@@ -67,11 +67,56 @@ fi
 
 printf 'Installing Panoptes from %s\n' "$repo_dir"
 printf 'Installation root: %s\n' "$install_root"
-PANOPTES_GIT_SHA=$git_sha cargo install \
-    --path "$repo_dir" \
-    --locked \
-    --force \
-    --root "$install_root"
+
+run_cargo_install() {
+    PANOPTES_GIT_SHA=$git_sha cargo install \
+        --path "$repo_dir" \
+        --locked \
+        --force \
+        --root "$install_root"
+}
+
+# Cargo can obtain rustc-wrapper = "sccache" from user configuration even when
+# RUSTC_WRAPPER is absent from the environment. Keep a working cache enabled,
+# but recover when sccache itself cannot start (for example, in a managed shell
+# that denies its server IPC). Capturing through tee preserves normal progress
+# output while retaining Cargo's status and enough diagnostics to distinguish a
+# wrapper failure from a Panoptes compilation error.
+install_log_dir=$(mktemp -d "${TMPDIR:-/tmp}/panoptes-install.XXXXXX")
+install_log=$install_log_dir/cargo-install.log
+install_status_file=$install_log_dir/cargo-install.status
+cleanup_install_log() {
+    rm -rf "$install_log_dir"
+}
+trap cleanup_install_log 0 HUP INT TERM
+
+(
+    set +e
+    run_cargo_install
+    install_status=$?
+    printf '%s\n' "$install_status" >"$install_status_file"
+    exit 0
+) 2>&1 | tee "$install_log"
+
+if [ ! -f "$install_status_file" ]; then
+    printf '%s\n' 'error: cargo install ended without reporting its status' >&2
+    exit 1
+fi
+install_status=$(sed -n '1p' "$install_status_file")
+if [ "$install_status" -ne 0 ]; then
+    if grep -Fq 'sccache' "$install_log" && \
+        { grep -Fq 'sccache: error:' "$install_log" || grep -Fq 'could not execute process' "$install_log"; }
+    then
+        printf '%s\n' \
+            'Configured sccache wrapper is unavailable; retrying without a Rust compiler wrapper.' >&2
+        RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' run_cargo_install
+    else
+        exit "$install_status"
+    fi
+fi
+
+cleanup_install_log
+trap - 0 HUP INT TERM
 
 binary="$install_root/bin/panoptes"
 if [ ! -x "$binary" ]; then

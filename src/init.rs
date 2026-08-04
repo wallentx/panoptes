@@ -1,5 +1,6 @@
-//! User-level provider registration. Machine-specific executable paths belong
-//! only in user configuration, never in repository files.
+//! User-level provider registration and code-navigation guidance. Machine-specific
+//! executable paths and provider integration belong only in user configuration,
+//! never in indexed repositories.
 
 use anyhow::{Context, Result, bail};
 use dialoguer::{MultiSelect, console::Term, theme::SimpleTheme};
@@ -8,6 +9,21 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+
+const SKILL: &str = include_str!("../assets/skills/panoptes/SKILL.md");
+const OPENAI_SKILL_YAML: &str = include_str!("../assets/skills/panoptes/agents/openai.yaml");
+const MANAGED_SKILL_MARKER: &str = "<!-- panoptes:managed-skill -->";
+const GUIDANCE_START: &str = "<!-- panoptes:managed:start -->";
+const GUIDANCE_END: &str = "<!-- panoptes:managed:end -->";
+const GUIDANCE: &str = r#"## Panoptes code navigation
+
+For coding tasks involving indexed source, prefer the Panoptes MCP tools before
+built-in grep, search, or whole-file reads. Use `find` for ranked code context,
+`grep` for exhaustive occurrences, `callers` for dependencies and blast radius,
+`skeleton` for a file API, and `map` for repository orientation. Work from the
+returned paths, spans, and bounded source before reading more. When Panoptes was
+used, report its MCP session token-savings total as an estimate versus reading
+matched files whole, never as model billing."#;
 
 struct Provider {
     id: &'static str,
@@ -167,6 +183,10 @@ fn reconcile_at(
     for id in &selected {
         provider(id)?;
     }
+    let active: HashSet<String> = selected.iter().map(|id| (*id).to_string()).collect();
+    if !dry_run {
+        sync_guidance(home, &active, true, &mut Vec::new())?;
+    }
     let mut writes = Vec::new();
     for provider in PROVIDERS {
         let state = registration(home, provider, executable)?;
@@ -181,6 +201,7 @@ fn reconcile_at(
             change_provider(home, executable, provider, action, dry_run, &mut writes)?;
         }
     }
+    sync_guidance(home, &active, dry_run, &mut writes)?;
     Ok(writes)
 }
 
@@ -188,27 +209,47 @@ fn change_named(providers: &[String], dry_run: bool, add: bool) -> Result<Vec<Pl
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     let home = PathBuf::from(home);
     let executable = std::env::current_exe()?.canonicalize()?;
-    let mut writes = Vec::new();
+    let mut active = HashSet::new();
+    for candidate in PROVIDERS {
+        if registration(&home, candidate, &executable)?.present {
+            active.insert(candidate.id.to_string());
+        }
+    }
     let mut seen = HashSet::new();
     for id in providers {
         if !seen.insert(id.as_str()) {
             continue;
         }
         let provider = provider(id)?;
-        let state = registration(&home, provider, &executable)?;
-        let action = if add {
-            if state.current {
-                continue;
-            }
-            if state.present { "update" } else { "register" }
+        if add {
+            active.insert(provider.id.to_string());
         } else {
-            if !state.present {
-                continue;
-            }
-            "deregister"
-        };
-        change_provider(&home, &executable, provider, action, dry_run, &mut writes)?;
+            active.remove(provider.id);
+        }
     }
+    if !dry_run {
+        sync_guidance(&home, &active, true, &mut Vec::new())?;
+    }
+
+    let mut writes = Vec::new();
+    seen.clear();
+    for id in providers {
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        let provider = provider(id)?;
+        let state = registration(&home, provider, &executable)?;
+        let action = match (add, state.present, state.current) {
+            (true, _, true) | (false, false, _) => None,
+            (true, true, false) => Some("update"),
+            (true, false, _) => Some("register"),
+            (false, true, _) => Some("deregister"),
+        };
+        if let Some(action) = action {
+            change_provider(&home, &executable, provider, action, dry_run, &mut writes)?;
+        }
+    }
+    sync_guidance(&home, &active, dry_run, &mut writes)?;
     Ok(writes)
 }
 
@@ -250,6 +291,274 @@ fn change_provider(
                 json!({"command":executable, "args":["mcp"]}),
             )?,
             _ => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+fn sync_guidance(
+    home: &Path,
+    active: &HashSet<String>,
+    dry_run: bool,
+    writes: &mut Vec<PlannedWrite>,
+) -> Result<()> {
+    let has = |id: &str| active.contains(id);
+    let shared = ["codex", "cursor", "gemini", "opencode", "copilot"]
+        .into_iter()
+        .any(has);
+    sync_skill(
+        home,
+        ".agents/skills/panoptes",
+        "shared",
+        shared,
+        dry_run,
+        writes,
+    )?;
+    sync_skill(
+        home,
+        ".claude/skills/panoptes",
+        "claude",
+        has("claude"),
+        dry_run,
+        writes,
+    )?;
+    sync_skill(
+        home,
+        ".gemini/antigravity-cli/skills/panoptes",
+        "antigravity",
+        has("antigravity"),
+        dry_run,
+        writes,
+    )?;
+
+    let codex = has("codex");
+    let codex_agents = home.join(".codex/AGENTS.md");
+    let codex_override = home.join(".codex/AGENTS.override.md");
+    let override_active =
+        codex_override.exists() && !std::fs::read_to_string(&codex_override)?.trim().is_empty();
+    sync_marked_guidance(
+        &codex_agents,
+        "codex",
+        codex && !override_active,
+        dry_run,
+        writes,
+    )?;
+    sync_marked_guidance(
+        &codex_override,
+        "codex",
+        codex && override_active,
+        dry_run,
+        writes,
+    )?;
+
+    sync_owned_guidance(
+        &home.join(".claude/rules/panoptes.md"),
+        "claude",
+        has("claude"),
+        dry_run,
+        writes,
+    )?;
+    sync_marked_guidance(
+        &home.join(".gemini/GEMINI.md"),
+        "gemini/antigravity",
+        has("gemini") || has("antigravity"),
+        dry_run,
+        writes,
+    )?;
+    Ok(())
+}
+
+fn sync_skill(
+    home: &Path,
+    relative: &str,
+    provider: &str,
+    enabled: bool,
+    dry_run: bool,
+    writes: &mut Vec<PlannedWrite>,
+) -> Result<()> {
+    let directory = home.join(relative);
+    let skill_path = directory.join("SKILL.md");
+    let metadata_path = directory.join("agents/openai.yaml");
+    let existing = if skill_path.exists() {
+        Some(std::fs::read_to_string(&skill_path)?)
+    } else {
+        None
+    };
+    if enabled
+        && let Some(text) = &existing
+        && text != SKILL
+        && !text.contains(MANAGED_SKILL_MARKER)
+    {
+        bail!(
+            "refusing to overwrite unmanaged Panoptes skill at {}",
+            skill_path.display()
+        );
+    }
+
+    if enabled {
+        let metadata_current =
+            metadata_path.exists() && std::fs::read_to_string(&metadata_path)? == OPENAI_SKILL_YAML;
+        if existing.as_deref() == Some(SKILL) && metadata_current {
+            return Ok(());
+        }
+        writes.push(PlannedWrite {
+            provider: provider.to_string(),
+            path: skill_path.to_string_lossy().into_owned(),
+            format: "skill",
+            action: if existing.is_some() {
+                "update"
+            } else {
+                "install"
+            },
+        });
+        if !dry_run {
+            write_private_atomic(&skill_path, SKILL.as_bytes())?;
+            write_private_atomic(&metadata_path, OPENAI_SKILL_YAML.as_bytes())?;
+        }
+    } else if existing
+        .as_deref()
+        .is_some_and(|text| text.contains(MANAGED_SKILL_MARKER))
+    {
+        writes.push(PlannedWrite {
+            provider: provider.to_string(),
+            path: skill_path.to_string_lossy().into_owned(),
+            format: "skill",
+            action: "remove",
+        });
+        if !dry_run {
+            std::fs::remove_file(&skill_path)?;
+            if metadata_path.exists() {
+                std::fs::remove_file(&metadata_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn managed_guidance() -> String {
+    format!("{GUIDANCE_START}\n{GUIDANCE}\n{GUIDANCE_END}\n")
+}
+
+fn marked_range(text: &str) -> Result<Option<(usize, usize)>> {
+    let start = text.find(GUIDANCE_START);
+    let end = text.find(GUIDANCE_END);
+    match (start, end) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) if end >= start => {
+            let mut end = end + GUIDANCE_END.len();
+            if text.as_bytes().get(end) == Some(&b'\n') {
+                end += 1;
+            }
+            Ok(Some((start, end)))
+        }
+        _ => bail!("Panoptes guidance has an unmatched managed marker"),
+    }
+}
+
+fn sync_marked_guidance(
+    path: &Path,
+    provider: &str,
+    enabled: bool,
+    dry_run: bool,
+    writes: &mut Vec<PlannedWrite>,
+) -> Result<()> {
+    let mut text = if path.exists() {
+        std::fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    let range = marked_range(&text)
+        .with_context(|| format!("invalid Panoptes guidance in {}", path.display()))?;
+    let original = text.clone();
+    if enabled {
+        let block = managed_guidance();
+        if let Some((start, end)) = range {
+            text.replace_range(start..end, &block);
+        } else {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            if !text.trim().is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&block);
+        }
+    } else if let Some((start, end)) = range {
+        text.replace_range(start..end, "");
+    }
+    if text == original {
+        return Ok(());
+    }
+    writes.push(PlannedWrite {
+        provider: provider.to_string(),
+        path: path.to_string_lossy().into_owned(),
+        format: "markdown",
+        action: if enabled {
+            if original.is_empty() {
+                "install"
+            } else {
+                "update"
+            }
+        } else {
+            "remove"
+        },
+    });
+    if !dry_run {
+        write_private_atomic(path, text.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn sync_owned_guidance(
+    path: &Path,
+    provider: &str,
+    enabled: bool,
+    dry_run: bool,
+    writes: &mut Vec<PlannedWrite>,
+) -> Result<()> {
+    let desired = managed_guidance();
+    let existing = if path.exists() {
+        Some(std::fs::read_to_string(path)?)
+    } else {
+        None
+    };
+    if enabled
+        && let Some(text) = &existing
+        && text != &desired
+        && !text.contains(GUIDANCE_START)
+    {
+        bail!(
+            "refusing to overwrite unmanaged Panoptes guidance at {}",
+            path.display()
+        );
+    }
+    if enabled && existing.as_deref() != Some(&desired) {
+        writes.push(PlannedWrite {
+            provider: provider.to_string(),
+            path: path.to_string_lossy().into_owned(),
+            format: "markdown",
+            action: if existing.is_some() {
+                "update"
+            } else {
+                "install"
+            },
+        });
+        if !dry_run {
+            write_private_atomic(path, desired.as_bytes())?;
+        }
+    } else if !enabled
+        && existing
+            .as_deref()
+            .is_some_and(|text| text.contains(GUIDANCE_START))
+    {
+        writes.push(PlannedWrite {
+            provider: provider.to_string(),
+            path: path.to_string_lossy().into_owned(),
+            format: "markdown",
+            action: "remove",
+        });
+        if !dry_run {
+            std::fs::remove_file(path)?;
         }
     }
     Ok(())
@@ -486,8 +795,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let providers = ["codex".to_string(), "codex".to_string()];
         let writes = reconcile_at(&home, Path::new("/safe/panoptes"), &providers, true).unwrap();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].provider, "codex");
+        assert_eq!(writes.len(), 3);
+        assert_eq!(
+            writes.iter().filter(|write| write.format == "toml").count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -573,6 +885,124 @@ mod tests {
         assert!(text.contains("[mcp_servers.other]\ncommand = \"other\""));
         assert!(!text.contains("[mcp_servers.panoptes]"));
         assert!(!text.contains("/safe/panoptes"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn guidance_install_and_removal_preserve_existing_global_instructions() {
+        let base = std::env::temp_dir().join(format!(
+            "panoptes-init-guidance-preserve-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let agents = base.join(".codex/AGENTS.md");
+        std::fs::create_dir_all(agents.parent().unwrap()).unwrap();
+        std::fs::write(&agents, "# My instructions\n\nKeep this text.\n").unwrap();
+
+        let selected = ["codex".to_string()];
+        reconcile_at(&base, Path::new("/safe/panoptes"), &selected, false).unwrap();
+        let installed = std::fs::read_to_string(&agents).unwrap();
+        assert!(installed.contains("# My instructions"));
+        assert!(installed.contains(GUIDANCE_START));
+        assert_eq!(installed.matches(GUIDANCE_START).count(), 1);
+        assert!(base.join(".agents/skills/panoptes/SKILL.md").exists());
+
+        reconcile_at(&base, Path::new("/safe/panoptes"), &[], false).unwrap();
+        let removed = std::fs::read_to_string(&agents).unwrap();
+        assert!(removed.contains("# My instructions"));
+        assert!(!removed.contains(GUIDANCE_START));
+        assert!(!base.join(".agents/skills/panoptes/SKILL.md").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn codex_guidance_uses_an_active_override_file() {
+        let base = std::env::temp_dir().join(format!(
+            "panoptes-init-guidance-override-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let override_path = base.join(".codex/AGENTS.override.md");
+        std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        std::fs::write(&override_path, "# Active override\n").unwrap();
+
+        reconcile_at(
+            &base,
+            Path::new("/safe/panoptes"),
+            &["codex".to_string()],
+            false,
+        )
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&override_path)
+                .unwrap()
+                .contains(GUIDANCE_START)
+        );
+        assert!(!base.join(".codex/AGENTS.md").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn every_provider_gets_a_supported_skill_location() {
+        let base = std::env::temp_dir().join(format!(
+            "panoptes-init-provider-skills-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let providers = PROVIDERS
+            .iter()
+            .map(|provider| provider.id.to_string())
+            .collect::<Vec<_>>();
+        let writes = reconcile_at(&base, Path::new("/safe/panoptes"), &providers, true).unwrap();
+        let skill_paths = writes
+            .iter()
+            .filter(|write| write.format == "skill")
+            .map(|write| write.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(skill_paths.len(), 3);
+        assert!(
+            skill_paths
+                .iter()
+                .any(|path| path.contains(".agents/skills"))
+        );
+        assert!(
+            skill_paths
+                .iter()
+                .any(|path| path.contains(".claude/skills"))
+        );
+        assert!(
+            skill_paths
+                .iter()
+                .any(|path| path.contains("antigravity-cli/skills"))
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn unmanaged_skill_is_never_overwritten_or_removed() {
+        let base = std::env::temp_dir().join(format!(
+            "panoptes-init-unmanaged-skill-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let skill = base.join(".agents/skills/panoptes/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "user-owned skill\n").unwrap();
+
+        let error = reconcile_at(
+            &base,
+            Path::new("/safe/panoptes"),
+            &["codex".to_string()],
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("refusing to overwrite unmanaged"));
+        reconcile_at(&base, Path::new("/safe/panoptes"), &[], false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&skill).unwrap(),
+            "user-owned skill\n"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 }
