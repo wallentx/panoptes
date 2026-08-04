@@ -12,6 +12,7 @@ use crate::{ask, db, index, repo};
 const MAX_MESSAGE: usize = 1024 * 1024;
 const MAX_OUTPUT: usize = 1024 * 1024;
 const TOKEN_CHARS: u64 = 4;
+const SAVINGS_LABEL: &str = "ꙮ Estimated tokens saved for this session";
 
 #[derive(Default)]
 struct SessionStats {
@@ -97,7 +98,7 @@ fn dispatch(
                 "protocolVersion":"2024-11-05",
                 "capabilities":{"tools":{"listChanged":false}},
                 "serverInfo":{"name":"panoptes", "version":env!("CARGO_PKG_VERSION")},
-                "instructions":"Prefer Panoptes before built-in grep, search, or whole-file reads for indexed source; one focused call usually replaces several reads. Use find for where/how questions (bounded source is included by default), grep when every occurrence matters, callers for incoming/outgoing dependency and blast-radius tracing, skeleton for a file API, and map for orientation. Work from returned paths and spans; do not repeat the same find wording, and fall back only when indexed context is insufficient. Retrieval results include an honest four-characters-per-token estimate versus reading matched files whole plus an MCP-session total. When Panoptes was used, report that session total as an estimate, never as billing. Panoptes indexes on connection and refreshes changed source before answers; freshness is observational."
+                "instructions":"Prefer Panoptes before built-in grep, search, or whole-file reads for indexed source; one focused call usually replaces several reads. Use find for where/how questions (bounded source is included by default), grep when every occurrence matters, callers for incoming/outgoing dependency and blast-radius tracing, skeleton for a file API, and map for orientation. Work from returned paths and spans; do not repeat the same find wording, and fall back only when indexed context is insufficient. Retrieval results include an honest four-characters-per-token estimate versus reading matched files whole plus an MCP-session total. When Panoptes was used, end the response with the provided session savings display in the form `ꙮ Estimated tokens saved for this session: 1,231,578`; treat it as an estimate, never as billing. Panoptes indexes on connection and refreshes changed source before answers; freshness is observational."
             }))
         }
         "ping" => Ok(json!({})),
@@ -383,6 +384,22 @@ fn savings_percent(saved: u64, baseline: u64) -> u64 {
     saved.saturating_mul(100).checked_div(baseline).unwrap_or(0)
 }
 
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + (digits.len() - 1) / 3);
+    for (index, digit) in digits.bytes().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(char::from(digit));
+    }
+    formatted
+}
+
+fn session_savings_display(value: u64) -> String {
+    format!("{SAVINGS_LABEL}: {}", format_count(value))
+}
+
 fn add_savings(mut output: ToolData, session: &mut SessionStats) -> Result<Value> {
     if output.baseline_bytes == 0 {
         return Ok(output.value);
@@ -403,6 +420,7 @@ fn add_savings(mut output: ToolData, session: &mut SessionStats) -> Result<Value
             "matchedFiles":output.baseline_files,
             "sessionEstimatedTokensSaved":session_total,
             "sessionCallsWithSavings":session_calls,
+            "sessionSavingsDisplay":session_savings_display(session_total),
             "basis":"estimate at four UTF-8 source bytes or output characters per token versus reading matched source files whole; not model billing"
         });
         output
@@ -432,6 +450,7 @@ fn add_savings(mut output: ToolData, session: &mut SessionStats) -> Result<Value
         "matchedFiles":output.baseline_files,
         "sessionEstimatedTokensSaved":session.estimated_tokens_saved,
         "sessionCallsWithSavings":session.calls_with_savings,
+        "sessionSavingsDisplay":session_savings_display(session.estimated_tokens_saved),
         "basis":"estimate at four UTF-8 source bytes or output characters per token versus reading matched source files whole; not model billing"
     });
     output
@@ -725,6 +744,22 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("sessionEstimatedTokensSaved")
+        );
+        assert_eq!(
+            second_savings["sessionSavingsDisplay"].as_str().unwrap(),
+            session_savings_display(
+                second_savings["sessionEstimatedTokensSaved"]
+                    .as_u64()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn savings_display_uses_panoptes_mark_and_grouped_total() {
+        assert_eq!(
+            session_savings_display(1_231_578),
+            "ꙮ Estimated tokens saved for this session: 1,231,578"
         );
     }
 }

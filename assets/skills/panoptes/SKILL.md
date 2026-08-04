@@ -37,6 +37,6 @@ line spans, signatures, and bounded source.
   required.
 - Treat the `panoptesSavings` values as estimates based on four characters per
   token versus reading the matched source files whole. When Panoptes was used,
-  report the MCP session's estimated tokens saved in one concise final line.
-  Never present that estimate as model billing or an externally measured token
-  count.
+  end the response with the MCP-provided `sessionSavingsDisplay`, formatted like
+  `ꙮ Estimated tokens saved for this session: 1,231,578`. Never present that
+  estimate as model billing or an externally measured token count.

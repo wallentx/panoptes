@@ -22,8 +22,9 @@ built-in grep, search, or whole-file reads. Use `find` for ranked code context,
 `grep` for exhaustive occurrences, `callers` for dependencies and blast radius,
 `skeleton` for a file API, and `map` for repository orientation. Work from the
 returned paths, spans, and bounded source before reading more. When Panoptes was
-used, report its MCP session token-savings total as an estimate versus reading
-matched files whole, never as model billing."#;
+used, end the response with the MCP-provided session savings display in this
+form: `ꙮ Estimated tokens saved for this session: 1,231,578`. Treat it as an
+estimate versus reading matched files whole, never as model billing."#;
 
 struct Provider {
     id: &'static str,
@@ -904,8 +905,15 @@ mod tests {
         let installed = std::fs::read_to_string(&agents).unwrap();
         assert!(installed.contains("# My instructions"));
         assert!(installed.contains(GUIDANCE_START));
+        assert!(installed.contains("ꙮ Estimated tokens saved for this session: 1,231,578"));
         assert_eq!(installed.matches(GUIDANCE_START).count(), 1);
-        assert!(base.join(".agents/skills/panoptes/SKILL.md").exists());
+        let skill_path = base.join(".agents/skills/panoptes/SKILL.md");
+        assert!(skill_path.exists());
+        assert!(
+            std::fs::read_to_string(&skill_path)
+                .unwrap()
+                .contains("ꙮ Estimated tokens saved for this session: 1,231,578")
+        );
 
         reconcile_at(&base, Path::new("/safe/panoptes"), &[], false).unwrap();
         let removed = std::fs::read_to_string(&agents).unwrap();
