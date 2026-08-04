@@ -48,7 +48,11 @@ read-only sandbox, clean checkout, and ignored user configuration. The
 treatment arm adds only the Panoptes MCP server. Runs are ephemeral; the order
 is reversed on even-numbered trials. JSONL events and final answers are
 retained, while `results.tsv` records actual Codex token usage, tool calls, MCP
-failures, wall time, exit status, and deterministic rubric coverage.
+failures, wall time, exit status, deterministic rubric coverage, and an
+API-price equivalent. The pricing inputs are retained in `metadata.tsv` and can
+be overridden with `PANOPTES_AGENT_INPUT_USD_PER_MTOK`,
+`PANOPTES_AGENT_CACHED_INPUT_USD_PER_MTOK`, and
+`PANOPTES_AGENT_OUTPUT_USD_PER_MTOK`.
 
 Both total and uncached input tokens are recorded. Treat them separately:
 cached context still reaches the model, but providers may bill it differently.
@@ -58,6 +62,6 @@ the saved answers before publishing comparisons.
 
 The first three-task pilot is recorded in
 [`results/agent-pocketbase-pilot-2026-08-04.md`](results/agent-pocketbase-pilot-2026-08-04.md).
-It showed lower aggregate tokens and wall time, but did not match baseline
-rubric coverage, so its percentages are intentionally absent from the product
-README.
+It showed lower aggregate cost, tokens, tool calls, and wall time, but did not
+match baseline rubric coverage. The product README presents those measured
+results with the pilot size and correctness result visible.

@@ -8,6 +8,7 @@ user configuration, and read-only sandbox. The treatment added only Panoptes.
 
 | Metric | Baseline | Panoptes | Change |
 | --- | ---: | ---: | ---: |
+| API-price equivalent | $0.504 | $0.418 | -17.0% |
 | Total input tokens | 861,944 | 754,069 | -12.5% |
 | Uncached input tokens | 134,136 | 109,973 | -18.0% |
 | Output tokens | 7,492 | 5,790 | -22.7% |
@@ -19,6 +20,14 @@ All runs completed with no MCP failures. The Panoptes arm respected the
 three-call budget in every task. One miss was substantive (`bindApi` was named
 instead of `NewRouter`); the other answer described auth-alert behavior without
 naming the `authAlert` function required by the rubric.
+
+The cost estimate applies the standard
+[GPT-5.6 Terra API rates](https://developers.openai.com/api/docs/models/gpt-5.6-terra)
+on 2026-08-04: $2.00 per million uncached input tokens, $0.20 per million cached
+input tokens, and $12.00 per million output tokens. It is an API-price
+equivalent calculated from recorded usage, not a Codex subscription charge.
+Future runs record their pricing inputs in `metadata.tsv` so the calculation
+remains auditable when model prices change.
 
 The efficiency direction is promising, but correctness did not match the
 baseline and one trial per task is too small for marketing. Run multiple

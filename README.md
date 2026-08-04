@@ -13,6 +13,35 @@ repository file by file.
 - MCP setup for Codex, Claude Code, Cursor, Gemini CLI, Antigravity, OpenCode,
   and GitHub Copilot CLI.
 
+## Benchmark
+
+**17% cheaper and 17% faster in a controlled three-task PocketBase pilot.**
+
+| Metric | Without Panoptes | With Panoptes | Change |
+| --- | ---: | ---: | ---: |
+| API-price equivalent | $0.50 | $0.42 | **−17%** |
+| Total input tokens | 861,944 | 754,069 | **−12.5%** |
+| Uncached input tokens | 134,136 | 109,973 | **−18.0%** |
+| Output tokens | 7,492 | 5,790 | **−22.7%** |
+| Tool calls | 20 | 19 | **−5.0%** |
+| Wall time | 168.0 s | 138.8 s | **−17.4%** |
+| Correctness checks | 18/18 | 16/18 | −2 checks |
+
+Both arms used the same Codex model, prompts, navigation guidance, clean
+checkouts, and read-only sandbox. Cost applies the standard
+[GPT-5.6 Terra API rates](https://developers.openai.com/api/docs/models/gpt-5.6-terra)—$2.00/M
+uncached input, $0.20/M cached input, and $12.00/M output—to the recorded usage;
+it is not a Codex subscription charge. This pilot is directional, not a broad
+claim: one miss was substantive and one omitted a required function name. See
+the [methodology and results](bench/results/agent-pocketbase-pilot-2026-08-04.md).
+
+Panoptes also reports the source context avoided during each session:
+
+> ꙮ Estimated tokens saved for this session: 166,376
+
+That session figure is Panoptes's local estimate versus reading matched files
+whole, not model billing.
+
 ## Fast enough to stay in the loop
 
 **Index a 704-file production repository in 2.5 seconds. Refresh a one-file

@@ -11,6 +11,9 @@ model=${PANOPTES_AGENT_MODEL:-gpt-5.6-terra}
 reasoning=${PANOPTES_AGENT_REASONING:-medium}
 trials=${PANOPTES_AGENT_TRIALS:-1}
 panoptes_bin=${PANOPTES_BENCH_BIN:-"$repo_dir/target/release/panoptes"}
+input_usd_per_mtok=${PANOPTES_AGENT_INPUT_USD_PER_MTOK:-2.00}
+cached_input_usd_per_mtok=${PANOPTES_AGENT_CACHED_INPUT_USD_PER_MTOK:-0.20}
+output_usd_per_mtok=${PANOPTES_AGENT_OUTPUT_USD_PER_MTOK:-12.00}
 
 usage() {
     printf '%s\n' \
@@ -55,7 +58,7 @@ mkdir -p "$output/runs"
 benchmark_failed=0
 
 results="$output/results.tsv"
-printf 'task\tarm\ttrial\texit_code\twall_ms\tinput_tokens\tcached_input_tokens\tuncached_input_tokens\toutput_tokens\treasoning_output_tokens\ttool_calls\tpanoptes_calls\tmcp_failures\trubric_hits\trubric_total\n' > "$results"
+printf 'task\tarm\ttrial\texit_code\twall_ms\tinput_tokens\tcached_input_tokens\tuncached_input_tokens\toutput_tokens\testimated_cost_usd\treasoning_output_tokens\ttool_calls\tpanoptes_calls\tmcp_failures\trubric_hits\trubric_total\n' > "$results"
 
 run_one() {
     local task=$1
@@ -118,11 +121,19 @@ run_one() {
     jq -rs '[.[] | select(.type == "item.completed" and .item.type == "agent_message") | .item.text] | last // ""' \
         "$events" > "$answer"
 
-    local input_tokens cached_tokens uncached_tokens output_tokens reasoning_tokens tool_calls panoptes_calls mcp_failures
+    local input_tokens cached_tokens uncached_tokens output_tokens estimated_cost reasoning_tokens tool_calls panoptes_calls mcp_failures
     input_tokens=$(jq -rs '[.[] | select(.type == "turn.completed") | .usage.input_tokens] | add // 0' "$events")
     cached_tokens=$(jq -rs '[.[] | select(.type == "turn.completed") | .usage.cached_input_tokens] | add // 0' "$events")
     uncached_tokens=$((input_tokens - cached_tokens))
     output_tokens=$(jq -rs '[.[] | select(.type == "turn.completed") | .usage.output_tokens] | add // 0' "$events")
+    estimated_cost=$(awk \
+        -v uncached="$uncached_tokens" \
+        -v cached="$cached_tokens" \
+        -v output="$output_tokens" \
+        -v input_rate="$input_usd_per_mtok" \
+        -v cached_rate="$cached_input_usd_per_mtok" \
+        -v output_rate="$output_usd_per_mtok" \
+        'BEGIN { printf "%.6f", (uncached * input_rate + cached * cached_rate + output * output_rate) / 1000000 }')
     reasoning_tokens=$(jq -rs '[.[] | select(.type == "turn.completed") | .usage.reasoning_output_tokens] | add // 0' "$events")
     tool_calls=$(jq -rs '[.[] | select(.type == "item.completed") | .item | select(.type != "agent_message" and .type != "reasoning")] | length' "$events")
     panoptes_calls=$(jq -rs '[.[] | select(.type == "item.completed") | .item | select((.server // "") == "panoptes" and .status == "completed")] | length' "$events")
@@ -137,9 +148,9 @@ run_one() {
         fi
     done
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$task" "$arm" "$trial" "$exit_code" "$wall_ms" "$input_tokens" "$cached_tokens" \
-        "$uncached_tokens" "$output_tokens" "$reasoning_tokens" "$tool_calls" "$panoptes_calls" \
+        "$uncached_tokens" "$output_tokens" "$estimated_cost" "$reasoning_tokens" "$tool_calls" "$panoptes_calls" \
         "$mcp_failures" "$rubric_hits" "$rubric_total" >> "$results"
 }
 
@@ -166,15 +177,15 @@ fi
 
 summary="$output/summary.tsv"
 awk -F '\t' '
-    BEGIN { OFS="\t"; print "arm", "runs", "successful", "input_tokens", "uncached_input_tokens", "output_tokens", "tool_calls", "wall_ms", "rubric_hits", "rubric_total" }
+    BEGIN { OFS="\t"; print "arm", "runs", "successful", "estimated_cost_usd", "input_tokens", "uncached_input_tokens", "output_tokens", "tool_calls", "wall_ms", "rubric_hits", "rubric_total" }
     NR > 1 {
         arm=$2; runs[arm]++
         if ($4 == 0) successful[arm]++
-        input[arm]+=$6; uncached[arm]+=$8; output[arm]+=$9; tools[arm]+=$11; wall[arm]+=$5
-        hits[arm]+=$14; total[arm]+=$15
+        input[arm]+=$6; uncached[arm]+=$8; output[arm]+=$9; cost[arm]+=$10; tools[arm]+=$12; wall[arm]+=$5
+        hits[arm]+=$15; total[arm]+=$16
     }
     END {
-        for (arm in runs) print arm, runs[arm], successful[arm]+0, input[arm]+0, uncached[arm]+0, output[arm]+0, tools[arm]+0, wall[arm]+0, hits[arm]+0, total[arm]+0
+        for (arm in runs) printf "%s\t%d\t%d\t%.6f\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", arm, runs[arm], successful[arm]+0, cost[arm]+0, input[arm]+0, uncached[arm]+0, output[arm]+0, tools[arm]+0, wall[arm]+0, hits[arm]+0, total[arm]+0
     }
 ' "$results" | { IFS= read -r header; printf '%s\n' "$header"; sort; } > "$summary"
 
@@ -186,6 +197,9 @@ awk -F '\t' '
     printf 'reasoning\t%s\n' "$reasoning"
     printf 'trials\t%s\n' "$trials"
     printf 'tasks\t%s\n' "$tasks"
+    printf 'input_usd_per_mtok\t%s\n' "$input_usd_per_mtok"
+    printf 'cached_input_usd_per_mtok\t%s\n' "$cached_input_usd_per_mtok"
+    printf 'output_usd_per_mtok\t%s\n' "$output_usd_per_mtok"
     printf 'codex\t%s\n' "$(codex --version 2>/dev/null)"
     printf 'panoptes\t%s\n' "$("$panoptes_bin" --version)"
     printf 'uname\t%s\n' "$(uname -a | tr '\t' ' ')"
