@@ -1,0 +1,4 @@
+interface:
+  display_name: "Panoptes"
+  short_description: "Navigate indexed code with fewer reads"
+  default_prompt: "Use $panoptes to locate and understand relevant code before reading whole files."

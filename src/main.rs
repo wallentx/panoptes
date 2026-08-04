@@ -117,7 +117,7 @@ enum Cmd {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Register Panoptes with one or more coding-agent providers.
+    /// Configure Panoptes MCP, guidance, and skills for coding-agent providers.
     Init {
         /// Provider to configure; repeat for scripts. Omit to open the checkbox picker.
         #[arg(

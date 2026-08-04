@@ -1,15 +1,15 @@
 # Panoptes
 
-Panoptes builds a local structural map of a source repository for people and
-coding agents. It indexes definitions, imports, and resolvable calls into one
-SQLite database outside the repository, then exposes that graph through a CLI
-and MCP. Named for Argus Panoptes, it provides a broad view of a codebase while
-keeping source and queries on the local machine.
+Panoptes is a local code-intelligence index for navigating software repositories.
+It turns definitions, imports, and resolvable calls into a searchable structural
+map, then exposes compact, line-addressable results through a CLI and MCP server.
 
-It is a native Rust executable. There is no Node.js runtime, npm, `npx`, daemon,
-telemetry, model API, or repository-local agent configuration.
+Use it to find where behavior is implemented, inspect a file's public shape,
+trace dependencies, search every occurrence of a pattern, or orient yourself in
+an unfamiliar codebase. Results include exact paths, line spans, signatures,
+relationships, and bounded source excerpts so you can decide what to read next.
 
-## What it does
+## Highlights
 
 - Indexes TypeScript, TSX, JavaScript, Python, Go, and Rust.
 - Finds relevant symbols for natural-language questions.
@@ -20,26 +20,23 @@ telemetry, model API, or repository-local agent configuration.
   OpenCode, and GitHub Copilot CLI through MCP.
 - Incrementally reparses changed files and automatically refreshes normal CLI
   queries when source changes.
+- Performs indexing and retrieval locally against a SQLite database.
 
-Panoptes does not modify an indexed repository. Its shared database defaults to
-`$XDG_DATA_HOME/panoptes/panoptes.db`, falling back to
-`~/.local/share/panoptes/panoptes.db`.
+Panoptes stores its shared index outside source repositories at
+`$XDG_DATA_HOME/panoptes/panoptes.db`, or
+`~/.local/share/panoptes/panoptes.db` when `XDG_DATA_HOME` is unset.
 
 ## Install
 
-Install the native CLI from the explicit
-[`wallentx/panoptes`](https://github.com/wallentx/panoptes) repository and
-`main` branch.
-
-Install Git, Rust, Cargo, and a C compiler with the operating system package
-manager. On Termux, the required packages are available with:
+Panoptes requires Git, Rust, Cargo, and a C compiler. Install them with your
+operating system's package manager. On Termux, use:
 
 ```sh
 pkg update
 pkg install git rust clang
 ```
 
-Clone the repository so it can be inspected, then run the local installer:
+Clone the repository and run the installer:
 
 ```sh
 git clone --branch main --single-branch https://github.com/wallentx/panoptes.git
@@ -47,9 +44,8 @@ cd panoptes
 ./install.sh
 ```
 
-This builds for the host Rust target and installs the executable to
-`~/.local/bin/panoptes`. On Termux that produces a native Android/Bionic binary;
-no `proot` environment is required.
+This builds Panoptes for the current host, installs it as
+`~/.local/bin/panoptes`, and verifies that the installed executable starts.
 
 If `~/.local/bin` is not already on `PATH`, add it to your shell configuration:
 
@@ -63,13 +59,12 @@ Choose another user-owned installation root when needed:
 ./install.sh --prefix "$HOME/.local/panoptes"
 ```
 
-The installer never uses `sudo`. It builds only the checkout containing the
-script, verifies that the installed binary starts, and then prints the exact
-`PATH` entry and next steps.
+Installation is user-local. The script builds the current checkout and prints
+any required `PATH` update and next steps.
 
 ### Direct Cargo install
 
-If inspecting a clone first is not required:
+To install directly with Cargo:
 
 ```sh
 cargo install \
@@ -80,13 +75,12 @@ cargo install \
   panoptes
 ```
 
-The `main` branch is mutable. For a reproducible source install, replace
-`--branch main` with `--rev <full-commit-sha>`.
+For a reproducible source install, replace `--branch main` with
+`--rev <full-commit-sha>`.
 
 ### Update or uninstall
 
-The `upgrade` command explains the update policy but never downloads or executes
-anything. Update an inspect-first installation from its checkout:
+Update an installation from its checkout:
 
 ```sh
 cd panoptes
@@ -95,15 +89,15 @@ git pull --ff-only origin main
 ```
 
 For a complete uninstall, first run the provider picker and uncheck every
-registered provider. This removes only Panoptes's MCP entries and preserves all
-other provider settings:
+registered provider. This removes Panoptes's MCP entries, managed guidance, and
+installed skill copies while preserving all unrelated provider settings and
+instructions:
 
 ```sh
 panoptes init
 ```
 
-Optionally remove every indexed graph and reclaim the database space. Source
-repositories are never touched:
+Optionally remove the local indexes and reclaim their database space:
 
 ```sh
 panoptes cache clear --yes
@@ -115,9 +109,13 @@ Then remove an installation made under the default root:
 cargo uninstall --root "$HOME/.local" panoptes
 ```
 
-## Configure providers
+## Connect coding agents
 
-Run `init` with no options to open the interactive checkbox picker:
+`panoptes init` connects Panoptes to supported coding agents. For each selected
+provider it registers the MCP server and installs guidance describing when and
+how to use the indexed tools.
+
+Run it without options to open the provider picker:
 
 ```sh
 panoptes init
@@ -130,12 +128,10 @@ Select providers (space toggles, enter confirms)
   [ ] Cursor                ~/.cursor/mcp.json
 ```
 
-Only providers containing an actual Panoptes registration start checked. Installed
-providers without one are labelled `detected` but remain unchecked. Move with
-the arrow keys, toggle with space, and apply the selection with enter. Checking
-a provider registers or refreshes Panoptes; unchecking a registered provider
-deregisters it. Existing unrelated entries are preserved, invalid JSON is
-refused, and writes are private and atomic.
+Registered providers start checked; detected but unconfigured providers are
+labelled `detected`. Move with the arrow keys, toggle with space, and press enter
+to apply the selection. Checking a provider installs or refreshes its Panoptes
+configuration, while unchecking it removes the Panoptes integration.
 
 For scripts or headless machines, repeat `--provider` instead of opening the
 picker:
@@ -149,21 +145,23 @@ panoptes init --provider opencode --dry-run --json
 
 Supported provider IDs and destinations:
 
-| Provider ID | Provider | User configuration |
-|---|---|---|
-| `claude` | Claude Code | `~/.claude.json` |
-| `codex` | Codex | `~/.codex/config.toml` |
-| `cursor` | Cursor | `~/.cursor/mcp.json` |
-| `gemini` | Gemini CLI | `~/.gemini/settings.json` |
-| `antigravity` | Antigravity | `~/.gemini/config/mcp_config.json` |
-| `opencode` | OpenCode | `~/.config/opencode/opencode.json` |
-| `copilot` | GitHub Copilot CLI | `~/.copilot/mcp-config.json` |
+| Provider ID | Provider | MCP configuration | Guidance and skill |
+|---|---|---|---|
+| `claude` | Claude Code | `~/.claude.json` | `~/.claude/rules/panoptes.md`, `~/.claude/skills/panoptes/` |
+| `codex` | Codex | `~/.codex/config.toml` | active `~/.codex/AGENTS*.md`, `~/.agents/skills/panoptes/` |
+| `cursor` | Cursor | `~/.cursor/mcp.json` | `~/.agents/skills/panoptes/` |
+| `gemini` | Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/GEMINI.md`, `~/.agents/skills/panoptes/` |
+| `antigravity` | Antigravity | `~/.gemini/config/mcp_config.json` | `~/.gemini/GEMINI.md`, `~/.gemini/antigravity-cli/skills/panoptes/` |
+| `opencode` | OpenCode | `~/.config/opencode/opencode.json` | `~/.agents/skills/panoptes/` |
+| `copilot` | GitHub Copilot CLI | `~/.copilot/mcp-config.json` | `~/.agents/skills/panoptes/` |
 
-The registered command is the installed executable's absolute path. No
-machine-specific path, hook, prompt, or provider file is written into a source
-repository.
+Codex, Cursor, Gemini CLI, OpenCode, and Copilot share the skill installed under
+`~/.agents`. Claude Code and Antigravity use their provider-specific global skill
+directories. Managed markers identify the Panoptes sections in shared instruction
+files, allowing later updates and removal while preserving unrelated content.
+All provider integration stays in user configuration outside indexed repositories.
 
-## Quick start
+## CLI quick start
 
 ```sh
 cd /path/to/repository
@@ -180,17 +178,15 @@ TypeScript declaration files. Subsequent builds reuse unchanged extraction
 payloads. Large cold builds use at most four parser workers; use `--jobs 1` or
 `PANOPTES_JOBS=1` on a memory-constrained device.
 
-After provider registration, MCP automatically indexes the repository when the
-provider connects and incrementally refreshes changed source before later answers.
-The MCP `freshness` tool is observational and does not trigger a build.
-This makes Panoptes available in any repository opened by a registered provider;
-running `panoptes build` first is optional unless you want to pre-warm the index.
+When a provider connects, MCP indexes the current repository and incrementally
+refreshes changed source before retrieval calls. Running `panoptes build` first
+is optional but can pre-warm the index. The MCP `freshness` tool reports drift
+without triggering a build.
 
-Normal CLI query commands refresh an existing stale index before answering;
-their initial index is still created explicitly with `panoptes build`. CLI `check`
-and `status` are observational. Use global `--no-refresh` or
-`PANOPTES_NO_REFRESH=1` to disable MCP startup indexing and all automatic refreshes
-when an intentional stored snapshot is required.
+CLI query commands refresh an existing stale index before answering. Create the
+initial CLI index with `panoptes build`; `check` and `status` only report its
+state. Use global `--no-refresh` or `PANOPTES_NO_REFRESH=1` when queries should
+use an intentional stored snapshot.
 
 ## Commands
 
@@ -204,7 +200,7 @@ when an intentional stored snapshot is required.
 | `map [path]` | Show directory clusters, hubs, and hotspots |
 | `viz [path]` | Serve a loopback viewer or write self-contained HTML |
 | `export <destination>` | Write deterministic Markdown cards or JSON |
-| `init` | Select and configure MCP providers |
+| `init` | Configure MCP, guidance, and skills for coding agents |
 | `mcp [path]` | Serve newline-delimited MCP JSON-RPC over stdin/stdout |
 | `check [path]` | Fail when an index is missing, stale, or incompatible |
 | `status [path]` | Report graph counts, age, schema, extractor, and source drift |
@@ -229,16 +225,24 @@ means bad input, an unindexed repository, or a missing/ambiguous requested node.
 
 The MCP server exposes:
 
-- `find`
-- `grep`
-- `callers`
-- `skeleton`
-- `map`
-- `status`
-- `freshness`
+- `find` for ranked context and bounded source excerpts, included by default
+- `grep` for exhaustive regex or literal occurrences
+- `callers` for incoming or outgoing dependency traversal
+- `skeleton` for definitions and signatures without a whole-file read
+- `map` for repository orientation, hubs, and hotspots
+- `status` for graph counts and freshness
+- `freshness` for an observational live-source comparison
 
-Requests and responses are capped at 1 MiB. Retrieval is local and
-deterministic; Panoptes does not send source code or queries to a model service.
+Retrieval results include a `panoptesSavings` object with per-call and MCP-session
+token-savings estimates. The baseline is the size of distinct matched indexed
+files represented in the result; the response cost is the serialized tool
+payload. Both use a four-characters-per-token heuristic. These values describe
+an estimated reduction versus reading those files whole, not model billing or a
+provider-measured token count. The session total resets when the MCP process
+restarts.
+
+Requests and responses are capped at 1 MiB. Indexing and retrieval are local and
+deterministic.
 
 ## Multi-repository workspaces
 
@@ -277,15 +281,17 @@ edges. Inheritance and arbitrary reference edges are not part of the native
 
 Natural-language `ask` is deterministic local retrieval over symbol names,
 signatures, bounded definition bodies, graph coupling, and test-path de-ranking.
-There is no embedding service or `--deep` model enrichment.
 
 ## Security and privacy
 
-- Indexed source and queries stay on the machine.
-- The index lives outside the repository.
-- Provider setup touches only explicitly selected user configuration files.
-- Invalid existing JSON is never overwritten.
-- There is no self-updater or remote installer execution.
+- Panoptes performs indexing and retrieval locally and makes no outbound network
+  requests at runtime.
+- MCP clients receive the requested tool results; the selected coding agent's
+  data-handling policy applies to those results.
+- The index lives outside the repository, and indexing leaves source files
+  unchanged.
+- Provider setup is limited to selected user configuration files and preserves
+  unrelated settings and instructions.
 - Release archives contain a stripped binary, README, license, and SHA-256
   sidecar; verify the checksum before copying a release binary onto `PATH`.
 
