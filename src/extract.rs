@@ -1,0 +1,1064 @@
+//! Tier-1 extraction: source text -> symbols + unresolved call intents.
+//!
+//! Symbols are found per file while call *targets* remain unresolved, because a
+//! callee named in one file is usually defined in another. Resolution happens
+//! once the whole repository's symbols are known — see `resolve_edges`.
+//!
+//! Extraction is query-driven rather than a hand-rolled walk: a tree-sitter query
+//! states which shapes are definitions, so adding a language means adding a query
+//! rather than another arm in a recursive match.
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use streaming_iterator::StreamingIterator;
+use tree_sitter::{Node, Parser, Query, QueryCursor};
+
+use crate::repo::Lang;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub signature: String,
+    /// Definition body used by lexical retrieval. Capped to bound store growth.
+    #[serde(default)]
+    pub search_text: String,
+}
+
+/// A call site whose target is a bare name, not yet tied to a symbol row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallIntent {
+    /// Index into the file's symbol list — the symbol the call appears inside.
+    /// None for a top-level call, which belongs to the file itself: a module-level
+    /// `register(x)` is a real dependency and dropping it loses the edge entirely.
+    pub from: Option<usize>,
+    pub callee: String,
+    /// Receiver text for a member call (`repo` in `repo.scan()`). None for a bare
+    /// call. This is what turns an ambiguous method name into one target.
+    pub receiver: Option<String>,
+}
+
+/// A variable, parameter or field bound to a type name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Binding {
+    /// Symbol the binding is scoped to; None at module level.
+    pub owner: Option<usize>,
+    pub name: String,
+    pub ty: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Extracted {
+    pub symbols: Vec<Symbol>,
+    pub calls: Vec<CallIntent>,
+    pub bindings: Vec<Binding>,
+    /// Parallel to `symbols`: the enclosing class name for a method, else None.
+    /// Used to resolve a receiver-typed call to one class's method.
+    pub containers: Vec<Option<String>>,
+    /// Parallel to `symbols`: index of the innermost enclosing symbol, else None
+    /// for a top-level definition (whose parent is the file). Drives `contains`.
+    pub parents: Vec<Option<usize>>,
+    /// Module specifiers this file imports, verbatim (`./stats.js`, `node:fs`).
+    pub imports: Vec<String>,
+}
+
+/// Definition shapes. `@name` is the identifier stored; the outer capture is the
+/// span. Order matters only for readability — matches are keyed by capture name.
+const TS_DEFS: &str = r#"
+(function_declaration name: (identifier) @name) @def
+(generator_function_declaration name: (identifier) @name) @def
+(class_declaration name: (type_identifier) @name) @def
+(interface_declaration name: (type_identifier) @name) @def
+(type_alias_declaration name: (type_identifier) @name) @def
+(enum_declaration name: (identifier) @name) @def
+(method_definition name: (property_identifier) @name) @def
+(public_field_definition name: (property_identifier) @name
+  value: [(arrow_function) (function_expression)]) @def
+(variable_declarator
+  name: (identifier) @name
+  value: [(arrow_function) (function_expression) (generator_function)]) @def
+"#;
+
+/// Call sites. `foo()` and `obj.foo()` both record the bare callee name, which is
+/// what the repo-wide index is keyed on.
+const TS_CALLS: &str = r#"
+(call_expression function: (identifier) @callee)
+(call_expression function: (member_expression object: (_) @recv property: (property_identifier) @callee))
+(new_expression constructor: (identifier) @callee)
+"#;
+
+/// Type bindings. Each alternative names the variable and the type it carries, so
+/// a later member call on that variable resolves to one class's method rather
+/// than to every method in the repo sharing the name.
+/// Import specifiers. `export ... from` is an import too — it pulls the module in
+/// and re-exposes it, so omitting it would lose a real file-to-file dependency.
+const TS_IMPORTS: &str = r#"
+(import_statement source: (string) @spec)
+(export_statement source: (string) @spec)
+"#;
+
+const TS_BINDINGS: &str = r#"
+(variable_declarator
+  name: (identifier) @name
+  value: (new_expression constructor: (identifier) @ty))
+(variable_declarator
+  name: (identifier) @name
+  type: (type_annotation (type_identifier) @ty))
+(required_parameter
+  pattern: (identifier) @name
+  type: (type_annotation (type_identifier) @ty))
+(public_field_definition
+  name: (property_identifier) @field
+  type: (type_annotation (type_identifier) @ty))
+"#;
+
+/// Per-language queries. Each language is a set of four queries over the same
+/// machinery — definitions, calls, bindings, imports — so adding one is data
+/// rather than another arm of a recursive walk.
+struct Queries {
+    defs: &'static str,
+    calls: &'static str,
+    bindings: &'static str,
+    imports: &'static str,
+}
+
+const PY_DEFS: &str = r#"
+(function_definition name: (identifier) @name) @def
+(class_definition name: (identifier) @name) @def
+"#;
+
+/// `f()` and `obj.f()`. Python has no `new`, so a constructor call is an ordinary
+/// call to the class name and needs no separate pattern.
+const PY_CALLS: &str = r#"
+(call function: (identifier) @callee)
+(call function: (attribute object: (_) @recv attribute: (identifier) @callee))
+"#;
+
+/// Annotated assignment (`x: Repo = ...`), constructor assignment (`x = Repo()`),
+/// and annotated parameters. `self.x` is stored the same way `this.x` is in TS.
+const PY_BINDINGS: &str = r#"
+(assignment left: (identifier) @name type: (type (identifier) @ty))
+(assignment left: (identifier) @name right: (call function: (identifier) @ty))
+(typed_parameter (identifier) @name type: (type (identifier) @ty))
+(assignment
+  left: (attribute object: (identifier) attribute: (identifier) @field)
+  right: (call function: (identifier) @ty))
+"#;
+
+const PY_FIELD_ALIASES: &str = r#"
+(assignment
+  left: (attribute object: (identifier) @object attribute: (identifier) @field)
+  right: (identifier) @source)
+"#;
+
+const PY_IMPORTS: &str = r#"
+(import_statement name: (dotted_name) @spec)
+(import_from_statement module_name: [(dotted_name) (relative_import)] @spec)
+"#;
+
+/// Go has no lexical nesting for methods, so a method's container cannot be found
+/// by enclosing span the way a TypeScript or Python one can. It comes from the
+/// receiver instead, with a pointer receiver unwrapped: `func (w *Worker) Run()`
+/// belongs to `Worker`.
+const GO_DEFS: &str = r#"
+(function_declaration name: (identifier) @name) @def
+(method_declaration
+  receiver: (parameter_list (parameter_declaration
+    name: (identifier)? @recvname
+    type: [(pointer_type (type_identifier) @recvty) (type_identifier) @recvty]))
+  name: (field_identifier) @name) @def
+(type_declaration (type_spec name: (type_identifier) @name)) @def
+"#;
+
+const GO_CALLS: &str = r#"
+(call_expression function: (identifier) @callee)
+(call_expression function: (selector_expression operand: (_) @recv field: (field_identifier) @callee))
+"#;
+
+/// `var x T`, `x := T{}`, and typed parameters. The receiver of a method is bound
+/// separately, since its type is what `w.foo()` inside the method resolves against.
+const GO_BINDINGS: &str = r#"
+(var_declaration (var_spec name: (identifier) @name type: (type_identifier) @ty))
+(short_var_declaration
+  left: (expression_list (identifier) @name)
+  right: (expression_list (composite_literal type: (type_identifier) @ty)))
+(parameter_declaration name: (identifier) @name type: (type_identifier) @ty)
+"#;
+
+const GO_IMPORTS: &str = r#"
+(import_spec path: (interpreted_string_literal) @spec)
+"#;
+
+const RUST_DEFS: &str = r#"
+(function_item name: (identifier) @name) @def
+(struct_item name: (type_identifier) @name) @def
+(enum_item name: (type_identifier) @name) @def
+(trait_item name: (type_identifier) @name) @def
+(type_item name: (type_identifier) @name) @def
+(mod_item name: (identifier) @name) @def
+"#;
+
+const RUST_CALLS: &str = r#"
+(call_expression function: (identifier) @callee)
+(call_expression function: (field_expression value: (_) @recv field: (field_identifier) @callee))
+(call_expression function: (scoped_identifier path: (_) @recv name: (identifier) @callee))
+"#;
+
+const RUST_BINDINGS: &str = r#"
+(let_declaration pattern: (identifier) @name type: (_) @ty)
+(parameter pattern: (identifier) @name type: (_) @ty)
+"#;
+
+const RUST_IMPORTS: &str = r#"
+(use_declaration argument: (_) @spec)
+(mod_item name: (identifier) @spec)
+"#;
+
+fn queries(lang: Lang) -> Queries {
+    match lang {
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => Queries {
+            defs: TS_DEFS,
+            calls: TS_CALLS,
+            bindings: TS_BINDINGS,
+            imports: TS_IMPORTS,
+        },
+        Lang::Python => Queries {
+            defs: PY_DEFS,
+            calls: PY_CALLS,
+            bindings: PY_BINDINGS,
+            imports: PY_IMPORTS,
+        },
+        Lang::Go => Queries {
+            defs: GO_DEFS,
+            calls: GO_CALLS,
+            bindings: GO_BINDINGS,
+            imports: GO_IMPORTS,
+        },
+        Lang::Rust => Queries {
+            defs: RUST_DEFS,
+            calls: RUST_CALLS,
+            bindings: RUST_BINDINGS,
+            imports: RUST_IMPORTS,
+        },
+    }
+}
+
+fn language(lang: Lang) -> tree_sitter::Language {
+    match lang {
+        Lang::TypeScript | Lang::JavaScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Lang::Python => tree_sitter_python::LANGUAGE.into(),
+        Lang::Go => tree_sitter_go::LANGUAGE.into(),
+        Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
+    }
+}
+
+struct CompiledExtractor {
+    parser: Parser,
+    defs: Query,
+    calls: Query,
+    bindings: Query,
+    imports: Query,
+    python_aliases: Option<Query>,
+}
+
+impl CompiledExtractor {
+    fn new(lang: Lang) -> Result<Self> {
+        let language = language(lang);
+        let mut parser = Parser::new();
+        parser.set_language(&language).context("set_language")?;
+        let queries = queries(lang);
+        Ok(Self {
+            parser,
+            defs: Query::new(&language, queries.defs).context("compile definition query")?,
+            calls: Query::new(&language, queries.calls).context("compile call query")?,
+            bindings: Query::new(&language, queries.bindings).context("compile binding query")?,
+            imports: Query::new(&language, queries.imports).context("compile import query")?,
+            python_aliases: (lang == Lang::Python)
+                .then(|| {
+                    Query::new(&language, PY_FIELD_ALIASES)
+                        .context("compile Python field-alias query")
+                })
+                .transpose()?,
+        })
+    }
+}
+
+/// Reusable parser and compiled-query state for one build.
+///
+/// Tree-sitter parsers and query compilation are much more expensive than
+/// clearing them for another file. Keeping one instance per language avoids
+/// paying that setup cost for every source file while preserving serial,
+/// deterministic extraction.
+pub struct Extractor {
+    compiled: HashMap<Lang, CompiledExtractor>,
+}
+
+impl Extractor {
+    pub fn new() -> Self {
+        Self {
+            compiled: HashMap::new(),
+        }
+    }
+
+    pub fn extract(&mut self, lang: Lang, src: &str) -> Result<Extracted> {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.compiled.entry(lang) {
+            entry.insert(CompiledExtractor::new(lang)?);
+        }
+        extract_compiled(
+            self.compiled
+                .get_mut(&lang)
+                .context("compiled extractor missing after insertion")?,
+            lang,
+            src,
+        )
+    }
+}
+
+/// A node's kind, mapped to the vocabulary stored in `symbols.kind`.
+fn kind_of(n: &Node) -> &'static str {
+    match n.kind() {
+        "class_definition" => "class",
+        "method_declaration" => "method",
+        "type_spec" | "type_declaration" => "type",
+        "class_declaration" => "class",
+        "interface_declaration" => "interface",
+        "type_alias_declaration" => "type",
+        "enum_declaration" => "enum",
+        "method_definition" => "method",
+        "struct_item" => "struct",
+        "enum_item" => "enum",
+        "trait_item" => "trait",
+        "type_item" => "type",
+        "mod_item" => "namespace",
+        _ => "function",
+    }
+}
+
+fn type_basename(text: &str) -> String {
+    let before_generics = text.trim().split('<').next().unwrap_or(text).trim();
+    before_generics
+        .rsplit("::")
+        .next()
+        .unwrap_or(before_generics)
+        .split_whitespace()
+        .last()
+        .unwrap_or(before_generics)
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .to_string()
+}
+
+fn rust_container_of(node: Node<'_>, src: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "impl_item" => {
+                let ty = parent.child_by_field_name("type")?;
+                return Some(type_basename(&src[ty.byte_range()]));
+            }
+            "trait_item" => {
+                let name = parent.child_by_field_name("name")?;
+                return Some(src[name.byte_range()].to_string());
+            }
+            _ => current = parent.parent(),
+        }
+    }
+    None
+}
+
+/// First line of the definition, trimmed — enough to identify a symbol without
+/// storing its body. This is what `grep` and `skeleton` display.
+fn signature_of(src: &str, n: &Node) -> String {
+    let text = &src[n.byte_range()];
+    let line = text.lines().next().unwrap_or("").trim();
+    let line = line.strip_suffix('{').unwrap_or(line).trim_end();
+    let mut s = line.to_string();
+    if s.len() > 200 {
+        let mut end = 200;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+        s.push('…');
+    }
+    s
+}
+
+fn search_text_of(src: &str, node: &Node<'_>) -> String {
+    const MAX_BYTES: usize = 32 * 1024;
+    let text = &src[node.byte_range()];
+    if text.len() <= MAX_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+#[cfg(test)]
+pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
+    Extractor::new().extract(lang, src)
+}
+
+fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> Result<Extracted> {
+    let tree = compiled
+        .parser
+        .parse(src, None)
+        .context("parse returned no tree")?;
+    let root = tree.root_node();
+
+    let def_q = &compiled.defs;
+    let name_idx = def_q
+        .capture_index_for_name("name")
+        .context("query lacks @name")?;
+    let def_idx = def_q
+        .capture_index_for_name("def")
+        .context("query lacks @def")?;
+
+    let recvty_idx = def_q.capture_index_for_name("recvty");
+    let recvname_idx = def_q.capture_index_for_name("recvname");
+    // Parallel to `symbols`: a Go method's receiver type and variable, filled
+    // during the definition pass.
+    let mut recv_types: Vec<Option<String>> = Vec::new();
+    let mut recv_names: Vec<Option<String>> = Vec::new();
+    let mut symbols: Vec<Symbol> = Vec::new();
+    // Byte span of each symbol, kept parallel to `symbols`, so a call site can be
+    // attributed to the innermost definition containing it.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+
+    let mut cursor = QueryCursor::new();
+    let mut it = cursor.matches(def_q, root, src.as_bytes());
+    while let Some(m) = it.next() {
+        let name_node = m
+            .captures
+            .iter()
+            .find(|c| c.index == name_idx)
+            .map(|c| c.node);
+        let def_node = m
+            .captures
+            .iter()
+            .find(|c| c.index == def_idx)
+            .map(|c| c.node);
+        let (Some(name_node), Some(def_node)) = (name_node, def_node) else {
+            continue;
+        };
+        let rust_container = if lang == Lang::Rust && def_node.kind() == "function_item" {
+            rust_container_of(def_node, src)
+        } else {
+            None
+        };
+        symbols.push(Symbol {
+            name: src[name_node.byte_range()].to_string(),
+            kind: if rust_container.is_some() {
+                "method".to_string()
+            } else {
+                kind_of(&def_node).to_string()
+            },
+            // tree-sitter rows are 0-based; every display surface is 1-based.
+            start_line: def_node.start_position().row as i64 + 1,
+            end_line: def_node.end_position().row as i64 + 1,
+            signature: signature_of(src, &def_node),
+            search_text: search_text_of(src, &def_node),
+        });
+        spans.push((def_node.start_byte(), def_node.end_byte()));
+        recv_types.push(
+            recvty_idx
+                .and_then(|i| m.captures.iter().find(|c| c.index == i))
+                .map(|c| src[c.node.byte_range()].to_string())
+                .or(rust_container),
+        );
+        recv_names.push(
+            recvname_idx
+                .and_then(|i| m.captures.iter().find(|c| c.index == i))
+                .map(|c| src[c.node.byte_range()].to_string()),
+        );
+    }
+
+    // Innermost definition containing a byte offset. Narrowest wins, so a call in
+    // a method is credited to the method rather than to the class around it.
+    let owner_at = |at: usize| -> Option<usize> {
+        spans
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, e))| *s <= at && at < *e)
+            .min_by_key(|(_, (s, e))| e - s)
+            .map(|(i, _)| i)
+    };
+    // Innermost enclosing symbol of any kind, excluding the symbol itself. This is
+    // what `contains` is built from: class->method, function->nested function, and
+    // (where None) file->top-level definition.
+    let parents: Vec<Option<usize>> = (0..symbols.len())
+        .map(|i| {
+            let (ms, me) = spans[i];
+            spans
+                .iter()
+                .enumerate()
+                .filter(|(j, (s, e))| *j != i && *s <= ms && me <= *e)
+                .min_by_key(|(_, (s, e))| e - s)
+                .map(|(j, _)| j)
+        })
+        .collect();
+
+    // Python has one definition node for both, so a function whose parent is a
+    // class is reclassified here. Without it Python methods carry no container and
+    // no member call against them can ever resolve.
+    for i in 0..symbols.len() {
+        if symbols[i].kind == "function"
+            && let Some(p) = parents[i]
+            && symbols[p].kind == "class"
+        {
+            symbols[i].kind = "method".to_string();
+        }
+    }
+
+    // Innermost enclosing *class*. Declared after the reclassification above so it
+    // borrows `symbols` only once the kinds are final.
+    let class_at = |at: usize| -> Option<usize> {
+        spans
+            .iter()
+            .enumerate()
+            .filter(|(i, (s, e))| *s <= at && at < *e && symbols[*i].kind == "class")
+            .min_by_key(|(_, (s, e))| e - s)
+            .map(|(i, _)| i)
+    };
+
+    let containers: Vec<Option<String>> = symbols
+        .iter()
+        .enumerate()
+        .map(|(i, sym)| {
+            if sym.kind != "method" {
+                return None;
+            }
+            // Go: the receiver type. Everywhere else: the enclosing class.
+            recv_types[i]
+                .clone()
+                .or_else(|| class_at(spans[i].0).map(|c| symbols[c].name.clone()))
+        })
+        .collect();
+
+    let call_q = &compiled.calls;
+    let callee_idx = call_q
+        .capture_index_for_name("callee")
+        .context("query lacks @callee")?;
+    let recv_idx = call_q
+        .capture_index_for_name("recv")
+        .context("query lacks @recv")?;
+    let mut calls = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut it = cursor.matches(call_q, root, src.as_bytes());
+    while let Some(m) = it.next() {
+        // Per match, not per capture: a member call matches @recv and @callee
+        // together, and iterating captures would record the call twice.
+        let Some(callee_node) = m
+            .captures
+            .iter()
+            .find(|c| c.index == callee_idx)
+            .map(|c| c.node)
+        else {
+            continue;
+        };
+        calls.push(CallIntent {
+            from: owner_at(callee_node.start_byte()),
+            callee: src[callee_node.byte_range()].to_string(),
+            receiver: m
+                .captures
+                .iter()
+                .find(|c| c.index == recv_idx)
+                .map(|c| src[c.node.byte_range()].to_string()),
+        });
+    }
+
+    let bind_q = &compiled.bindings;
+    let b_name = bind_q.capture_index_for_name("name");
+    let b_field = bind_q.capture_index_for_name("field");
+    let _ = &b_field;
+    let b_ty = bind_q
+        .capture_index_for_name("ty")
+        .context("query lacks @ty")?;
+    let mut bindings = Vec::new();
+    for (owner, (name, ty)) in recv_names.iter().zip(&recv_types).enumerate() {
+        if let (Some(name), Some(ty)) = (name, ty) {
+            bindings.push(Binding {
+                owner: Some(owner),
+                name: name.clone(),
+                ty: ty.clone(),
+            });
+        }
+    }
+    let mut cursor = QueryCursor::new();
+    let mut it = cursor.matches(bind_q, root, src.as_bytes());
+    while let Some(m) = it.next() {
+        let Some(ty_node) = m.captures.iter().find(|c| c.index == b_ty).map(|c| c.node) else {
+            continue;
+        };
+        let raw_ty = &src[ty_node.byte_range()];
+        let ty = if lang == Lang::Rust {
+            type_basename(raw_ty)
+        } else {
+            raw_ty.to_string()
+        };
+
+        // A class field binds `this.<field>` and is scoped to the class, so a
+        // method body's `this.repo.scan()` finds it. A plain variable or parameter
+        // binds its own name in whatever definition encloses it.
+        if let Some(f) = b_field.and_then(|i| m.captures.iter().find(|c| c.index == i)) {
+            let at = f.node.start_byte();
+            bindings.push(Binding {
+                owner: class_at(at),
+                name: format!("this.{}", &src[f.node.byte_range()]),
+                ty,
+            });
+        } else if let Some(n) = b_name.and_then(|i| m.captures.iter().find(|c| c.index == i)) {
+            let at = n.node.start_byte();
+            bindings.push(Binding {
+                owner: owner_at(at),
+                name: src[n.node.byte_range()].to_string(),
+                ty,
+            });
+        }
+    }
+
+    // Propagate an annotated parameter into a self field:
+    // `def __init__(self, store: Store): self.store = store`.
+    if lang == Lang::Python {
+        let alias_q = compiled
+            .python_aliases
+            .as_ref()
+            .context("Python extractor lacks field-alias query")?;
+        let object_idx = alias_q
+            .capture_index_for_name("object")
+            .context("alias query lacks @object")?;
+        let field_idx = alias_q
+            .capture_index_for_name("field")
+            .context("alias query lacks @field")?;
+        let source_idx = alias_q
+            .capture_index_for_name("source")
+            .context("alias query lacks @source")?;
+        let mut aliases = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(alias_q, root, src.as_bytes());
+        while let Some(m) = matches.next() {
+            let captured = |index| {
+                m.captures
+                    .iter()
+                    .find(|capture| capture.index == index)
+                    .map(|capture| capture.node)
+            };
+            let (Some(object), Some(field), Some(source)) = (
+                captured(object_idx),
+                captured(field_idx),
+                captured(source_idx),
+            ) else {
+                continue;
+            };
+            if &src[object.byte_range()] != "self" {
+                continue;
+            }
+            aliases.push((field, source));
+        }
+        for (field, source) in aliases {
+            let scope = owner_at(field.start_byte());
+            let source_name = &src[source.byte_range()];
+            let Some(ty) = bindings
+                .iter()
+                .find(|binding| binding.owner == scope && binding.name == source_name)
+                .map(|binding| binding.ty.clone())
+            else {
+                continue;
+            };
+            bindings.push(Binding {
+                owner: class_at(field.start_byte()),
+                name: format!("this.{}", &src[field.byte_range()]),
+                ty,
+            });
+        }
+    }
+
+    let imp_q = &compiled.imports;
+    let mut imports = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut it = cursor.matches(imp_q, root, src.as_bytes());
+    while let Some(m) = it.next() {
+        for c in m.captures {
+            // The capture is a string literal including its quotes.
+            let raw = &src[c.node.byte_range()];
+            let spec = raw.trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`');
+            if !spec.is_empty() {
+                imports.push(spec.to_string());
+            }
+        }
+    }
+
+    Ok(Extracted {
+        symbols,
+        calls,
+        bindings,
+        containers,
+        parents,
+        imports,
+    })
+}
+
+/// Resolve bare callee names against the whole-repo symbol index.
+///
+/// Ambiguity is dropped, not guessed: a name defined in more than one file cannot
+/// be attributed to one of them from a bare call site, and inventing an edge is
+/// worse than omitting one — `callers` is used to decide what a change breaks.
+pub fn resolve(by_name: &HashMap<String, Vec<i64>>, from_id: i64, callee: &str) -> Option<i64> {
+    match by_name.get(callee)?.as_slice() {
+        [only] => Some(*only),
+        // Self-recursion resolves even when the name is ambiguous repo-wide.
+        many if many.contains(&from_id) => Some(from_id),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(src: &str) -> Vec<(String, String)> {
+        extract(Lang::TypeScript, src)
+            .unwrap()
+            .symbols
+            .into_iter()
+            .map(|s| (s.name, s.kind))
+            .collect()
+    }
+
+    #[test]
+    fn finds_the_definition_shapes_typescript_actually_uses() {
+        let src = r#"
+export function greet(name: string): string { return `hi ${name}`; }
+export const shout = (s: string) => s.toUpperCase();
+export class Repo {
+  scan(): void {}
+}
+export interface Node { id: string }
+export type Id = string;
+enum Color { Red }
+"#;
+        let got = names(src);
+        for want in [
+            ("greet", "function"),
+            ("shout", "function"),
+            ("Repo", "class"),
+            ("scan", "method"),
+            ("Node", "interface"),
+            ("Id", "type"),
+            ("Color", "enum"),
+        ] {
+            assert!(
+                got.contains(&(want.0.to_string(), want.1.to_string())),
+                "missing {want:?} in {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_const_is_not_a_symbol() {
+        // Only function-valued declarators are definitions; indexing every const
+        // would bury real symbols under configuration and string literals.
+        let got = names("const MAX = 10; const cfg = { a: 1 };");
+        assert!(got.is_empty(), "expected no symbols, got {got:?}");
+    }
+
+    #[test]
+    fn lines_are_one_based() {
+        let e = extract(Lang::TypeScript, "\n\nfunction f() {}\n").unwrap();
+        assert_eq!(
+            e.symbols[0].start_line, 3,
+            "tree-sitter rows are 0-based; storage is 1-based"
+        );
+    }
+
+    #[test]
+    fn long_unicode_signatures_truncate_on_a_char_boundary() {
+        let src = format!("function f(/*{}é*/) {{}}", "a".repeat(186));
+        let e = extract(Lang::TypeScript, &src).unwrap();
+        assert!(e.symbols[0].signature.ends_with('…'));
+        assert!(e.symbols[0].signature.len() <= 203);
+    }
+
+    #[test]
+    fn calls_are_credited_to_the_innermost_definition() {
+        let src = r#"
+class Service {
+  run(): void { helper(); }
+}
+function helper(): void {}
+"#;
+        let e = extract(Lang::TypeScript, src).unwrap();
+        let run = e.symbols.iter().position(|s| s.name == "run").unwrap();
+        let call = e
+            .calls
+            .iter()
+            .find(|c| c.callee == "helper")
+            .expect("call not found");
+        assert_eq!(
+            call.from,
+            Some(run),
+            "the call belongs to run(), not to the enclosing class"
+        );
+    }
+
+    #[test]
+    fn method_calls_record_the_bare_property_name() {
+        let e = extract(Lang::TypeScript, "function f() { repo.scan(); }").unwrap();
+        assert!(e.calls.iter().any(|c| c.callee == "scan"), "{:?}", e.calls);
+    }
+
+    #[test]
+    fn resolve_refuses_to_guess_between_duplicates() {
+        let mut idx = HashMap::new();
+        idx.insert("unique".to_string(), vec![7]);
+        idx.insert("dup".to_string(), vec![1, 2]);
+        assert_eq!(resolve(&idx, 99, "unique"), Some(7));
+        assert_eq!(
+            resolve(&idx, 99, "dup"),
+            None,
+            "an invented edge is worse than a missing one"
+        );
+        assert_eq!(resolve(&idx, 99, "absent"), None);
+        // …except recursion, where the caller is itself a candidate.
+        assert_eq!(resolve(&idx, 2, "dup"), Some(2));
+    }
+
+    #[test]
+    fn tsx_parses_as_its_own_dialect() {
+        let e = extract(Lang::Tsx, "const App = () => <div>hi</div>;").unwrap();
+        assert_eq!(e.symbols.len(), 1);
+        assert_eq!(e.symbols[0].name, "App");
+    }
+
+    #[test]
+    fn javascript_family_reuses_typescript_grammar() {
+        let e = extract(
+            Lang::JavaScript,
+            "export function buildViewer() { helper(); }",
+        )
+        .unwrap();
+        assert!(e.symbols.iter().any(|symbol| symbol.name == "buildViewer"));
+        assert!(e.calls.iter().any(|call| call.callee == "helper"));
+    }
+}
+
+#[cfg(test)]
+mod lang_tests {
+    use super::*;
+
+    #[test]
+    fn python_definitions_calls_and_receiver_binding() {
+        let src = r#"
+import os
+from pkg.mod import helper
+
+class Repo:
+    def scan(self):
+        return 1
+
+def main():
+    r = Repo()
+    r.scan()
+    helper()
+"#;
+        let e = extract(Lang::Python, src).unwrap();
+        let names: Vec<_> = e
+            .symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind.as_str()))
+            .collect();
+        assert!(names.contains(&("Repo", "class")), "{names:?}");
+        assert!(
+            names.contains(&("scan", "method")),
+            "a def inside a class is a method: {names:?}"
+        );
+        assert_eq!(
+            e.containers[e.symbols.iter().position(|s| s.name == "scan").unwrap()].as_deref(),
+            Some("Repo"),
+            "without a container, r.scan() can never resolve"
+        );
+        assert!(names.contains(&("main", "function")), "{names:?}");
+
+        // `r = Repo()` is a constructor binding, which is what lets r.scan()
+        // resolve to Repo.scan rather than to every method named scan.
+        assert!(
+            e.bindings.iter().any(|b| b.name == "r" && b.ty == "Repo"),
+            "{:?}",
+            e.bindings
+        );
+        assert!(
+            e.calls
+                .iter()
+                .any(|c| c.callee == "scan" && c.receiver.as_deref() == Some("r"))
+        );
+        assert!(
+            e.calls
+                .iter()
+                .any(|c| c.callee == "helper" && c.receiver.is_none())
+        );
+        assert!(e.imports.iter().any(|i| i == "os"), "{:?}", e.imports);
+        assert!(e.imports.iter().any(|i| i == "pkg.mod"), "{:?}", e.imports);
+    }
+
+    #[test]
+    fn python_methods_are_contained_by_their_class() {
+        let e = extract(Lang::Python, "class A:\n    def m(self):\n        pass\n").unwrap();
+        let m = e.symbols.iter().position(|s| s.name == "m").unwrap();
+        let a = e.symbols.iter().position(|s| s.name == "A").unwrap();
+        assert_eq!(e.parents[m], Some(a), "contains must link A -> m");
+    }
+
+    #[test]
+    fn python_preserves_relative_import_prefixes() {
+        let e = extract(Lang::Python, "from ..pkg.mod import helper\n").unwrap();
+        assert_eq!(e.imports, ["..pkg.mod"]);
+    }
+
+    #[test]
+    fn python_binds_self_fields_from_constructor_assignment() {
+        // `self.store.fetch()` only resolves if `self.store = Store()` is recorded
+        // as a field binding scoped to the class.
+        let e = extract(
+            Lang::Python,
+            "class S:\n    def __init__(self):\n        self.store = Store()\n",
+        )
+        .unwrap();
+        assert!(
+            e.bindings
+                .iter()
+                .any(|b| b.name.ends_with("store") && b.ty == "Store"),
+            "{:?}",
+            e.bindings
+        );
+    }
+
+    #[test]
+    fn python_propagates_annotated_parameter_into_self_field() {
+        let e = extract(
+            Lang::Python,
+            "class S:\n    def __init__(self, store: Store):\n        self.store = store\n",
+        )
+        .unwrap();
+        assert!(
+            e.bindings
+                .iter()
+                .any(|binding| binding.name == "this.store" && binding.ty == "Store"),
+            "{:?}",
+            e.bindings
+        );
+    }
+
+    #[test]
+    fn go_definitions_and_method_receivers() {
+        let src = r#"
+package main
+
+import "fmt"
+
+type Worker struct{ n int }
+
+func (w *Worker) Run() {
+	fmt.Println(w.n)
+}
+
+func (*Worker) Idle() {}
+
+func main() {
+	var w Worker
+	w.Run()
+}
+"#;
+        let e = extract(Lang::Go, src).unwrap();
+        let names: Vec<_> = e
+            .symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind.as_str()))
+            .collect();
+        assert!(names.contains(&("Worker", "type")), "{names:?}");
+        assert!(names.contains(&("Run", "method")), "{names:?}");
+        assert!(
+            names.contains(&("Idle", "method")),
+            "anonymous receivers still define methods: {names:?}"
+        );
+        assert!(names.contains(&("main", "function")), "{names:?}");
+
+        assert!(
+            e.bindings.iter().any(|b| b.name == "w" && b.ty == "Worker"),
+            "`var w Worker` must bind: {:?}",
+            e.bindings
+        );
+        let run = e.symbols.iter().position(|s| s.name == "Run").unwrap();
+        assert!(
+            e.bindings
+                .iter()
+                .any(|b| b.owner == Some(run) && b.name == "w" && b.ty == "Worker"),
+            "method receiver must bind inside its method: {:?}",
+            e.bindings
+        );
+        assert!(
+            e.calls
+                .iter()
+                .any(|c| c.callee == "Run" && c.receiver.as_deref() == Some("w"))
+        );
+        assert!(e.imports.iter().any(|i| i == "fmt"), "{:?}", e.imports);
+        // Go methods are not lexically nested, so the container comes from the
+        // receiver — with the pointer unwrapped.
+        assert_eq!(
+            e.containers[e.symbols.iter().position(|s| s.name == "Run").unwrap()].as_deref(),
+            Some("Worker")
+        );
+    }
+
+    #[test]
+    fn rust_definitions_methods_calls_bindings_and_imports() {
+        let src = r#"
+use crate::db::helper;
+
+struct Store;
+struct Other;
+
+impl Store {
+    fn fetch(&self) {}
+    fn run(&self, other: Other) {
+        self.fetch();
+        helper();
+        consume(other);
+    }
+}
+
+fn consume(_: Other) {}
+"#;
+        let e = extract(Lang::Rust, src).unwrap();
+        let names: Vec<_> = e
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind.as_str()))
+            .collect();
+        assert!(names.contains(&("Store", "struct")), "{names:?}");
+        assert!(names.contains(&("fetch", "method")), "{names:?}");
+        assert!(names.contains(&("run", "method")), "{names:?}");
+        let run = e
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name == "run")
+            .unwrap();
+        assert_eq!(e.containers[run].as_deref(), Some("Store"));
+        assert!(
+            e.calls
+                .iter()
+                .any(|call| call.callee == "fetch" && call.receiver.as_deref() == Some("self"))
+        );
+        assert!(
+            e.bindings
+                .iter()
+                .any(|binding| binding.name == "other" && binding.ty == "Other")
+        );
+        assert_eq!(e.imports, ["crate::db::helper"]);
+    }
+}

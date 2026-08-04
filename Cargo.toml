@@ -1,0 +1,30 @@
+[package]
+name = "panoptes"
+version = "0.1.0"
+edition = "2024"
+description = "Local repository structure and retrieval CLI"
+license = "MIT"
+repository = "https://github.com/wallentx/panoptes"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.5", features = ["derive"] }
+clap_complete = "4.6.0"
+dialoguer = { version = "0.12.0", default-features = false }
+ignore = "0.4.31"
+libc = "0.2.189"
+regex = "1.13.1"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
+streaming-iterator = "0.1.9"
+tree-sitter = "0.26.11"
+tree-sitter-go = "0.25.0"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

@@ -1,0 +1,18 @@
+/target/
+/release/
+*.log
+
+# Env
+.env
+.env.local
+
+# OS
+.DS_Store
+
+# Session transcripts and prompt traces — local analysis, not product.
+transcripts/
+
+# Agent-host integration is machine/user state. `panoptes init` writes only to
+# user-level host configuration; never commit generated local host wiring.
+/.claude/
+/.codegraph/

@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  release-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install into isolated prefix
+        run: cargo install --path . --locked --root "$RUNNER_TEMP/panoptes-prefix"
+
+      - name: Exercise every command and an indexed fixture
+        env:
+          PANOPTES_BIN: ${{ runner.temp }}/panoptes-prefix/bin/panoptes
+          PANOPTES_STORE: ${{ runner.temp }}/panoptes-smoke.db
+          PANOPTES_HOME: ${{ runner.temp }}/panoptes-home
+        run: |
+          set -euxo pipefail
+          "$PANOPTES_BIN" --version
+          for command in build ask grep callers skeleton map mcp init check export completions cache version upgrade viz status; do
+            "$PANOPTES_BIN" "$command" --help >/dev/null
+          done
+          smoke=$(mktemp -d)
+          mkdir -p "$smoke/src" "$PANOPTES_HOME"
+          printf '%s\n' 'export function greet(name: string) { return "hello " + name; }' 'export function main() { return greet("world"); }' > "$smoke/src/a.ts"
+          git -C "$smoke" init -q
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" build "$smoke"
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" ask greet "$smoke" --json
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" grep greet --path "$smoke" --json
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" callers greet --path "$smoke" --json
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" skeleton a.ts --path "$smoke" --json
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" map "$smoke" --json
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" check "$smoke" --json
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" status "$smoke" --json
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" export "$RUNNER_TEMP/export.json" --path "$smoke" --json
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" viz "$smoke" --output "$RUNNER_TEMP/map.html"
+          HOME="$PANOPTES_HOME" "$PANOPTES_BIN" init --provider codex --dry-run --json
+          test ! -e "$PANOPTES_HOME/.codex/config.toml"
+          HOME="$PANOPTES_HOME" "$PANOPTES_BIN" init --provider codex
+          grep -q '\[mcp_servers.panoptes\]' "$PANOPTES_HOME/.codex/config.toml"
+          HOME="$PANOPTES_HOME" "$PANOPTES_BIN" init --provider codex --deregister
+          if grep -q '\[mcp_servers.panoptes\]' "$PANOPTES_HOME/.codex/config.toml"; then
+            exit 1
+          fi
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | "$PANOPTES_BIN" --store "$PANOPTES_STORE" mcp "$smoke" | grep -q '"tools"'
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" grep greet --path "$smoke" | head -n 1 >/dev/null
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" cache clear --yes
+          printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}' | "$PANOPTES_BIN" --store "$PANOPTES_STORE" mcp "$smoke" | grep -q '"indexed":true'
+          printf '%s\n' 'export function added() { return greet("again"); }' >> "$smoke/src/a.ts"
+          printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"find","arguments":{"query":"added"}}}' | "$PANOPTES_BIN" --store "$PANOPTES_STORE" mcp "$smoke" | grep -q 'added'
+          "$PANOPTES_BIN" --store "$PANOPTES_STORE" cache doctor
+
+  termux-container:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build and run in Termux Bionic userland
+        run: |
+          set -euxo pipefail
+          docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace termux/termux-docker:latest bash -lc "
+            set -eu
+            pkg update -y
+            pkg install -y rust clang make git pkg-config
+            cargo test --workspace --all-targets --locked
+            cargo build --workspace --release --locked
+            file target/release/panoptes
+            target/release/panoptes --version
+            target/release/panoptes version --json
+          "
