@@ -1,0 +1,4 @@
+task	prompt	required_terms
+auth-routing	Explain how PocketBase wires the record authentication API into its router and how successful auth methods converge on the shared response path. Cite exact files and functions. Do not change files.	apis/base.go|NewRouter|apis/record_auth.go|bindRecordAuthApi|apis/record_helpers.go|recordAuthResponse
+auth-methods	Compare the password, OTP, and OAuth2 record authentication paths, including where each hands off to common response handling. Cite exact files and functions. Do not change files.	record_auth_with_password.go|recordAuthWithPassword|record_auth_with_otp.go|recordAuthWithOTP|record_auth_with_oauth2.go|recordAuthWithOAuth2|recordAuthResponse
+auth-response	Trace what recordAuthResponse does after an authentication method succeeds, including hooks, MFA, token handling, and the response. Cite exact files and functions. Do not change files.	apis/record_helpers.go|recordAuthResponse|OnRecordAuthRequest|checkMFA|authAlert

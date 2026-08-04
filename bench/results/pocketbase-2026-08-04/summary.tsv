@@ -1,0 +1,8 @@
+workload	samples	median_wall_ms	median_peak_rss_kb	db_bytes
+ask	5	423	76812	42213376
+callers	5	29	16228	42213376
+cold-build	3	2520	91912	42168320
+grep	5	44	16276	42213376
+map	5	18360	16400	42213376
+one-file-build	3	280	48752	42213376
+warm-build	3	207	48572	42172416

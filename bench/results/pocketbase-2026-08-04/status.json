@@ -1,0 +1,17 @@
+[
+  {
+    "scope": "pocketbase",
+    "files": 704,
+    "symbols": 15588,
+    "edges": 45693,
+    "extractor_stamp": "panoptes-1",
+    "schema_version": 1,
+    "freshness": {
+      "indexed": true,
+      "extractor_current": true,
+      "added": [],
+      "modified": [],
+      "deleted": []
+    }
+  }
+]

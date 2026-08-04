@@ -1,0 +1,14 @@
+key	value
+timestamp_utc	2026-08-04T21:52:40Z
+corpus	pocketbase
+repo_url	https://github.com/pocketbase/pocketbase.git
+revision	0a74d2f25d6decfc9bd0fc64656ec431f23bf610
+indexed_source_files	705
+repository_bytes	23394573
+uname	Linux brickroad 7.1.5-arch1-2 #1 SMP PREEMPT_DYNAMIC Tue, 28 Jul 2026 13:49:51 +0000 x86_64 GNU/Linux
+rustc	rustc 1.97.1 (8bab26f4f 2026-07-14)
+panoptes	panoptes 0.1.0
+panoptes_git_sha	5f184a8bc78900650fcfdae5d41def75777f4914
+panoptes_git_dirty	true
+build_runs	3
+query_runs	5

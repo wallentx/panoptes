@@ -29,9 +29,13 @@ line spans, signatures, and bounded source.
 
 ## Work from the result
 
+- For a scoped question, start with one `find` or `grep` call, not `map`. Treat
+  three Panoptes calls as the normal budget for the whole task.
 - Act from returned paths and spans rather than repeating the same query with
   slightly different wording. Switch tools when the question changes from
   relevance to exhaustiveness or graph traversal.
+- Do not issue a series of `find` calls to reconstruct individual files. Use one
+  exhaustive `grep`, then read only the reported spans that are still needed.
 - Fall back to built-in search or targeted reads when Panoptes has no suitable
   result, the file type is not indexed, or exact surrounding implementation is
   required.

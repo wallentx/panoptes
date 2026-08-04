@@ -15,19 +15,25 @@ repository file by file.
 
 ## Fast enough to stay in the loop
 
-Local benchmark on a 400-file synthetic repository:
+**Index a 704-file production repository in 2.5 seconds. Refresh a one-file
+change in 280 ms. Trace callers in 29 ms.**
+
+Measured against a pinned PocketBase revision:
 
 | Operation | Median |
 | --- | ---: |
-| Cold index | **71 ms** |
-| Refresh unchanged index | **18 ms** |
-| Ranked code search | **22 ms** |
-| Exhaustive text search | **8 ms** |
-| Trace callers | **4 ms** |
+| Fresh index | **2.52 s** |
+| Refresh unchanged index | **207 ms** |
+| Refresh one changed file | **280 ms** |
+| Ranked code search | **423 ms** |
+| Exhaustive text search | **44 ms** |
+| Trace callers | **29 ms** |
 
-Measured over 3 build runs and 5 query runs on Linux with an AMD Ryzen AI 7
-PRO 350. The resulting index was 2.0 MiB and peak RSS stayed below 25 MiB.
-Reproduce it with `scripts/benchmark.sh`; results vary by machine and codebase.
+PocketBase produced 15,588 symbols and 45,693 resolved edges in a 40.3 MiB
+index. Medians cover 3 build runs and 5 query runs on Linux with an AMD Ryzen
+AI 7 PRO 350; peak RSS stayed below 90 MiB. The corpus, revision, raw outputs,
+synthetic regression test, and controlled agent runner are documented in
+[bench/README.md](bench/README.md). Results vary by machine and codebase.
 
 ## Get running
 

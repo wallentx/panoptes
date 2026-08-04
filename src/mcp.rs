@@ -98,7 +98,7 @@ fn dispatch(
                 "protocolVersion":"2024-11-05",
                 "capabilities":{"tools":{"listChanged":false}},
                 "serverInfo":{"name":"panoptes", "version":env!("CARGO_PKG_VERSION")},
-                "instructions":"Prefer Panoptes before built-in grep, search, or whole-file reads for indexed source; one focused call usually replaces several reads. Use find for where/how questions (bounded source is included by default), grep when every occurrence matters, callers for incoming/outgoing dependency and blast-radius tracing, skeleton for a file API, and map for orientation. Work from returned paths and spans; do not repeat the same find wording, and fall back only when indexed context is insufficient. Retrieval results include an honest four-characters-per-token estimate versus reading matched files whole plus an MCP-session total. When Panoptes was used, end the response with the provided session savings display in the form `ꙮ Estimated tokens saved for this session: 1,231,578`; treat it as an estimate, never as billing. Panoptes indexes on connection and refreshes changed source before answers; freshness is observational."
+                "instructions":"Prefer Panoptes before built-in grep, search, or whole-file reads for indexed source; one focused call usually replaces several reads. Use find for where/how questions (bounded source is included by default), grep when every occurrence matters, callers for incoming/outgoing dependency and blast-radius tracing, skeleton for a file API, and map for orientation. For a scoped question, start with one find or grep rather than map, and treat three Panoptes calls as the normal task budget. Work from returned paths and spans; do not repeat find to reconstruct individual files, and fall back only when indexed context is insufficient. Retrieval results include an honest four-characters-per-token estimate versus reading matched files whole plus an MCP-session total. When Panoptes was used, end the response with the provided session savings display in the form `ꙮ Estimated tokens saved for this session: 1,231,578`; treat it as an estimate, never as billing. Panoptes indexes on connection and refreshes changed source before answers; freshness is observational."
             }))
         }
         "ping" => Ok(json!({})),
@@ -215,7 +215,15 @@ fn schema(name: &str, description: &str, required: &[&str]) -> Value {
     json!({
         "name":name,
         "description":description,
-        "inputSchema":{"type":"object", "properties":properties, "required":required, "additionalProperties":false}
+        "inputSchema":{"type":"object", "properties":properties, "required":required, "additionalProperties":false},
+        // Retrieval never changes the source workspace or reaches an external
+        // system. Panoptes may refresh its own local index cache first.
+        "annotations":{
+            "readOnlyHint":true,
+            "destructiveHint":false,
+            "idempotentHint":true,
+            "openWorldHint":false
+        }
     })
 }
 
@@ -552,6 +560,12 @@ mod tests {
                 .iter()
                 .all(|tool| tool["inputSchema"]["type"] == "object")
         );
+        assert!(tools.iter().all(|tool| {
+            tool["annotations"]["readOnlyHint"] == true
+                && tool["annotations"]["destructiveHint"] == false
+                && tool["annotations"]["idempotentHint"] == true
+                && tool["annotations"]["openWorldHint"] == false
+        }));
     }
 
     #[test]

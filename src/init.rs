@@ -21,10 +21,14 @@ For coding tasks involving indexed source, prefer the Panoptes MCP tools before
 built-in grep, search, or whole-file reads. Use `find` for ranked code context,
 `grep` for exhaustive occurrences, `callers` for dependencies and blast radius,
 `skeleton` for a file API, and `map` for repository orientation. Work from the
-returned paths, spans, and bounded source before reading more. When Panoptes was
-used, end the response with the MCP-provided session savings display in this
-form: `ꙮ Estimated tokens saved for this session: 1,231,578`. Treat it as an
-estimate versus reading matched files whole, never as model billing."#;
+returned paths, spans, and bounded source before reading more. For a scoped
+question, start with one `find` or `grep` call rather than `map`, and treat three
+Panoptes calls as the normal task budget. Do not repeat `find` to reconstruct
+individual files; use one exhaustive `grep`, then read only needed spans. When
+Panoptes was used, end the response with the MCP-provided session savings
+display in this form: `ꙮ Estimated tokens saved for this session: 1,231,578`.
+Treat it as an estimate versus reading matched files whole, never as model
+billing."#;
 
 struct Provider {
     id: &'static str,
