@@ -88,8 +88,13 @@ fn git_toplevel(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// A git repository, or an immediate workspace containing at least two repos.
-pub fn targets(start: &Path) -> Result<Vec<Target>> {
+/// Git repositories that are safe to index automatically.
+///
+/// A single repository may contain `start`, or `start` may be an immediate
+/// workspace containing at least two repositories. A plain directory returns
+/// no targets so an MCP client launched from a broad directory does not walk it
+/// recursively during startup.
+pub fn automatic_targets(start: &Path) -> Result<Vec<Target>> {
     let start = std::fs::canonicalize(start)
         .with_context(|| format!("canonicalize {}", start.display()))?;
     if let Some(root) = git_toplevel(&start) {
@@ -121,15 +126,26 @@ pub fn targets(start: &Path) -> Result<Vec<Target>> {
     if children.len() >= 2 {
         Ok(children)
     } else {
-        Ok(vec![Target {
-            label: start
+        Ok(Vec::new())
+    }
+}
+
+/// Explicit CLI targets, including a plain directory selected by the user.
+pub fn targets(start: &Path) -> Result<Vec<Target>> {
+    let mut targets = automatic_targets(start)?;
+    if targets.is_empty() {
+        let root = std::fs::canonicalize(start)
+            .with_context(|| format!("canonicalize {}", start.display()))?;
+        targets.push(Target {
+            label: root
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
-            root: start,
-        }])
+            root,
+        });
     }
+    Ok(targets)
 }
 
 /// `git rev-parse --git-common-dir`, which is shared by every worktree of a repo.
@@ -302,6 +318,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alpha", "beta"]
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_targets_skip_a_plain_directory() {
+        let root =
+            std::env::temp_dir().join(format!("panoptes-plain-directory-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn plain() {}\n").unwrap();
+
+        assert!(automatic_targets(&root).unwrap().is_empty());
+        assert_eq!(targets(&root).unwrap()[0].root, root);
+
         let _ = std::fs::remove_dir_all(root);
     }
 

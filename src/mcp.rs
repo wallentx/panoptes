@@ -27,7 +27,7 @@ struct ToolData {
 }
 
 pub fn serve(store: &Path, start: &Path, no_refresh: bool) -> Result<()> {
-    let targets = repo::targets(start)?;
+    let targets = repo::automatic_targets(start)?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     let mut session = SessionStats::default();
@@ -94,11 +94,16 @@ fn dispatch(
     match method {
         "initialize" => {
             ensure_targets(store, targets, no_refresh)?;
+            let instructions = if targets.is_empty() {
+                "Panoptes started without indexing because the current directory is not a Git repository or a workspace containing at least two immediate Git repositories. Start the coding agent inside a repository to enable Panoptes source navigation."
+            } else {
+                "Prefer Panoptes before built-in grep, search, or whole-file reads for indexed source; one focused call usually replaces several reads. Use find for where/how questions (bounded source is included by default), grep when every occurrence matters, callers for incoming/outgoing dependency and blast-radius tracing, skeleton for a file API, and map for orientation. For a scoped question, start with one find or grep rather than map, and treat three Panoptes calls as the normal task budget. Work from returned paths and spans; do not repeat find to reconstruct individual files, and fall back only when indexed context is insufficient. Retrieval results include an honest four-characters-per-token estimate versus reading matched files whole plus an MCP-session total. When Panoptes was used, end the response with the provided session savings display in the form `ꙮ Estimated tokens saved for this session: 1,231,578`; treat it as an estimate, never as billing. Panoptes indexes on connection and refreshes changed source before answers; freshness is observational."
+            };
             Ok(json!({
                 "protocolVersion":"2024-11-05",
                 "capabilities":{"tools":{"listChanged":false}},
                 "serverInfo":{"name":"panoptes", "version":env!("CARGO_PKG_VERSION")},
-                "instructions":"Prefer Panoptes before built-in grep, search, or whole-file reads for indexed source; one focused call usually replaces several reads. Use find for where/how questions (bounded source is included by default), grep when every occurrence matters, callers for incoming/outgoing dependency and blast-radius tracing, skeleton for a file API, and map for orientation. For a scoped question, start with one find or grep rather than map, and treat three Panoptes calls as the normal task budget. Work from returned paths and spans; do not repeat find to reconstruct individual files, and fall back only when indexed context is insufficient. Retrieval results include an honest four-characters-per-token estimate versus reading matched files whole plus an MCP-session total. When Panoptes was used, end the response with the provided session savings display in the form `ꙮ Estimated tokens saved for this session: 1,231,578`; treat it as an estimate, never as billing. Panoptes indexes on connection and refreshes changed source before answers; freshness is observational."
+                "instructions":instructions
             }))
         }
         "ping" => Ok(json!({})),
@@ -473,6 +478,11 @@ fn select_targets<'a>(
     targets: &'a [repo::Target],
     label: Option<&str>,
 ) -> Result<Vec<&'a repo::Target>> {
+    if targets.is_empty() {
+        return Err(anyhow!(
+            "current directory is not a Git repository or a workspace containing at least two immediate Git repositories"
+        ));
+    }
     match label {
         None => Ok(targets.iter().collect()),
         Some(label) => targets
@@ -660,6 +670,44 @@ mod tests {
         )
         .unwrap();
 
+        assert!(!store.exists());
+    }
+
+    #[test]
+    fn initialize_without_targets_starts_idle_without_creating_a_store() {
+        let temp = TempDir::new("initialize-idle");
+        let store = temp.0.join("panoptes.db");
+
+        let response = dispatch(
+            &store,
+            &[],
+            "initialize",
+            &json!({}),
+            false,
+            &mut SessionStats::default(),
+        )
+        .unwrap();
+
+        assert_eq!(response["serverInfo"]["name"], "panoptes");
+        assert!(
+            response["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("started without indexing")
+        );
+        assert!(!store.exists());
+    }
+
+    #[test]
+    fn tool_call_without_targets_explains_why_navigation_is_unavailable() {
+        let temp = TempDir::new("tool-idle");
+        let store = temp.0.join("panoptes.db");
+
+        let problem = call_tool(&store, &[], "status", &json!({}), false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(problem.contains("current directory is not a Git repository"));
         assert!(!store.exists());
     }
 
