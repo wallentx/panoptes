@@ -31,6 +31,7 @@ pub fn serve(store: &Path, start: &Path, no_refresh: bool) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     let mut session = SessionStats::default();
+    let mut indexing = None;
     for line in stdin.lock().lines() {
         let line = line?;
         if line.len() > MAX_MESSAGE {
@@ -51,6 +52,9 @@ pub fn serve(store: &Path, start: &Path, no_refresh: bool) -> Result<()> {
         let id = id.unwrap_or(Value::Null);
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+        if method == "tools/call" {
+            finish_indexing(&mut indexing);
+        }
         let response = if !matches!(method, "initialize" | "ping" | "tools/list" | "tools/call") {
             error(id, -32601, &format!("method not found: {method}"))
         } else {
@@ -60,6 +64,9 @@ pub fn serve(store: &Path, start: &Path, no_refresh: bool) -> Result<()> {
             }
         };
         write_response(&mut stdout, response)?;
+        if method == "initialize" && indexing.is_none() {
+            indexing = start_indexing(store, &targets, no_refresh);
+        }
     }
     Ok(())
 }
@@ -93,7 +100,6 @@ fn dispatch(
 ) -> Result<Value> {
     match method {
         "initialize" => {
-            ensure_targets(store, targets, no_refresh)?;
             let instructions = if targets.is_empty() {
                 "Panoptes started without indexing because the current directory is not a Git repository or a workspace containing at least two immediate Git repositories. Start the coding agent inside a repository to enable Panoptes source navigation."
             } else {
@@ -123,6 +129,32 @@ fn dispatch(
             }))
         }
         _ => unreachable!("method validated by serve"),
+    }
+}
+
+fn start_indexing(
+    store: &Path,
+    targets: &[repo::Target],
+    no_refresh: bool,
+) -> Option<std::thread::JoinHandle<Result<()>>> {
+    if no_refresh || targets.is_empty() {
+        return None;
+    }
+    let store = store.to_path_buf();
+    let targets = targets.to_vec();
+    Some(std::thread::spawn(move || {
+        ensure_targets(&store, &targets, false)
+    }))
+}
+
+fn finish_indexing(worker: &mut Option<std::thread::JoinHandle<Result<()>>>) {
+    let Some(worker) = worker.take() else {
+        return;
+    };
+    match worker.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(problem)) => eprintln!("[panoptes] background indexing deferred: {problem:#}"),
+        Err(_) => eprintln!("[panoptes] background indexing worker panicked"),
     }
 }
 
@@ -617,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_builds_and_refreshes_the_index() {
+    fn initialize_responds_before_background_indexing_builds_and_refreshes() {
         let (_temp, store, target) = fixture("initialize-index");
         let targets = [target.clone()];
 
@@ -631,6 +663,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response["serverInfo"]["name"], "panoptes");
+        assert!(!store.exists(), "the handshake must not wait for SQLite");
+
+        let mut worker = start_indexing(&store, &targets, false);
+        finish_indexing(&mut worker);
         let conn = db::open(&store).unwrap();
         assert!(index::freshness(&conn, &target.root).unwrap().is_clean());
         drop(conn);
@@ -640,15 +676,8 @@ mod tests {
             "pub fn original() {}\npub fn refreshed() {}\n",
         )
         .unwrap();
-        dispatch(
-            &store,
-            &targets,
-            "initialize",
-            &json!({}),
-            false,
-            &mut SessionStats::default(),
-        )
-        .unwrap();
+        let mut worker = start_indexing(&store, &targets, false);
+        finish_indexing(&mut worker);
         let conn = db::open(&store).unwrap();
         assert!(index::freshness(&conn, &target.root).unwrap().is_clean());
         let repo_id = index::repo_id_of(&conn, &target.root).unwrap().unwrap();

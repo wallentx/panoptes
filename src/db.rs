@@ -133,26 +133,32 @@ pub fn open(path: &Path) -> Result<Connection> {
     let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
 
-    // WAL so a query can read while a build writes. `journal_mode` returns the
-    // mode actually in force, which is not necessarily the one requested — a
-    // filesystem without the shared memory WAL needs will quietly stay in
-    // rollback mode, and every concurrent read would then block behind a build.
-    let mode: String = db.query_row("pragma journal_mode=wal", [], |r| r.get(0))?;
-    anyhow::ensure!(
-        mode.eq_ignore_ascii_case("wal"),
-        "journal_mode is {mode:?}, not wal"
-    );
-    db.execute_batch("pragma foreign_keys=on; pragma synchronous=normal;")?;
-
     let found: i64 = db.query_row("pragma user_version", [], |r| r.get(0))?;
     anyhow::ensure!(
         matches!(found, 0 | SCHEMA_VERSION),
         "store at {} is schema v{found}; expected v{SCHEMA_VERSION}",
         path.display()
     );
-    db.execute_batch(DDL).context("apply schema")?;
-    if found != SCHEMA_VERSION {
+
+    // Setting journal_mode and executing even no-op CREATE statements both need
+    // SQLite schema/write locks. Do that only for a new store; repeating it for
+    // every MCP connection can fail while another repository is being indexed.
+    if found == 0 {
+        let mode: String = db.query_row("pragma journal_mode=wal", [], |r| r.get(0))?;
+        anyhow::ensure!(
+            mode.eq_ignore_ascii_case("wal"),
+            "journal_mode is {mode:?}, not wal"
+        );
+        db.execute_batch("pragma foreign_keys=on; pragma synchronous=normal;")?;
+        db.execute_batch(DDL).context("apply schema")?;
         db.execute_batch(&format!("pragma user_version={SCHEMA_VERSION}"))?;
+    } else {
+        let mode: String = db.query_row("pragma journal_mode", [], |r| r.get(0))?;
+        anyhow::ensure!(
+            mode.eq_ignore_ascii_case("wal"),
+            "journal_mode is {mode:?}, not wal"
+        );
+        db.execute_batch("pragma foreign_keys=on; pragma synchronous=normal;")?;
     }
     Ok(db)
 }
@@ -319,6 +325,25 @@ mod tests {
             .query_row("select count(*) from repos", [], |row| row.get(0))
             .unwrap();
         assert_eq!(after, 1);
+    }
+
+    #[test]
+    fn opening_an_existing_store_does_not_contend_with_a_writer() {
+        let g = tempdir::Guard::new();
+        let path = g.path().join("panoptes.db");
+        let mut writer = open(&path).unwrap();
+        let tx = writer.transaction().unwrap();
+        tx.execute(
+            "insert into repos(root, indexed_at, extractor_stamp) values ('/pending', 1, 'x')",
+            [],
+        )
+        .unwrap();
+
+        let reader = open(&path).unwrap();
+        let visible: i64 = reader
+            .query_row("select count(*) from repos", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(visible, 0, "the uncommitted writer remains invisible");
     }
 
     #[test]
