@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-1";
+pub const EXTRACTOR_STAMP: &str = "panoptes-2";
 
 pub struct BuildStats {
     pub files: usize,
@@ -705,6 +705,28 @@ fn resolve_import(
             return ids;
         }
         Lang::Rust => return resolve_rust_import(from_rel, spec, files),
+        Lang::Shell => {
+            if spec.contains('$') || spec.contains('`') {
+                return Vec::new();
+            }
+            vec![
+                normalize_path(&from_dir.join(spec)),
+                normalize_path(Path::new(spec)),
+            ]
+        }
+        Lang::Yaml => {
+            if !spec.starts_with('.') {
+                return Vec::new();
+            }
+            // GitHub Actions resolves local `uses:` paths from the repository
+            // root, not from the workflow file's directory.
+            let path = normalize_path(Path::new(spec));
+            vec![
+                path.clone(),
+                format!("{path}/action.yml"),
+                format!("{path}/action.yaml"),
+            ]
+        }
     };
     for candidate in candidates {
         if let Some(&id) = files.get(&candidate) {
@@ -1629,6 +1651,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(calls, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shell_and_yaml_relationships_resolve_across_indexed_files() {
+        let (db, root) = fixture(&[
+            (
+                ".github/workflows/ci.yml",
+                "defaults: &linux\n  runs-on: ubuntu-latest\njobs:\n  build:\n    <<: *linux\n    steps:\n      - uses: ./.github/actions/setup\n",
+            ),
+            (
+                ".github/actions/setup/action.yml",
+                "name: Setup\nruns:\n  using: composite\n",
+            ),
+            (
+                "scripts/main.sh",
+                "source \"./lib.sh\"\nmain() { helper; }\n",
+            ),
+            ("scripts/lib.sh", "helper() { echo ready; }\n"),
+        ]);
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+
+        let edge_count = |kind: &str, source: &str, target: &str| -> i64 {
+            db.query_row(
+                "select count(*) from edges e
+                   join symbols src on src.id=e.src_symbol_id
+                   join symbols dst on dst.id=e.dst_symbol_id
+                  where e.repo_id=?1 and e.kind=?2
+                    and src.name=?3 and dst.name=?4",
+                rusqlite::params![id, kind, source, target],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            edge_count(
+                "imports",
+                ".github/workflows/ci.yml",
+                ".github/actions/setup/action.yml"
+            ),
+            1
+        );
+        assert_eq!(
+            edge_count("imports", "scripts/main.sh", "scripts/lib.sh"),
+            1
+        );
+        assert_eq!(edge_count("calls", "main", "helper"), 1);
+        assert_eq!(edge_count("calls", "jobs.build.<<", "linux"), 1);
+
+        let yaml_keys: i64 = db
+            .query_row(
+                "select count(*) from symbols where repo_id=?1 and name='jobs.build.steps.uses'",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(yaml_keys, 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

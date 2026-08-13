@@ -7,6 +7,7 @@
 //! subdirectory hits the same store entry as one run from the root.
 
 use anyhow::{Context, Result};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,8 @@ pub enum Lang {
     Rust,
     Python,
     Go,
+    Shell,
+    Yaml,
 }
 
 impl Lang {
@@ -38,8 +41,24 @@ impl Lang {
             "rs" => Some(Lang::Rust),
             "py" => Some(Lang::Python),
             "go" => Some(Lang::Go),
+            "sh" | "bash" | "bats" => Some(Lang::Shell),
+            "yaml" | "yml" => Some(Lang::Yaml),
             _ => None,
         }
+    }
+
+    fn of_shebang(bytes: &[u8]) -> Option<Lang> {
+        let first_line = bytes.split(|byte| *byte == b'\n').next()?;
+        if !first_line.starts_with(b"#!") {
+            return None;
+        }
+        let line = String::from_utf8_lossy(first_line).to_ascii_lowercase();
+        [
+            "/sh", "/bash", "/dash", "/ksh", " sh", " bash", " dash", " ksh",
+        ]
+        .iter()
+        .any(|shell| line.contains(shell))
+        .then_some(Lang::Shell)
     }
 }
 
@@ -190,16 +209,19 @@ fn fnv1a(bytes: &[u8]) -> String {
 
 /// Walk `root` for source files Panoptes can extract, honouring .gitignore.
 ///
-/// The `ignore` crate is ripgrep's walker, so "what Panoptes indexes" and "what rg
-/// searches" agree by construction — a file the user cannot grep will not quietly
-/// show up in Panoptes's results either.
+/// The `ignore` crate supplies ripgrep-compatible ignore handling. Hidden tracked
+/// configuration remains visible because CI and automation commonly live there;
+/// `.git` itself is always excluded.
 pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
     let mut out = Vec::new();
     let walker = ignore::WalkBuilder::new(root)
-        .hidden(true)
+        // Tracked configuration commonly lives under .github, .gitlab, or
+        // .circleci. Include hidden paths but never descend into Git's database.
+        .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .parents(true)
+        .filter_entry(|entry| entry.file_name() != ".git")
         .build();
 
     for dent in walker {
@@ -211,7 +233,21 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
             continue;
         }
         let abs = dent.path();
-        let Some(lang) = Lang::of_path(abs) else {
+        let lang = if let Some(lang) = Lang::of_path(abs) {
+            lang
+        } else if abs.extension().is_none() {
+            let mut prefix = [0u8; 256];
+            let Ok(mut file) = std::fs::File::open(abs) else {
+                continue;
+            };
+            let Ok(read) = file.read(&mut prefix) else {
+                continue;
+            };
+            let Some(lang) = Lang::of_shebang(&prefix[..read]) else {
+                continue;
+            };
+            lang
+        } else {
             continue;
         };
         // Non-UTF8 files are not source we can parse; skipping beats failing.
@@ -265,6 +301,47 @@ mod tests {
             ".d.ts has no bodies to index"
         );
         assert_eq!(Lang::of_path(Path::new("README.md")), None);
+    }
+
+    #[test]
+    fn recognizes_shell_yaml_and_extensionless_shell_shebangs() {
+        assert_eq!(Lang::of_path(Path::new("script.sh")), Some(Lang::Shell));
+        assert_eq!(Lang::of_path(Path::new("test.bats")), Some(Lang::Shell));
+        assert_eq!(Lang::of_path(Path::new("config.yaml")), Some(Lang::Yaml));
+        assert_eq!(Lang::of_path(Path::new("config.yml")), Some(Lang::Yaml));
+        assert_eq!(
+            Lang::of_shebang(b"#!/usr/bin/env bash\necho ready\n"),
+            Some(Lang::Shell)
+        );
+        assert_eq!(Lang::of_shebang(b"#!/usr/bin/python3\n"), None);
+    }
+
+    #[test]
+    fn walk_includes_hidden_yaml_and_extensionless_shell_scripts() {
+        let root = std::env::temp_dir().join(format!("panoptes-new-langs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(root.join(".github/workflows/ci.yml"), "name: CI\n").unwrap();
+        std::fs::write(
+            root.join("scripts/build"),
+            "#!/usr/bin/env bash\necho ready\n",
+        )
+        .unwrap();
+
+        let files = walk(&root).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|file| file.rel == ".github/workflows/ci.yml" && file.lang == Lang::Yaml)
+        );
+        assert!(
+            files
+                .iter()
+                .any(|file| file.rel == "scripts/build" && file.lang == Lang::Shell)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

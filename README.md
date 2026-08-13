@@ -8,7 +8,7 @@ file's API, search every occurrence, and orient themselves without reading the
 repository file by file.
 
 - Local SQLite index; source stays on your machine.
-- TypeScript, TSX, JavaScript, Python, Go, and Rust.
+- TypeScript, TSX, JavaScript, Python, Go, Rust, shell, and YAML.
 - Incremental refresh when files change.
 - MCP setup for Codex, Claude Code, Cursor, Gemini CLI, Antigravity, OpenCode,
   and GitHub Copilot CLI.

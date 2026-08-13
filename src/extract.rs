@@ -120,9 +120,9 @@ const TS_BINDINGS: &str = r#"
 /// rather than another arm of a recursive walk.
 struct Queries {
     defs: &'static str,
-    calls: &'static str,
-    bindings: &'static str,
-    imports: &'static str,
+    calls: Option<&'static str>,
+    bindings: Option<&'static str>,
+    imports: Option<&'static str>,
 }
 
 const PY_DEFS: &str = r#"
@@ -217,31 +217,79 @@ const RUST_IMPORTS: &str = r#"
 (mod_item name: (identifier) @spec)
 "#;
 
+const SHELL_DEFS: &str = r#"
+(function_definition name: (word) @name) @def
+"#;
+
+const SHELL_CALLS: &str = r#"
+(command name: (command_name) @callee)
+"#;
+
+const SHELL_IMPORTS: &str = r#"
+(command
+  name: (command_name) @_source
+  argument: (_) @spec
+  (#match? @_source "^(source|\\.)$"))
+"#;
+
+const YAML_DEFS: &str = r#"
+(block_mapping_pair key: (_) @name) @def
+(flow_pair key: (_) @name) @def
+(anchor (anchor_name) @name) @def
+"#;
+
+const YAML_CALLS: &str = r#"
+(alias (alias_name) @callee)
+"#;
+
+const YAML_IMPORTS: &str = r#"
+(block_mapping_pair
+  key: (_) @_key
+  value: (_) @spec
+  (#eq? @_key "uses"))
+(flow_pair
+  key: (_) @_key
+  value: (_) @spec
+  (#eq? @_key "uses"))
+"#;
+
 fn queries(lang: Lang) -> Queries {
     match lang {
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => Queries {
             defs: TS_DEFS,
-            calls: TS_CALLS,
-            bindings: TS_BINDINGS,
-            imports: TS_IMPORTS,
+            calls: Some(TS_CALLS),
+            bindings: Some(TS_BINDINGS),
+            imports: Some(TS_IMPORTS),
         },
         Lang::Python => Queries {
             defs: PY_DEFS,
-            calls: PY_CALLS,
-            bindings: PY_BINDINGS,
-            imports: PY_IMPORTS,
+            calls: Some(PY_CALLS),
+            bindings: Some(PY_BINDINGS),
+            imports: Some(PY_IMPORTS),
         },
         Lang::Go => Queries {
             defs: GO_DEFS,
-            calls: GO_CALLS,
-            bindings: GO_BINDINGS,
-            imports: GO_IMPORTS,
+            calls: Some(GO_CALLS),
+            bindings: Some(GO_BINDINGS),
+            imports: Some(GO_IMPORTS),
         },
         Lang::Rust => Queries {
             defs: RUST_DEFS,
-            calls: RUST_CALLS,
-            bindings: RUST_BINDINGS,
-            imports: RUST_IMPORTS,
+            calls: Some(RUST_CALLS),
+            bindings: Some(RUST_BINDINGS),
+            imports: Some(RUST_IMPORTS),
+        },
+        Lang::Shell => Queries {
+            defs: SHELL_DEFS,
+            calls: Some(SHELL_CALLS),
+            bindings: None,
+            imports: Some(SHELL_IMPORTS),
+        },
+        Lang::Yaml => Queries {
+            defs: YAML_DEFS,
+            calls: Some(YAML_CALLS),
+            bindings: None,
+            imports: Some(YAML_IMPORTS),
         },
     }
 }
@@ -253,15 +301,17 @@ fn language(lang: Lang) -> tree_sitter::Language {
         Lang::Python => tree_sitter_python::LANGUAGE.into(),
         Lang::Go => tree_sitter_go::LANGUAGE.into(),
         Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Lang::Shell => tree_sitter_bash::LANGUAGE.into(),
+        Lang::Yaml => tree_sitter_yaml::LANGUAGE.into(),
     }
 }
 
 struct CompiledExtractor {
     parser: Parser,
     defs: Query,
-    calls: Query,
-    bindings: Query,
-    imports: Query,
+    calls: Option<Query>,
+    bindings: Option<Query>,
+    imports: Option<Query>,
     python_aliases: Option<Query>,
 }
 
@@ -274,9 +324,18 @@ impl CompiledExtractor {
         Ok(Self {
             parser,
             defs: Query::new(&language, queries.defs).context("compile definition query")?,
-            calls: Query::new(&language, queries.calls).context("compile call query")?,
-            bindings: Query::new(&language, queries.bindings).context("compile binding query")?,
-            imports: Query::new(&language, queries.imports).context("compile import query")?,
+            calls: queries
+                .calls
+                .map(|query| Query::new(&language, query).context("compile call query"))
+                .transpose()?,
+            bindings: queries
+                .bindings
+                .map(|query| Query::new(&language, query).context("compile binding query"))
+                .transpose()?,
+            imports: queries
+                .imports
+                .map(|query| Query::new(&language, query).context("compile import query"))
+                .transpose()?,
             python_aliases: (lang == Lang::Python)
                 .then(|| {
                     Query::new(&language, PY_FIELD_ALIASES)
@@ -334,8 +393,32 @@ fn kind_of(n: &Node) -> &'static str {
         "trait_item" => "trait",
         "type_item" => "type",
         "mod_item" => "namespace",
+        "block_mapping_pair" | "flow_pair" => "key",
+        "anchor" => "anchor",
         _ => "function",
     }
+}
+
+fn yaml_key_text(src: &str, node: Node<'_>) -> String {
+    src[node.byte_range()]
+        .trim()
+        .trim_matches(|ch| ch == '"' || ch == '\'')
+        .to_string()
+}
+
+fn yaml_key_path(src: &str, def: Node<'_>, name: Node<'_>) -> String {
+    let mut parts = vec![yaml_key_text(src, name)];
+    let mut current = def.parent();
+    while let Some(node) = current {
+        if matches!(node.kind(), "block_mapping_pair" | "flow_pair")
+            && let Some(key) = node.child_by_field_name("key")
+        {
+            parts.push(yaml_key_text(src, key));
+        }
+        current = node.parent();
+    }
+    parts.reverse();
+    parts.join(".")
 }
 
 fn type_basename(text: &str) -> String {
@@ -452,8 +535,13 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
         } else {
             None
         };
+        let name = if lang == Lang::Yaml && def_node.kind() != "anchor" {
+            yaml_key_path(src, def_node, name_node)
+        } else {
+            src[name_node.byte_range()].to_string()
+        };
         symbols.push(Symbol {
-            name: src[name_node.byte_range()].to_string(),
+            name,
             kind: if rust_container.is_some() {
                 "method".to_string()
             } else {
@@ -541,45 +629,38 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
         })
         .collect();
 
-    let call_q = &compiled.calls;
-    let callee_idx = call_q
-        .capture_index_for_name("callee")
-        .context("query lacks @callee")?;
-    let recv_idx = call_q
-        .capture_index_for_name("recv")
-        .context("query lacks @recv")?;
     let mut calls = Vec::new();
-    let mut cursor = QueryCursor::new();
-    let mut it = cursor.matches(call_q, root, src.as_bytes());
-    while let Some(m) = it.next() {
-        // Per match, not per capture: a member call matches @recv and @callee
-        // together, and iterating captures would record the call twice.
-        let Some(callee_node) = m
-            .captures
-            .iter()
-            .find(|c| c.index == callee_idx)
-            .map(|c| c.node)
-        else {
-            continue;
-        };
-        calls.push(CallIntent {
-            from: owner_at(callee_node.start_byte()),
-            callee: src[callee_node.byte_range()].to_string(),
-            receiver: m
+    if let Some(call_q) = &compiled.calls {
+        let callee_idx = call_q
+            .capture_index_for_name("callee")
+            .context("query lacks @callee")?;
+        let recv_idx = call_q.capture_index_for_name("recv");
+        let mut cursor = QueryCursor::new();
+        let mut it = cursor.matches(call_q, root, src.as_bytes());
+        while let Some(m) = it.next() {
+            // Per match, not per capture: a member call matches @recv and @callee
+            // together, and iterating captures would record the call twice.
+            let Some(callee_node) = m
                 .captures
                 .iter()
-                .find(|c| c.index == recv_idx)
-                .map(|c| src[c.node.byte_range()].to_string()),
-        });
+                .find(|c| c.index == callee_idx)
+                .map(|c| c.node)
+            else {
+                continue;
+            };
+            calls.push(CallIntent {
+                from: owner_at(callee_node.start_byte()),
+                callee: src[callee_node.byte_range()].to_string(),
+                receiver: recv_idx.and_then(|index| {
+                    m.captures
+                        .iter()
+                        .find(|capture| capture.index == index)
+                        .map(|capture| src[capture.node.byte_range()].to_string())
+                }),
+            });
+        }
     }
 
-    let bind_q = &compiled.bindings;
-    let b_name = bind_q.capture_index_for_name("name");
-    let b_field = bind_q.capture_index_for_name("field");
-    let _ = &b_field;
-    let b_ty = bind_q
-        .capture_index_for_name("ty")
-        .context("query lacks @ty")?;
     let mut bindings = Vec::new();
     for (owner, (name, ty)) in recv_names.iter().zip(&recv_types).enumerate() {
         if let (Some(name), Some(ty)) = (name, ty) {
@@ -590,36 +671,43 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
             });
         }
     }
-    let mut cursor = QueryCursor::new();
-    let mut it = cursor.matches(bind_q, root, src.as_bytes());
-    while let Some(m) = it.next() {
-        let Some(ty_node) = m.captures.iter().find(|c| c.index == b_ty).map(|c| c.node) else {
-            continue;
-        };
-        let raw_ty = &src[ty_node.byte_range()];
-        let ty = if lang == Lang::Rust {
-            type_basename(raw_ty)
-        } else {
-            raw_ty.to_string()
-        };
+    if let Some(bind_q) = &compiled.bindings {
+        let b_name = bind_q.capture_index_for_name("name");
+        let b_field = bind_q.capture_index_for_name("field");
+        let b_ty = bind_q
+            .capture_index_for_name("ty")
+            .context("query lacks @ty")?;
+        let mut cursor = QueryCursor::new();
+        let mut it = cursor.matches(bind_q, root, src.as_bytes());
+        while let Some(m) = it.next() {
+            let Some(ty_node) = m.captures.iter().find(|c| c.index == b_ty).map(|c| c.node) else {
+                continue;
+            };
+            let raw_ty = &src[ty_node.byte_range()];
+            let ty = if lang == Lang::Rust {
+                type_basename(raw_ty)
+            } else {
+                raw_ty.to_string()
+            };
 
-        // A class field binds `this.<field>` and is scoped to the class, so a
-        // method body's `this.repo.scan()` finds it. A plain variable or parameter
-        // binds its own name in whatever definition encloses it.
-        if let Some(f) = b_field.and_then(|i| m.captures.iter().find(|c| c.index == i)) {
-            let at = f.node.start_byte();
-            bindings.push(Binding {
-                owner: class_at(at),
-                name: format!("this.{}", &src[f.node.byte_range()]),
-                ty,
-            });
-        } else if let Some(n) = b_name.and_then(|i| m.captures.iter().find(|c| c.index == i)) {
-            let at = n.node.start_byte();
-            bindings.push(Binding {
-                owner: owner_at(at),
-                name: src[n.node.byte_range()].to_string(),
-                ty,
-            });
+            // A class field binds `this.<field>` and is scoped to the class, so a
+            // method body's `this.repo.scan()` finds it. A plain variable or parameter
+            // binds its own name in whatever definition encloses it.
+            if let Some(f) = b_field.and_then(|i| m.captures.iter().find(|c| c.index == i)) {
+                let at = f.node.start_byte();
+                bindings.push(Binding {
+                    owner: class_at(at),
+                    name: format!("this.{}", &src[f.node.byte_range()]),
+                    ty,
+                });
+            } else if let Some(n) = b_name.and_then(|i| m.captures.iter().find(|c| c.index == i)) {
+                let at = n.node.start_byte();
+                bindings.push(Binding {
+                    owner: owner_at(at),
+                    name: src[n.node.byte_range()].to_string(),
+                    ty,
+                });
+            }
         }
     }
 
@@ -679,17 +767,25 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
         }
     }
 
-    let imp_q = &compiled.imports;
     let mut imports = Vec::new();
-    let mut cursor = QueryCursor::new();
-    let mut it = cursor.matches(imp_q, root, src.as_bytes());
-    while let Some(m) = it.next() {
-        for c in m.captures {
-            // The capture is a string literal including its quotes.
-            let raw = &src[c.node.byte_range()];
-            let spec = raw.trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`');
-            if !spec.is_empty() {
-                imports.push(spec.to_string());
+    if let Some(imp_q) = &compiled.imports {
+        let spec_idx = imp_q
+            .capture_index_for_name("spec")
+            .context("query lacks @spec")?;
+        let mut cursor = QueryCursor::new();
+        let mut it = cursor.matches(imp_q, root, src.as_bytes());
+        while let Some(m) = it.next() {
+            for capture in m
+                .captures
+                .iter()
+                .filter(|capture| capture.index == spec_idx)
+            {
+                // String-like captures may include quotes; paths are stored bare.
+                let raw = &src[capture.node.byte_range()];
+                let spec = raw.trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`');
+                if !spec.is_empty() {
+                    imports.push(spec.to_string());
+                }
             }
         }
     }
@@ -1060,5 +1156,78 @@ fn consume(_: Other) {}
                 .any(|binding| binding.name == "other" && binding.ty == "Other")
         );
         assert_eq!(e.imports, ["crate::db::helper"]);
+    }
+
+    #[test]
+    fn shell_functions_commands_and_sources_are_extracted() {
+        let src = r#"
+source "./lib.sh"
+
+build() {
+    helper
+    printf '%s\n' ready
+}
+
+function helper {
+    echo done
+}
+"#;
+        let e = extract(Lang::Shell, src).unwrap();
+        let names: Vec<_> = e
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind.as_str()))
+            .collect();
+        assert!(names.contains(&("build", "function")), "{names:?}");
+        assert!(names.contains(&("helper", "function")), "{names:?}");
+        let build = e
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name == "build")
+            .unwrap();
+        assert!(
+            e.calls
+                .iter()
+                .any(|call| call.from == Some(build) && call.callee == "helper"),
+            "{:?}",
+            e.calls
+        );
+        assert_eq!(e.imports, ["./lib.sh"]);
+    }
+
+    #[test]
+    fn yaml_key_paths_anchors_aliases_and_uses_are_extracted() {
+        let src = r#"
+defaults: &linux
+  runs-on: ubuntu-latest
+jobs:
+  build:
+    <<: *linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+"#;
+        let e = extract(Lang::Yaml, src).unwrap();
+        let names: Vec<_> = e
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind.as_str()))
+            .collect();
+        assert!(names.contains(&("defaults", "key")), "{names:?}");
+        assert!(names.contains(&("defaults.runs-on", "key")), "{names:?}");
+        assert!(
+            names.contains(&("jobs.build.steps.uses", "key")),
+            "{names:?}"
+        );
+        assert!(names.contains(&("linux", "anchor")), "{names:?}");
+        assert!(
+            e.calls.iter().any(|call| call.callee == "linux"),
+            "{:?}",
+            e.calls
+        );
+        assert_eq!(
+            e.imports,
+            ["actions/checkout@v4", "./.github/actions/setup"]
+        );
     }
 }
