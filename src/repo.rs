@@ -77,7 +77,8 @@ pub fn root_of(start: &Path) -> Result<PathBuf> {
 fn git_dir(root: &Path) -> Option<PathBuf> {
     let marker = root.join(".git");
     if marker.is_dir() {
-        return std::fs::canonicalize(marker).ok();
+        let directory = std::fs::canonicalize(marker).ok()?;
+        return directory.join("HEAD").is_file().then_some(directory);
     }
     if !marker.is_file() {
         return None;
@@ -89,7 +90,8 @@ fn git_dir(root: &Path) -> Option<PathBuf> {
     } else {
         root.join(path)
     };
-    std::fs::canonicalize(path).ok()
+    let directory = std::fs::canonicalize(path).ok()?;
+    directory.join("HEAD").is_file().then_some(directory)
 }
 
 fn git_toplevel(start: &Path) -> Option<PathBuf> {
@@ -417,9 +419,22 @@ mod tests {
         let root = std::env::temp_dir().join(format!("panoptes-git-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::create_dir_all(root.join("src/nested")).unwrap();
 
         assert_eq!(root_of(&root.join("src/nested")).unwrap(), root);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn empty_git_directory_is_not_a_repository() {
+        let root = std::env::temp_dir().join(format!("panoptes-empty-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        assert_eq!(git_toplevel(&root), None);
+        assert!(automatic_targets(&root).unwrap().is_empty());
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -432,6 +447,7 @@ mod tests {
         let worktree = base.join("linked");
         std::fs::create_dir_all(&git_dir).unwrap();
         std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(
             worktree.join(".git"),
             format!("gitdir: {}\n", git_dir.display()),
