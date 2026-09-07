@@ -74,12 +74,16 @@ jobs:
           if grep -q '\[mcp_servers.panoptes\]' "$PANOPTES_HOME/.codex/config.toml"; then
             exit 1
           fi
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | "$PANOPTES_BIN" --store "$PANOPTES_STORE" mcp "$smoke" | grep -q '"tools"'
+          # Let MCP finish before checking its output to avoid SIGPIPE under pipefail.
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | "$PANOPTES_BIN" --store "$PANOPTES_STORE" mcp "$smoke" > "$RUNNER_TEMP/mcp-tools.jsonl"
+          grep -q '"tools"' "$RUNNER_TEMP/mcp-tools.jsonl"
           "$PANOPTES_BIN" --store "$PANOPTES_STORE" grep greet --path "$smoke" | head -n 1 >/dev/null
           "$PANOPTES_BIN" --store "$PANOPTES_STORE" cache clear --yes
-          printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}' | "$PANOPTES_BIN" --store "$PANOPTES_STORE" mcp "$smoke" | grep -q '"indexed":true'
+          printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}' | "$PANOPTES_BIN" --store "$PANOPTES_STORE" mcp "$smoke" > "$RUNNER_TEMP/mcp-status.jsonl"
+          grep -q '"indexed":true' "$RUNNER_TEMP/mcp-status.jsonl"
           printf '%s\n' 'export function added() { return greet("again"); }' >> "$smoke/src/a.ts"
-          printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"find","arguments":{"query":"added"}}}' | "$PANOPTES_BIN" --store "$PANOPTES_STORE" mcp "$smoke" | grep -q 'added'
+          printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"find","arguments":{"query":"added"}}}' | "$PANOPTES_BIN" --store "$PANOPTES_STORE" mcp "$smoke" > "$RUNNER_TEMP/mcp-find.jsonl"
+          grep -q 'added' "$RUNNER_TEMP/mcp-find.jsonl"
           "$PANOPTES_BIN" --store "$PANOPTES_STORE" cache doctor
 
   termux-container:
@@ -93,13 +97,17 @@ jobs:
       - name: Build and run in Termux Bionic userland
         run: |
           set -euxo pipefail
-          docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace termux/termux-docker:latest bash -lc "
+          docker run --rm -v "$GITHUB_WORKSPACE:/workspace:ro" termux/termux-docker:latest bash -lc '
             set -eu
             pkg update -y
-            pkg install -y rust clang make git pkg-config
+            pkg install -y rust clang make git pkg-config file
+            # Build in container-owned storage; the mounted checkout belongs to the host runner.
+            build_dir=$(mktemp -d)
+            cp -R /workspace/. "$build_dir/"
+            cd "$build_dir"
             cargo test --workspace --all-targets --locked
             cargo build --workspace --release --locked
             file target/release/panoptes
             target/release/panoptes --version
             target/release/panoptes version --json
-          "
+          '

@@ -518,12 +518,12 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
     let mut it = cursor.matches(def_q, root, src.as_bytes());
     while let Some(m) = it.next() {
         let name_node = m
-            .captures
+            .captures()
             .iter()
             .find(|c| c.index == name_idx)
             .map(|c| c.node);
         let def_node = m
-            .captures
+            .captures()
             .iter()
             .find(|c| c.index == def_idx)
             .map(|c| c.node);
@@ -556,13 +556,13 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
         spans.push((def_node.start_byte(), def_node.end_byte()));
         recv_types.push(
             recvty_idx
-                .and_then(|i| m.captures.iter().find(|c| c.index == i))
+                .and_then(|i| m.captures().iter().find(|c| c.index == i))
                 .map(|c| src[c.node.byte_range()].to_string())
                 .or(rust_container),
         );
         recv_names.push(
             recvname_idx
-                .and_then(|i| m.captures.iter().find(|c| c.index == i))
+                .and_then(|i| m.captures().iter().find(|c| c.index == i))
                 .map(|c| src[c.node.byte_range()].to_string()),
         );
     }
@@ -641,7 +641,7 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
             // Per match, not per capture: a member call matches @recv and @callee
             // together, and iterating captures would record the call twice.
             let Some(callee_node) = m
-                .captures
+                .captures()
                 .iter()
                 .find(|c| c.index == callee_idx)
                 .map(|c| c.node)
@@ -652,7 +652,7 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
                 from: owner_at(callee_node.start_byte()),
                 callee: src[callee_node.byte_range()].to_string(),
                 receiver: recv_idx.and_then(|index| {
-                    m.captures
+                    m.captures()
                         .iter()
                         .find(|capture| capture.index == index)
                         .map(|capture| src[capture.node.byte_range()].to_string())
@@ -680,7 +680,12 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
         let mut cursor = QueryCursor::new();
         let mut it = cursor.matches(bind_q, root, src.as_bytes());
         while let Some(m) = it.next() {
-            let Some(ty_node) = m.captures.iter().find(|c| c.index == b_ty).map(|c| c.node) else {
+            let Some(ty_node) = m
+                .captures()
+                .iter()
+                .find(|c| c.index == b_ty)
+                .map(|c| c.node)
+            else {
                 continue;
             };
             let raw_ty = &src[ty_node.byte_range()];
@@ -693,14 +698,15 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
             // A class field binds `this.<field>` and is scoped to the class, so a
             // method body's `this.repo.scan()` finds it. A plain variable or parameter
             // binds its own name in whatever definition encloses it.
-            if let Some(f) = b_field.and_then(|i| m.captures.iter().find(|c| c.index == i)) {
+            if let Some(f) = b_field.and_then(|i| m.captures().iter().find(|c| c.index == i)) {
                 let at = f.node.start_byte();
                 bindings.push(Binding {
                     owner: class_at(at),
                     name: format!("this.{}", &src[f.node.byte_range()]),
                     ty,
                 });
-            } else if let Some(n) = b_name.and_then(|i| m.captures.iter().find(|c| c.index == i)) {
+            } else if let Some(n) = b_name.and_then(|i| m.captures().iter().find(|c| c.index == i))
+            {
                 let at = n.node.start_byte();
                 bindings.push(Binding {
                     owner: owner_at(at),
@@ -732,7 +738,7 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
         let mut matches = cursor.matches(alias_q, root, src.as_bytes());
         while let Some(m) = matches.next() {
             let captured = |index| {
-                m.captures
+                m.captures()
                     .iter()
                     .find(|capture| capture.index == index)
                     .map(|capture| capture.node)
@@ -776,7 +782,7 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
         let mut it = cursor.matches(imp_q, root, src.as_bytes());
         while let Some(m) = it.next() {
             for capture in m
-                .captures
+                .captures()
                 .iter()
                 .filter(|capture| capture.index == spec_idx)
             {
