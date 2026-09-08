@@ -533,6 +533,7 @@ fn index_extracted(
         rusqlite::params![repo_id, file_id, source.rel, lines, bounded_text(&source.text)],
     )?;
     let file_symbol = tx.last_insert_rowid();
+    crate::search::index_symbol(tx, file_symbol)?;
     let mut symbol_ids = Vec::with_capacity(extracted.symbols.len());
     for (index, symbol) in extracted.symbols.iter().enumerate() {
         let container = extracted.containers.get(index).cloned().flatten();
@@ -551,7 +552,9 @@ fn index_extracted(
                 symbol.search_text
             ],
         )?;
-        symbol_ids.push(tx.last_insert_rowid());
+        let id = tx.last_insert_rowid();
+        crate::search::index_symbol(tx, id)?;
+        symbol_ids.push(id);
     }
     let payload = serde_json::to_string(&extracted).context("serialize extraction cache")?;
     tx.execute(

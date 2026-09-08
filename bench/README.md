@@ -8,6 +8,10 @@ Panoptes keeps two benchmark layers separate:
 - `scripts/benchmark-agent.sh` runs the same read-only coding questions with a
   fresh Codex session and checkout, first without Panoptes and then with it.
 
+The [cached search benchmark](results/search-optimization-2026-09-08.md) compares
+query latency, memory, indexing time, and store size against the uncached search
+implementation, with raw measurements from both execution orders.
+
 ## Real repository
 
 The default corpus is PocketBase at the exact revision recorded in

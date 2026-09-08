@@ -1,0 +1,14 @@
+key	value
+timestamp_utc	2026-09-08T03:20:43Z
+uname	Linux brickroad 7.2.2-arch1-1 #1 SMP PREEMPT_DYNAMIC Fri, 28 Aug 2026 16:09:39 +0000 x86_64 GNU/Linux
+rustc	rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo	cargo 1.97.1 (c980f4866 2026-06-30)
+panoptes	panoptes 0.1.0
+git_sha	9c05d4336b211d7b90659385354fd798e950d1fc
+git_dirty	true
+single_files	4000
+workspace_repos	3
+workspace_files_per_repo	100
+query_runs	5
+build_runs	3
+panoptes_jobs	auto

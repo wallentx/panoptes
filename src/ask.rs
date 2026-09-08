@@ -3,8 +3,10 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
+
+use crate::search::terms;
 
 #[derive(Debug, Serialize)]
 pub struct AskHit {
@@ -41,10 +43,7 @@ struct Document {
     end_line: i64,
     signature: String,
     in_edges: i64,
-    name_terms: HashMap<String, usize>,
-    path_terms: HashMap<String, usize>,
-    signature_terms: HashMap<String, usize>,
-    body_terms: HashMap<String, usize>,
+    term_counts: Vec<(usize, [f64; 4])>,
 }
 
 pub struct AskOptions<'a> {
@@ -61,6 +60,13 @@ pub fn ask(
     query: &str,
     options: AskOptions<'_>,
 ) -> Result<AskResult> {
+    // Candidate postings, corpus size and edge counts must describe one snapshot
+    // even when another MCP process commits an index update during the query.
+    let _snapshot = if db.is_autocommit() {
+        Some(db.unchecked_transaction()?)
+    } else {
+        None
+    };
     if let Some((subject, outgoing)) = structural_subject(query) {
         let (seeds, reached) =
             crate::index::callers_scoped(db, repo_id, subject, outgoing, 1, options.scope)?;
@@ -116,79 +122,86 @@ pub fn ask(
         });
     }
 
-    let mut statement = db.prepare(
-        "select s.id, s.name, s.kind, f.path, s.start_line, s.end_line,
-                coalesce(s.signature,''), coalesce(s.summary,''),
-                (select count(*) from edges e
-                  where e.repo_id=s.repo_id and e.dst_symbol_id=s.id)
-           from symbols s join files f on f.id=s.file_id
-          where s.repo_id=?1 and s.kind != 'module'
-          order by f.path, s.start_line, s.id",
+    let scope = options.scope.map(|scope| scope.trim_matches('/'));
+    let corpus_size: i64 = db.query_row(
+        "select count(*) from symbols s join files f on f.id=s.file_id
+         where s.repo_id=?1 and s.kind != 'module'
+         and (?2 is null or f.path=?2 or substr(f.path,1,length(?2)+1)=?2||'/')",
+        rusqlite::params![repo_id, scope],
+        |r| r.get(0),
     )?;
-    let rows = statement.query_map([repo_id], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-            row.get::<_, i64>(8)?,
-        ))
-    })?;
-
-    let mut documents = Vec::new();
-    for row in rows {
-        let (id, name, kind, path, start_line, end_line, signature, body, in_edges) = row?;
-        if let Some(scope) = options.scope
-            && !in_scope(&path, scope)
-        {
-            continue;
-        }
-        documents.push(Document {
-            id,
-            name_terms: frequencies(&terms(&name)),
-            path_terms: frequencies(&terms(&path)),
-            signature_terms: frequencies(&terms(&signature)),
-            body_terms: frequencies(&terms(&body)),
-            name,
-            kind,
-            path,
-            start_line,
-            end_line,
-            signature,
-            in_edges,
-        });
-    }
-
-    let mut document_frequency: HashMap<&str, usize> = HashMap::new();
+    let mut statement = db.prepare(
+        "select s.id,s.name,s.kind,f.path,s.start_line,s.end_line,coalesce(s.signature,''),
+                (select count(*) from edges e where e.repo_id=s.repo_id and e.dst_symbol_id=s.id),
+                t.name_count,t.path_count,t.signature_count,t.body_count
+         from search_terms t join symbols s on s.id=t.symbol_id join files f on f.id=s.file_id
+         where t.repo_id=?1 and t.term=?2 and s.kind != 'module'
+         and (?3 is null or f.path=?3 or substr(f.path,1,length(?3)+1)=?3||'/')",
+    )?;
+    // Deduplicate lookup work while retaining repeated query terms in scoring.
+    let mut term_slots: HashMap<&str, usize> = HashMap::new();
+    let mut unique_terms = Vec::new();
+    let mut query_slots = Vec::new();
     for term in &query_terms {
-        let count = documents
-            .iter()
-            .filter(|document| document_has(document, term))
-            .count();
-        document_frequency.insert(term, count);
+        let next = unique_terms.len();
+        let slot = *term_slots.entry(term).or_insert(next);
+        if slot == next {
+            unique_terms.push(term);
+        }
+        query_slots.push(slot);
     }
-    let corpus_size = documents.len().max(1) as f64;
+    let mut document_frequency = vec![0usize; unique_terms.len()];
+    let mut candidates: HashMap<i64, Document> = HashMap::new();
+    for (slot, term) in unique_terms.iter().enumerate() {
+        let mut rows = statement.query(rusqlite::params![repo_id, term, scope])?;
+        while let Some(row) = rows.next()? {
+            let id = row.get(0)?;
+            let document = match candidates.entry(id) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(Document {
+                    id,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    path: row.get(3)?,
+                    start_line: row.get(4)?,
+                    end_line: row.get(5)?,
+                    signature: row.get(6)?,
+                    in_edges: row.get(7)?,
+                    term_counts: Vec::with_capacity(unique_terms.len().min(4)),
+                }),
+            };
+            let mut counts = [0.0; 4];
+            for (field, count) in counts.iter_mut().enumerate() {
+                *count = row.get::<_, i64>(8 + field)? as f64;
+            }
+            // Only matched terms occupy memory; long queries must not allocate
+            // a full query-by-corpus matrix. Slots arrive in increasing order.
+            document.term_counts.push((slot, counts));
+            document_frequency[slot] += 1;
+        }
+    }
+    let corpus_size = corpus_size.max(1) as f64;
     let query_mentions_tests = query_terms
         .iter()
         .any(|term| matches!(term.as_str(), "test" | "tests" | "fixture" | "fixtures"));
 
+    let idfs: Vec<f64> = document_frequency
+        .iter()
+        .map(|&df| ((corpus_size + 1.0) / (df as f64 + 1.0)).ln() + 1.0)
+        .collect();
     let mut scored = Vec::new();
-    for document in documents {
+    for document in candidates.into_values() {
         let mut score = 0.0;
         let mut strong = 0.0;
         let mut possible = 0.0;
-        for term in &query_terms {
-            let df = *document_frequency.get(term.as_str()).unwrap_or(&0) as f64;
-            let idf = ((corpus_size + 1.0) / (df + 1.0)).ln() + 1.0;
+        for &slot in &query_slots {
+            let idf = idfs[slot];
             possible += idf;
-            let name = frequency(&document.name_terms, term);
-            let path = frequency(&document.path_terms, term);
-            let signature = frequency(&document.signature_terms, term);
-            let body = frequency(&document.body_terms, term);
+            let [name, path, signature, body] = document
+                .term_counts
+                .binary_search_by_key(&slot, |(index, _)| *index)
+                .map(|index| document.term_counts[index].1)
+                .unwrap_or([0.0; 4]);
             if name + path + signature > 0.0 {
                 strong += idf;
             }
@@ -273,6 +286,7 @@ fn structural_subject(query: &str) -> Option<(&str, bool)> {
     None
 }
 
+#[cfg(test)]
 fn in_scope(path: &str, scope: &str) -> bool {
     let scope = scope.trim_matches('/');
     path == scope || path.starts_with(&format!("{scope}/"))
@@ -303,54 +317,6 @@ fn source_excerpt(root: &Path, path: &str, start: i64, end: i64, full: bool) -> 
             .collect::<Vec<_>>()
             .join("\n"),
     )
-}
-
-fn document_has(document: &Document, term: &str) -> bool {
-    document.name_terms.contains_key(term)
-        || document.path_terms.contains_key(term)
-        || document.signature_terms.contains_key(term)
-        || document.body_terms.contains_key(term)
-}
-
-fn frequency(frequencies: &HashMap<String, usize>, term: &str) -> f64 {
-    frequencies.get(term).copied().unwrap_or(0) as f64
-}
-
-fn frequencies(terms: &[String]) -> HashMap<String, usize> {
-    let mut frequencies = HashMap::new();
-    for term in terms {
-        *frequencies.entry(term.clone()).or_insert(0) += 1;
-    }
-    frequencies
-}
-
-fn terms(text: &str) -> Vec<String> {
-    let mut expanded = String::with_capacity(text.len() * 2);
-    let mut previous_lower = false;
-    for ch in text.chars() {
-        if ch.is_uppercase() && previous_lower {
-            expanded.push(' ');
-        }
-        if ch.is_alphanumeric() || ch == '_' {
-            expanded.extend(ch.to_lowercase());
-            previous_lower = ch.is_lowercase();
-        } else {
-            expanded.push(' ');
-            previous_lower = false;
-        }
-    }
-    let stopwords: HashSet<&'static str> = [
-        "a", "an", "and", "are", "as", "at", "be", "by", "code", "does", "for", "from", "how",
-        "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "what", "where", "which",
-        "with",
-    ]
-    .into_iter()
-    .collect();
-    expanded
-        .split(|ch: char| ch == '_' || ch.is_whitespace())
-        .filter(|term| term.len() > 1 && !stopwords.contains(term))
-        .map(str::to_string)
-        .collect()
 }
 
 #[cfg(test)]

@@ -86,6 +86,13 @@ registration and usage guidance while preserving existing configuration. The
 MCP server indexes the current repository when needed and refreshes changed
 files automatically.
 
+Ranked search caches per-field terms when files are indexed, so queries retrieve
+matching symbols without tokenizing the whole repository again. ASCII text uses
+a portable bulk lowercase fast path; Unicode token boundaries remain unchanged.
+Existing version 1 stores upgrade once to version 2 using their stored symbol
+text. The cache uses additional disk space and indexing time in exchange for
+faster queries; see the [search benchmark](bench/results/search-optimization-2026-09-08.md).
+
 For scripted setup:
 
 ```sh

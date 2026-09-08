@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever the DDL below changes in a way an existing store cannot serve.
 /// Read from and written to `pragma user_version`.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const DDL: &str = r#"
 create table if not exists repos (
@@ -135,30 +135,49 @@ pub fn open(path: &Path) -> Result<Connection> {
 
     let found: i64 = db.query_row("pragma user_version", [], |r| r.get(0))?;
     anyhow::ensure!(
-        matches!(found, 0 | SCHEMA_VERSION),
+        matches!(found, 0 | 1 | SCHEMA_VERSION),
         "store at {} is schema v{found}; expected v{SCHEMA_VERSION}",
         path.display()
     );
 
-    // Setting journal_mode and executing even no-op CREATE statements both need
-    // SQLite schema/write locks. Do that only for a new store; repeating it for
-    // every MCP connection can fail while another repository is being indexed.
-    if found == 0 {
-        let mode: String = db.query_row("pragma journal_mode=wal", [], |r| r.get(0))?;
+    // Established stores only read pragmas: readers must not acquire schema
+    // locks while another repository is being indexed.
+    let mode: String = db.query_row(
+        if found == 0 {
+            "pragma journal_mode=wal"
+        } else {
+            "pragma journal_mode"
+        },
+        [],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        mode.eq_ignore_ascii_case("wal"),
+        "journal_mode is {mode:?}, not wal"
+    );
+    db.execute_batch("pragma foreign_keys=on; pragma synchronous=normal;")?;
+    if found < SCHEMA_VERSION {
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
+                .context("begin store migration")?;
+        // Another process may have migrated between opening and taking the lock.
+        let version: i64 = tx.query_row("pragma user_version", [], |r| r.get(0))?;
         anyhow::ensure!(
-            mode.eq_ignore_ascii_case("wal"),
-            "journal_mode is {mode:?}, not wal"
+            matches!(version, 0 | 1 | SCHEMA_VERSION),
+            "unsupported store schema v{version}"
         );
-        db.execute_batch("pragma foreign_keys=on; pragma synchronous=normal;")?;
-        db.execute_batch(DDL).context("apply schema")?;
-        db.execute_batch(&format!("pragma user_version={SCHEMA_VERSION}"))?;
-    } else {
-        let mode: String = db.query_row("pragma journal_mode", [], |r| r.get(0))?;
-        anyhow::ensure!(
-            mode.eq_ignore_ascii_case("wal"),
-            "journal_mode is {mode:?}, not wal"
-        );
-        db.execute_batch("pragma foreign_keys=on; pragma synchronous=normal;")?;
+        if version == 0 {
+            tx.execute_batch(DDL).context("apply schema")?;
+        }
+        if version < SCHEMA_VERSION {
+            tx.execute_batch(crate::search::DDL)
+                .context("create search term index")?;
+            if version == 1 {
+                crate::search::backfill(&tx).context("backfill search terms")?;
+            }
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        tx.commit().context("commit store migration")?;
     }
     Ok(db)
 }
@@ -293,15 +312,61 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v1_search_terms_without_changing_the_snapshot() {
+        let g = tempdir::Guard::new();
+        let path = g.path().join("old.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch("pragma journal_mode=wal;").unwrap();
+        old.execute_batch(DDL).unwrap();
+        old.execute_batch("pragma user_version=1;").unwrap();
+        let repo = seed_repo(&old);
+        let before: i64 = old
+            .query_row("select count(*) from symbols", [], |r| r.get(0))
+            .unwrap();
+        drop(old);
+        let db = open(&path).unwrap();
+        let after: i64 = db
+            .query_row("select count(*) from symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        let cached: i64 = db
+            .query_row(
+                "select count(distinct symbol_id) from search_terms where repo_id=?1",
+                [repo],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cached, before);
+        let terms: i64 = db
+            .query_row("select count(*) from search_terms", [], |r| r.get(0))
+            .unwrap();
+        drop(db);
+        let db = open(&path).unwrap();
+        assert_eq!(
+            terms,
+            db.query_row("select count(*) from search_terms", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap()
+        );
+        db.execute("delete from repos where id=?1", [repo]).unwrap();
+        assert_eq!(
+            0,
+            db.query_row("select count(*) from search_terms", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn rejects_unrecognized_schema_versions() {
         let g = tempdir::Guard::new();
         let p = g.path().join("panoptes.db");
         let db = Connection::open(&p).unwrap();
-        db.execute_batch("pragma user_version=2;").unwrap();
+        db.execute_batch("pragma user_version=99;").unwrap();
         drop(db);
 
         let error = open(&p).unwrap_err().to_string();
-        assert!(error.contains("schema v2; expected v1"), "{error}");
+        assert!(error.contains("schema v99; expected v2"), "{error}");
     }
 
     #[test]

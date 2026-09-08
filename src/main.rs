@@ -13,6 +13,7 @@ mod index;
 mod init;
 mod mcp;
 mod repo;
+mod search;
 mod viz;
 
 use anyhow::Result;
