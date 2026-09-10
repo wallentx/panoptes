@@ -120,6 +120,21 @@ jobs:
           path: $.package.version
           value: ${{ steps.resolve.outputs.release_version }}
 
+      - name: Validate existing tag version
+        if: steps.resolve.outputs.existing_tag == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          RELEASE_VERSION: ${{ steps.resolve.outputs.release_version }}
+          CARGO_VERSION: ${{ steps.cargo.outputs.value }}
+        run: |
+          set -euo pipefail
+          if [ "$CARGO_VERSION" != "$RELEASE_VERSION" ]; then
+            printf '::error::Tag %s points to Cargo version %s; expected %s.\n' \
+              "$RELEASE_TAG" "$CARGO_VERSION" "$RELEASE_VERSION"
+            echo 'Existing tags are immutable in this workflow. Create a new release from main using Actions > Release > Run workflow so Cargo is versioned before tagging.' >&2
+            exit 1
+          fi
+
       - name: Set up Rust
         run: |
           rustup toolchain install stable --profile minimal
