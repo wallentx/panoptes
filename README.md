@@ -157,6 +157,9 @@ Indexes live at `$XDG_DATA_HOME/panoptes/panoptes.db`, falling back to
 
 ## Build and verify
 
+See [testing and release automation](docs/releases.md) for platform builds,
+CLI/MCP smoke tests, and publishing a release.
+
 ```sh
 cargo fmt --all --check
 cargo test --workspace --all-targets --locked

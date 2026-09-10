@@ -1,32 +1,249 @@
-name: Release archives
+name: Release
 
 on:
-  push:
-    tags: ['v*']
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Exact tag, for example v0.1.0. Leave blank to use bump.
+        required: false
+        type: string
+      bump:
+        description: Version bump when version is blank.
+        default: none
+        type: choice
+        options: [none, patch, minor, major]
 
 permissions:
   contents: read
 
+# Serialize releases so two manual bumps cannot update the branch concurrently.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
-  linux-x86_64:
+  prepare:
+    name: resolve tag and prepare Cargo version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_version: ${{ steps.resolve.outputs.release_version }}
+      checkout_ref: ${{ steps.prepare.outputs.checkout_ref }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      existing_tag: ${{ steps.resolve.outputs.existing_tag }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out repository
+        uses: actions/checkout@v7
         with:
-          persist-credentials: false
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}
           fetch-depth: 0
+          fetch-tags: true
 
-      - name: Package stripped archive and checksum
-        run: sh scripts/package-release.sh release
-
-      - name: Verify checksum
-        run: sha256sum -c release/*.sha256
-
-      - name: Upload archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Actions Toolbox
+        uses: wallentx/gh-actions/composite/actions-toolbox@main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: panoptes-linux-x86_64
-          path: release/*
-          if-no-files-found: error
+          checkout: false
+
+      - name: Resolve release inputs
+        id: resolve
+        env:
+          EVENT_RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || '' }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUMP: ${{ inputs.bump || 'none' }}
+        run: |
+          set -euo pipefail
+          tag=${EVENT_RELEASE_TAG:-$INPUT_VERSION}
+          if [ -z "$tag" ]; then
+            case "$INPUT_BUMP" in
+              major) tag=${GH_NEXT_MAJOR:?GH_NEXT_MAJOR is not set} ;;
+              minor) tag=${GH_NEXT_MINOR:?GH_NEXT_MINOR is not set} ;;
+              patch) tag=${GH_NEXT_PATCH:?GH_NEXT_PATCH is not set} ;;
+              *) echo 'Provide an exact version or choose a version bump.' >&2; exit 1 ;;
+            esac
+          fi
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Expected a SemVer tag such as v0.1.0; got $tag" >&2
+            exit 1
+          fi
+          existing=false
+          source_sha=$GITHUB_SHA
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            existing=true
+            source_sha=$(git rev-parse "refs/tags/$tag^{commit}")
+          elif [ -n "$EVENT_RELEASE_TAG" ]; then
+            echo "Published release tag is missing: $tag" >&2
+            exit 1
+          fi
+          version=${tag#v}
+          prerelease=false
+          [[ "${version%%+*}" != *-* ]] || prerelease=true
+          {
+            printf 'release_tag=%s\n' "$tag"
+            printf 'release_version=%s\n' "$version"
+            printf 'checkout_ref=%s\n' "$source_sha"
+            printf 'existing_tag=%s\n' "$existing"
+            printf 'prerelease=%s\n' "$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Select release source
+        env:
+          CHECKOUT_REF: ${{ steps.resolve.outputs.checkout_ref }}
+          EXISTING_TAG: ${{ steps.resolve.outputs.existing_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$EXISTING_TAG" = false ] && [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "Create new releases from the default branch: $DEFAULT_BRANCH" >&2
+            exit 1
+          fi
+          git checkout --detach "$CHECKOUT_REF"
+
+      - name: Read Cargo version
+        id: cargo
+        uses: cssnr/toml-action@v2
+        with:
+          file: Cargo.toml
+          path: $.package.version
+
+      - name: Update Cargo.toml version
+        if: steps.resolve.outputs.existing_tag == 'false' && steps.cargo.outputs.value != steps.resolve.outputs.release_version
+        uses: cssnr/toml-action@v2
+        with:
+          file: Cargo.toml
+          path: $.package.version
+          value: ${{ steps.resolve.outputs.release_version }}
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Synchronize lockfile and prepare versioned commit
+        id: prepare
+        env:
+          RELEASE_VERSION: ${{ steps.resolve.outputs.release_version }}
+          EXISTING_TAG: ${{ steps.resolve.outputs.existing_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$EXISTING_TAG" = false ]; then
+            cargo metadata --format-version 1 > /dev/null
+          fi
+          cargo metadata --locked --format-version 1 |
+            jq -e --arg version "$RELEASE_VERSION" \
+              '.packages[] | select(.name == "panoptes" and .source == null) | .version == $version'
+          if [ "$EXISTING_TAG" = false ]; then
+            git diff --check
+            git add Cargo.toml Cargo.lock
+            if ! git diff --cached --quiet; then
+              git config user.name 'github-actions[bot]'
+              git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+              git status --short --branch
+              git var GIT_AUTHOR_IDENT
+              git commit -m "chore(release): prepare v$RELEASE_VERSION"
+              git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+            fi
+          fi
+          printf 'checkout_ref=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  gate:
+    name: release checks
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      checkout_ref: ${{ needs.prepare.outputs.checkout_ref }}
+
+  build:
+    name: release builds
+    needs: [prepare, gate]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/build.yml
+    with:
+      checkout_ref: ${{ needs.prepare.outputs.checkout_ref }}
+      release_tag: ${{ needs.prepare.outputs.release_tag }}
+      attest: true
+
+  publish:
+    name: publish release assets
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      RELEASE_SHA: ${{ needs.prepare.outputs.checkout_ref }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      EXISTING_TAG: ${{ needs.prepare.outputs.existing_tag }}
+    steps:
+      - name: Check out tested commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Download release archives
+        uses: actions/download-artifact@v8
+        with:
+          path: release
+          pattern: panoptes-*
+          merge-multiple: true
+
+      - name: Verify archives and collect checksums
+        working-directory: release
+        run: |
+          set -euo pipefail
+          version=${RELEASE_TAG#v}
+          targets=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin)
+          archives=(*.tar.gz)
+          [ "${#archives[@]}" -eq "${#targets[@]}" ]
+          : > SHA256SUMS
+          for target in "${targets[@]}"; do
+            name="panoptes-$version-$target"
+            sha256sum -c "$name.tar.gz.sha256"
+            tar -xOf "$name.tar.gz" "$name/release.json" |
+              jq -e --arg version "$version" --arg tag "$RELEASE_TAG" \
+                --arg commit "$RELEASE_SHA" --arg target "$target" \
+                '.version == $version and .tag == $tag and .commit == $commit and .target == $target'
+            sha256sum "$name.tar.gz" >> SHA256SUMS
+          done
+
+      - name: Verify existing tag still identifies the tested commit
+        run: |
+          set -euo pipefail
+          remote_tags=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
+          if [ -n "$remote_tags" ]; then
+            git fetch --no-tags origin "refs/tags/$RELEASE_TAG"
+            [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$RELEASE_SHA" ] || {
+              echo "Release tag moved away from tested commit $RELEASE_SHA" >&2
+              exit 1
+            }
+          elif [ "$EXISTING_TAG" = true ]; then
+            echo "Release tag was deleted during the build: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Publish tested release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          target_commitish: ${{ needs.prepare.outputs.checkout_ref }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/*.tar.gz
+            release/*.tar.gz.sha256
+            release/SHA256SUMS

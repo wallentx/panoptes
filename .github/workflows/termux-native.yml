@@ -6,12 +6,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: termux-native-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   android-aarch64:
     # A runner registered from the Termux app with all three labels. This is the
     # real Android/Bionic gate; termux-docker in CI is useful but cannot emulate
     # Android's kernel and complete public-library surface.
     runs-on: [self-hosted, termux, ARM64]
+    timeout-minutes: 60
     steps:
       - name: Fetch exact revision without Node-based actions
         env:
@@ -28,9 +33,9 @@ jobs:
       - name: Native Android build and isolated install smoke
         run: |
           set -eu
-          pkg install -y rust clang make git pkg-config
+          pkg install -y rust clang make git pkg-config jq
+          export CARGO_BUILD_JOBS=1
           cargo test --workspace --all-targets --locked
           prefix="$TMPDIR/panoptes-prefix-$GITHUB_RUN_ID"
-          cargo install --path . --locked --root "$prefix"
-          "$prefix/bin/panoptes" --version
-          "$prefix/bin/panoptes" version --json
+          PANOPTES_GIT_SHA="$GITHUB_SHA" cargo install --path . --locked --root "$prefix"
+          bash scripts/smoke.sh "$prefix/bin/panoptes"
