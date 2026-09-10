@@ -409,7 +409,11 @@ mod tests {
         std::fs::write(root.join("lib.rs"), "pub fn plain() {}\n").unwrap();
 
         assert!(automatic_targets(&root).unwrap().is_empty());
-        assert_eq!(targets(&root).unwrap()[0].root, root);
+        // Temporary directories can contain symlinks, such as /var on macOS.
+        assert_eq!(
+            targets(&root).unwrap()[0].root,
+            std::fs::canonicalize(&root).unwrap()
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -422,7 +426,10 @@ mod tests {
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::create_dir_all(root.join("src/nested")).unwrap();
 
-        assert_eq!(root_of(&root.join("src/nested")).unwrap(), root);
+        assert_eq!(
+            root_of(&root.join("src/nested")).unwrap(),
+            std::fs::canonicalize(&root).unwrap()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -455,7 +462,10 @@ mod tests {
         .unwrap();
         std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
 
-        assert_eq!(root_of(&worktree.join("src")).unwrap(), worktree);
+        assert_eq!(
+            root_of(&worktree.join("src")).unwrap(),
+            std::fs::canonicalize(&worktree).unwrap()
+        );
         assert_eq!(
             git_common_dir(&worktree).unwrap(),
             std::fs::canonicalize(&common).unwrap().to_string_lossy()
