@@ -66,6 +66,18 @@ synthetic regression test, and controlled agent runner are documented in
 
 ## Get running
 
+### Homebrew (macOS and Linux)
+
+```sh
+brew install wallentx/tap/panoptes
+```
+
+Homebrew automatically adds the [tap](https://github.com/wallentx/homebrew-tap)
+and installs the required build dependencies. The package currently builds from
+source.
+
+### From source (including Termux)
+
 You need Git, Rust, Cargo, and a C compiler. On Termux, the equivalent packages
 are `git`, `rust`, and `clang`.
 
@@ -75,7 +87,11 @@ cd panoptes
 ./install.sh
 ```
 
-Make sure `~/.local/bin` is on `PATH`, then connect your coding agents:
+For source installations, make sure `~/.local/bin` is on `PATH`.
+
+### Connect coding agents (optional)
+
+After either installation method, connect your coding agents:
 
 ```sh
 panoptes init
@@ -98,6 +114,22 @@ For scripted setup:
 ```sh
 panoptes init --provider codex --provider claude
 ```
+
+Or configure Cursor and OpenCode:
+
+```sh
+panoptes init --provider cursor --provider opencode
+```
+
+### Upgrade a Homebrew installation
+
+```sh
+brew update
+brew upgrade wallentx/tap/panoptes
+```
+
+After upgrading, rerun `panoptes init` for your providers and restart their MCP
+clients so they use the newly installed executable.
 
 ## What agents get
 
