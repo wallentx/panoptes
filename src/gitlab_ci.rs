@@ -140,7 +140,13 @@ fn references<'a>(
         }
     }
 }
-pub fn enrich<'a>(root: Node<'a>, yaml: &Yaml<'a, '_>, path: &str, ex: &mut Extracted) {
+pub fn enrich<'a>(
+    root: Node<'a>,
+    yaml: &Yaml<'a, '_>,
+    path: &str,
+    ex: &mut Extracted,
+    included: bool,
+) {
     if ex.automation.dialect != Dialect::Generic {
         return;
     }
@@ -155,10 +161,11 @@ pub fn enrich<'a>(root: Node<'a>, yaml: &Yaml<'a, '_>, path: &str, ex: &mut Extr
                             matches!(key.as_str(), "script" | "extends" | "trigger" | "needs")
                         }))
             });
-        if !recognized {
+        if !recognized && !included {
             continue;
         }
         ex.automation.dialect = Dialect::GitLab;
+        ex.automation.gitlab_included = included;
         if let Some(entries) = yaml::get(doc, yaml, "include") {
             include(ex, None, entries, yaml);
         }
@@ -182,25 +189,28 @@ pub fn enrich<'a>(root: Node<'a>, yaml: &Yaml<'a, '_>, path: &str, ex: &mut Extr
         }
         for (name, value) in pairs.into_iter().filter(|(name, _)| !reserved(name)) {
             let fields = yaml::pairs(value, yaml);
-            if fields.is_empty()
-                || (!root_file(path)
-                    && !fields.iter().any(|(key, _)| {
-                        matches!(
-                            key.as_str(),
-                            "script"
-                                | "extends"
-                                | "trigger"
-                                | "needs"
-                                | "stage"
-                                | "rules"
-                                | "dependencies"
-                                | "before_script"
-                                | "after_script"
-                                | "variables"
-                                | "image"
-                                | "artifacts"
-                        )
-                    }))
+            if !matches!(
+                yaml::resolve(value, yaml).kind(),
+                "block_mapping" | "flow_mapping"
+            ) || (!root_file(path)
+                && !included
+                && !fields.iter().any(|(key, _)| {
+                    matches!(
+                        key.as_str(),
+                        "script"
+                            | "extends"
+                            | "trigger"
+                            | "needs"
+                            | "stage"
+                            | "rules"
+                            | "dependencies"
+                            | "before_script"
+                            | "after_script"
+                            | "variables"
+                            | "image"
+                            | "artifacts"
+                    )
+                }))
             {
                 continue;
             }
@@ -396,6 +406,70 @@ pub fn resolve(
     result
 }
 
+fn pipeline_seed(file: &Pending) -> bool {
+    file.extracted.automation.dialect == Dialect::GitLab
+        && !file.extracted.automation.gitlab_included
+        && (root_file(&file.rel)
+            || file
+                .extracted
+                .symbols
+                .iter()
+                .any(|s| s.name.starts_with("gitlab job:")))
+}
+
+/// Infer format only for files reached from a local pipeline include. Replay
+/// unchanged inferred payloads, and remove inferred symbols when the include
+/// disappears, even if the fragment's own content has not changed.
+pub fn contextualize(
+    pending: &mut [Pending],
+    sources: &[crate::repo::SourceFile],
+) -> anyhow::Result<Vec<usize>> {
+    let indexes: HashMap<_, _> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.rel.as_str(), i))
+        .collect();
+    let mut todo: Vec<_> = pending
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| pipeline_seed(f))
+        .map(|(i, _)| i)
+        .collect();
+    let mut seen = HashSet::new();
+    let mut changed = Vec::new();
+    let mut extractor = crate::extract::Extractor::new();
+    while let Some(index) = todo.pop() {
+        if !seen.insert(index) || pending[index].lang != crate::repo::Lang::Yaml {
+            continue;
+        }
+        let file = &mut pending[index];
+        if file.extracted.automation.dialect == Dialect::Generic {
+            file.extracted = extractor.extract_gitlab_include(&sources[index].text, &file.rel)?;
+            changed.push(index);
+        }
+        if file.extracted.automation.dialect != Dialect::GitLab {
+            continue;
+        }
+        for link in &file.extracted.automation.links {
+            if let Target::File(paths) = &link.target {
+                todo.extend(
+                    paths
+                        .iter()
+                        .filter_map(|p| indexes.get(p.as_str()).copied()),
+                );
+            }
+        }
+    }
+    for (index, file) in pending.iter_mut().enumerate() {
+        if file.extracted.automation.gitlab_included && !seen.contains(&index) {
+            file.extracted = extractor.extract_file(file.lang, &sources[index].text, &file.rel)?;
+            changed.push(index);
+        }
+    }
+    changed.sort_unstable();
+    Ok(changed)
+}
+
 /// Include-only fragments are active only when reached from a pipeline/job file.
 pub fn active_paths(pending: &[Pending]) -> HashSet<&str> {
     let files: HashMap<_, _> = pending
@@ -405,13 +479,7 @@ pub fn active_paths(pending: &[Pending]) -> HashSet<&str> {
         .collect();
     let mut todo: Vec<_> = files
         .values()
-        .filter(|f| {
-            root_file(&f.rel)
-                || f.extracted
-                    .symbols
-                    .iter()
-                    .any(|s| s.name.starts_with("gitlab job:"))
-        })
+        .filter(|f| pipeline_seed(f))
         .map(|f| f.rel.as_str())
         .collect();
     let mut active = HashSet::new();

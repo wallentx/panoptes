@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-14";
+pub const EXTRACTOR_STAMP: &str = "panoptes-15";
 
 pub struct BuildStats {
     pub files: usize,
@@ -241,11 +241,25 @@ pub fn build_with_jobs(
     for (index, extracted) in parsed_files {
         pending[index] = Some(index_extracted(&tx, repo_id, &files[index], extracted)?);
     }
-    let pending: Vec<Pending> = pending
+    let mut pending: Vec<Pending> = pending
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .context("missing extraction after parallel parse")?;
-    let parsed = changed.len();
+    let mut parsed = changed.len();
+    for index in crate::gitlab_ci::contextualize(&mut pending, &files)? {
+        // Include reachability is a cache input independent of the file hash.
+        tx.execute("delete from files where id=?1", [pending[index].file_id])?;
+        pending[index] = index_extracted(
+            &tx,
+            repo_id,
+            &files[index],
+            pending[index].extracted.clone(),
+        )?;
+        if changed.binary_search(&index).is_err() {
+            parsed += 1;
+            reused -= 1;
+        }
+    }
 
     let mut by_name: HashMap<String, Vec<i64>> = HashMap::new();
     let mut hcl_by_dir: HashMap<&Path, HashMap<String, Vec<i64>>> = HashMap::new();
@@ -2825,6 +2839,72 @@ child:
         );
         assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
         assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gitlab_included_templates_use_context_and_refresh_when_includes_change() {
+        let pipeline = "include: chain.yml\nconsumer:\n  script: echo test\n  extends: [.base, .vars, .tags, .empty]\n";
+        let (mut db, root) = fixture(&[
+            (".gitlab-ci.yml", pipeline),
+            (
+                "chain.yml",
+                "include: [templates/base.yml, templates/vars.yml, templates/tags.yml, templates/empty.yml, cycle.yml]\n",
+            ),
+            ("cycle.yml", "include: chain.yml\n"),
+            ("templates/base.yml", ".base: {image: alpine}\n"),
+            ("templates/vars.yml", ".vars: {variables: {ENV: prod}}\n"),
+            ("templates/tags.yml", ".tags: {tags: [linux]}\n"),
+            ("templates/empty.yml", ".empty: {}\n"),
+            ("unrelated.yml", ".base: {image: debian}\n"),
+        ]);
+        let edges = automation_edges(&db);
+        for name in [".base", ".vars", ".tags", ".empty"] {
+            let target = format!("gitlab job: {name}");
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|(_, s, d, _)| s == "gitlab job: consumer" && d == &target)
+                    .count(),
+                1,
+                "{edges:?}"
+            );
+        }
+        let template_paths = |db: &Connection| -> Vec<String> {
+            let mut statement = db.prepare("select f.path from symbols s join files f on s.file_id=f.id where s.name='gitlab job: .base' order by f.path").unwrap();
+            statement
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(template_paths(&db), ["templates/base.yml"]);
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+
+        // Only the include changes. Previously inferred templates must lose CI
+        // symbols, and the newly reached generic file must gain them.
+        std::fs::write(
+            root.join(".gitlab-ci.yml"),
+            pipeline.replace("include: chain.yml", "include: unrelated.yml"),
+        )
+        .unwrap();
+        build(&mut db, &root).unwrap();
+        assert_eq!(template_paths(&db), ["unrelated.yml"]);
+        let moved = automation_edges(&db);
+        let targets: Vec<_> = moved
+            .iter()
+            .filter(|(_, s, _, _)| s == "gitlab job: consumer")
+            .map(|(_, _, d, p)| (d.as_str(), p.as_str()))
+            .collect();
+        assert_eq!(targets, [("gitlab job: .base", "unrelated.yml")]);
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), moved);
+
+        std::fs::write(root.join(".gitlab-ci.yml"), pipeline).unwrap();
+        build(&mut db, &root).unwrap();
+        assert_eq!(automation_edges(&db), edges);
+        assert_eq!(template_paths(&db), ["templates/base.yml"]);
         let _ = std::fs::remove_dir_all(root);
     }
 

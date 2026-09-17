@@ -15,6 +15,9 @@ pub struct Automation {
     pub handlers: Vec<Handler>,
     #[serde(default)]
     pub resources: Vec<crate::kubernetes::Resource>,
+    /// Format inferred from a reachable CI include, not this file's own syntax.
+    #[serde(default)]
+    pub gitlab_included: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

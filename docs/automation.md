@@ -173,7 +173,10 @@ See the [Kustomize guide](https://kubernetes.io/docs/tasks/manage-kubernetes-obj
 `.gitlab-ci.yml` and recognizable CI fragments expose jobs, hidden templates,
 declared stages, and defaults. `extends`, `needs`, artifact `dependencies`, and
 `!reference` link to definitions in the same pipeline's local include graph.
-Included sibling files share that scope. `inherit: {default: false}` suppresses
+Included sibling files share that scope. Local includes also identify template-only
+fragments, such as `.base: {image: alpine}`, without requiring a runnable job.
+This inferred format is refreshed when include reachability changes; unrelated
+YAML is not promoted to CI configuration. `inherit: {default: false}` suppresses
 the default dependency. Child-pipeline includes link to separate pipeline files;
 the child's jobs do not enter the parent's name lookup.
 

@@ -384,6 +384,21 @@ impl Extractor {
     }
 
     pub fn extract_file(&mut self, lang: Lang, src: &str, path: &str) -> Result<Extracted> {
+        self.extract_context(lang, src, path, false)
+    }
+
+    /// Local CI includes supply format context for otherwise generic YAML.
+    pub fn extract_gitlab_include(&mut self, src: &str, path: &str) -> Result<Extracted> {
+        self.extract_context(Lang::Yaml, src, path, true)
+    }
+
+    fn extract_context(
+        &mut self,
+        lang: Lang,
+        src: &str,
+        path: &str,
+        gitlab_include: bool,
+    ) -> Result<Extracted> {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.compiled.entry(lang) {
             entry.insert(CompiledExtractor::new(lang)?);
         }
@@ -394,6 +409,7 @@ impl Extractor {
             lang,
             src,
             path,
+            gitlab_include,
         )
     }
 }
@@ -717,6 +733,7 @@ fn extract_compiled(
     lang: Lang,
     src: &str,
     path: &str,
+    gitlab_include: bool,
 ) -> Result<Extracted> {
     let tree = compiled
         .parser
@@ -1068,7 +1085,7 @@ fn extract_compiled(
         crate::compose::enrich(root, &yaml, path, &mut extracted);
         crate::kubernetes::enrich(root, &yaml, &mut extracted);
         crate::kustomize::enrich(root, &yaml, path, &mut extracted);
-        crate::gitlab_ci::enrich(root, &yaml, path, &mut extracted);
+        crate::gitlab_ci::enrich(root, &yaml, path, &mut extracted, gitlab_include);
         crate::cloudformation::enrich(root, &yaml, path, &mut extracted);
     }
     Ok(extracted)
