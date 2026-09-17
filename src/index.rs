@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-13";
+pub const EXTRACTOR_STAMP: &str = "panoptes-14";
 
 pub struct BuildStats {
     pub files: usize,
@@ -2709,6 +2709,42 @@ configMapGenerator:
         assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
         assert_eq!(automation_edges(&db), edges);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kustomize_root_directory_bases_preserve_imports_and_patch_scope() {
+        for filename in ["kustomization.yaml", "kustomization.yml", "Kustomization"] {
+            let (mut db, root) = fixture(&[
+                (filename, "resources: [deployment.yaml]\n"),
+                (
+                    "deployment.yaml",
+                    "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web}\nspec: {}\n",
+                ),
+                (
+                    "overlays/prod/kustomization.yaml",
+                    "resources: [../..]\npatches:\n  - target: {kind: Deployment, name: web}\n    patch: '[{op: add, path: /spec/replicas, value: 3}]'\n",
+                ),
+            ]);
+            let edges = automation_edges(&db);
+            assert!(
+                edges
+                    .iter()
+                    .any(|(p, _, _, q)| p == "overlays/prod/kustomization.yaml" && q == filename),
+                "{edges:?}"
+            );
+            assert!(
+                edges
+                    .iter()
+                    .any(|(p, s, d, q)| p == "overlays/prod/kustomization.yaml"
+                        && s == "patch: patches#1"
+                        && d == "Deployment: default/web"
+                        && q == "deployment.yaml"),
+                "{edges:?}"
+            );
+            assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+            assert_eq!(automation_edges(&db), edges);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]

@@ -50,12 +50,13 @@ fn local(base: &str, spec: &str) -> Option<String> {
     yaml::path(base, spec)
 }
 fn candidates(path: String) -> Vec<String> {
-    vec![
-        path.clone(),
-        format!("{path}/kustomization.yaml"),
-        format!("{path}/kustomization.yml"),
-        format!("{path}/Kustomization"),
-    ]
+    let mut result = vec![path.clone()];
+    result.extend(
+        ["kustomization.yaml", "kustomization.yml", "Kustomization"]
+            .into_iter()
+            .filter_map(|name| yaml::path(&path, name)),
+    );
+    result
 }
 pub fn enrich<'a>(root: Node<'a>, yaml: &Yaml<'a, '_>, path: &str, ex: &mut Extracted) {
     if !matches!(
