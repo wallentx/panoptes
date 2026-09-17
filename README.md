@@ -73,8 +73,9 @@ brew install wallentx/tap/panoptes
 ```
 
 Homebrew automatically adds the [tap](https://github.com/wallentx/homebrew-tap)
-and installs the required build dependencies. The package currently builds from
-source.
+and installs the matching release binary for Apple Silicon or Intel macOS, or
+ARM64 or x86-64 Linux, with checksum verification and shell completions. Rust is
+only needed when explicitly installing the development version with `--HEAD` (for example, `brew install --HEAD wallentx/tap/panoptes`).
 
 ### From source (including Termux)
 
