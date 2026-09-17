@@ -51,6 +51,7 @@ pub enum Target {
     OneOf(Vec<String>),
     External(String),
     KustomizeResource(Vec<String>),
+    KustomizeComponent(Vec<String>),
     Patch {
         path: Option<String>,
         selector: Option<crate::kustomize::Selector>,

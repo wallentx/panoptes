@@ -75,7 +75,16 @@ pub fn enrich<'a>(root: Node<'a>, yaml: &Yaml<'a, '_>, path: &str, ex: &mut Extr
             if let Some(entries) = yaml::get(doc, yaml, key) {
                 for entry in yaml::items(entries, yaml) {
                     if let Some(path) = yaml::literal(entry, yaml).and_then(|s| local(base, &s)) {
-                        link(ex, None, Target::KustomizeResource(candidates(path)));
+                        let paths = candidates(path);
+                        link(
+                            ex,
+                            None,
+                            if key == "components" {
+                                Target::KustomizeComponent(paths)
+                            } else {
+                                Target::KustomizeResource(paths)
+                            },
+                        );
                     }
                 }
             }
@@ -226,7 +235,9 @@ pub fn patch_only_paths(pending: &[Pending]) -> HashSet<String> {
                 } => {
                     patches.insert(path.clone());
                 }
-                Target::KustomizeResource(paths) => resources.extend(paths.iter().cloned()),
+                Target::KustomizeResource(paths) | Target::KustomizeComponent(paths) => {
+                    resources.extend(paths.iter().cloned())
+                }
                 _ => {}
             }
         }
@@ -238,29 +249,67 @@ pub fn patch_only_paths(pending: &[Pending]) -> HashSet<String> {
 pub fn resolve(pending: &[Pending], files: &HashMap<String, i64>) -> Resolved {
     let mut regex_cache = HashMap::new();
     let by_path: HashMap<_, _> = pending.iter().map(|f| (f.rel.as_str(), f)).collect();
+    let kustomizations: Vec<_> = pending
+        .iter()
+        .filter(|f| f.extracted.automation.dialect == Dialect::Kustomize)
+        .collect();
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut components: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut component_paths = HashSet::new();
+    for file in &kustomizations {
+        for link in &file.extracted.automation.links {
+            if let Target::KustomizeResource(paths) | Target::KustomizeComponent(paths) =
+                &link.target
+                && let Some(target) = paths.iter().find(|p| files.contains_key(*p))
+            {
+                children.entry(&file.rel).or_default().push(target);
+                if matches!(link.target, Target::KustomizeComponent(_)) {
+                    components.entry(&file.rel).or_default().push(target);
+                    component_paths.insert(target.as_str());
+                }
+            }
+        }
+    }
+    fn closure<'a>(start: &'a str, graph: &HashMap<&'a str, Vec<&'a str>>) -> HashSet<&'a str> {
+        let mut seen = HashSet::new();
+        let mut todo = vec![start];
+        while let Some(path) = todo.pop() {
+            if seen.insert(path)
+                && let Some(next) = graph.get(path)
+            {
+                todo.extend(next);
+            }
+        }
+        seen
+    }
+    let closures: HashMap<_, _> = kustomizations
+        .iter()
+        .map(|f| (f.rel.as_str(), closure(&f.rel, &children)))
+        .collect();
+    // Components share their consuming kustomization's resource accumulator.
+    // Follow only component edges here: a component inside a base belongs to
+    // that base's context, not to every overlay that later consumes the base.
+    let mut contexts: HashMap<&str, Vec<&str>> = HashMap::new();
+    for file in &kustomizations {
+        if component_paths.contains(file.rel.as_str()) {
+            continue;
+        }
+        for component in closure(&file.rel, &components) {
+            if component != file.rel {
+                contexts.entry(component).or_default().push(&file.rel);
+            }
+        }
+    }
     let mut result = Resolved {
         edges: Vec::new(),
         unresolved: 0,
     };
-    for file in pending
-        .iter()
-        .filter(|f| f.extracted.automation.dialect == Dialect::Kustomize)
-    {
-        let mut reachable = HashSet::new();
-        let mut todo = vec![file.rel.as_str()];
-        while let Some(path) = todo.pop() {
-            if reachable.insert(path)
-                && let Some(file) = by_path.get(path)
-            {
-                for link in &file.extracted.automation.links {
-                    if let Target::KustomizeResource(paths) = &link.target
-                        && let Some(target) = paths.iter().find(|p| files.contains_key(*p))
-                    {
-                        todo.push(target);
-                    }
-                }
-            }
-        }
+    for file in kustomizations {
+        let own = [file.rel.as_str()];
+        let scopes = contexts
+            .get(file.rel.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&own);
         for link in &file.extracted.automation.links {
             let from = link
                 .from
@@ -268,7 +317,9 @@ pub fn resolve(pending: &[Pending], files: &HashMap<String, i64>) -> Resolved {
                 .unwrap_or(file.file_symbol);
             match &link.target {
                 Target::Symbol(i) => result.edges.push((from, file.symbol_ids[*i], "calls")),
-                Target::File(paths) | Target::KustomizeResource(paths) => {
+                Target::File(paths)
+                | Target::KustomizeResource(paths)
+                | Target::KustomizeComponent(paths) => {
                     if let Some(id) = paths.iter().find_map(|p| files.get(p)) {
                         result.edges.push((from, *id, "imports"));
                     } else {
@@ -302,7 +353,7 @@ pub fn resolve(pending: &[Pending], files: &HashMap<String, i64>) -> Resolved {
                         .map(std::slice::from_ref)
                         .unwrap_or(&inferred);
                     let mut found = false;
-                    for path in &reachable {
+                    for path in scopes.iter().flat_map(|scope| &closures[scope]) {
                         if let Some(target) = by_path.get(path) {
                             for resource in &target.extracted.automation.resources {
                                 if selectors

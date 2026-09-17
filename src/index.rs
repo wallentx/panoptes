@@ -2787,6 +2787,66 @@ configMapGenerator:
     }
 
     #[test]
+    fn kustomize_component_patches_use_consumers_without_crossing_base_scopes() {
+        let resource = "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web}\n";
+        let patch = "patches:\n  - target: {kind: Deployment, name: web}\n    patch: '[{op: add, path: /spec/replicas, value: 3}]'\n";
+        let (mut db, root) = fixture(&[
+            ("components/inner/kustomization.yaml", patch),
+            (
+                "components/outer/kustomization.yaml",
+                "components: [../inner]\n",
+            ),
+            (
+                "prod/kustomization.yaml",
+                "resources: [app.yaml]\ncomponents: [../components/outer]\n",
+            ),
+            ("prod/app.yaml", resource),
+            (
+                "dev/kustomization.yaml",
+                "resources: [app.yaml]\ncomponents: [../components/inner]\n",
+            ),
+            ("dev/app.yaml", resource),
+            ("unrelated/app.yaml", resource),
+            (
+                "higher/kustomization.yaml",
+                "resources: [../prod, app.yaml]\n",
+            ),
+            ("higher/app.yaml", resource),
+        ]);
+        let edges = automation_edges(&db);
+        let targets: Vec<_> = edges
+            .iter()
+            .filter(|(p, s, d, _)| {
+                p == "components/inner/kustomization.yaml"
+                    && s == "patch: patches#1"
+                    && d == "Deployment: default/web"
+            })
+            .map(|(_, _, _, p)| p.as_str())
+            .collect();
+        assert_eq!(targets, ["dev/app.yaml", "prod/app.yaml"], "{edges:?}");
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(
+            root.join("dev/kustomization.yaml"),
+            "resources: [app.yaml]\n",
+        )
+        .unwrap();
+        build(&mut db, &root).unwrap();
+        let updated = automation_edges(&db);
+        let targets: Vec<_> = updated
+            .iter()
+            .filter(|(p, s, d, _)| {
+                p == "components/inner/kustomization.yaml"
+                    && s == "patch: patches#1"
+                    && d == "Deployment: default/web"
+            })
+            .map(|(_, _, _, p)| p.as_str())
+            .collect();
+        assert_eq!(targets, ["prod/app.yaml"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn kustomize_root_directory_bases_preserve_imports_and_patch_scope() {
         for filename in ["kustomization.yaml", "kustomization.yml", "Kustomization"] {
             let (mut db, root) = fixture(&[

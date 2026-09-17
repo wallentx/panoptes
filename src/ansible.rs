@@ -365,6 +365,7 @@ pub fn resolve(pending: &[Pending], files: &HashMap<String, i64>) -> Resolved {
                 Target::OneOf(_)
                 | Target::External(_)
                 | Target::KustomizeResource(_)
+                | Target::KustomizeComponent(_)
                 | Target::Patch { .. }
                 | Target::Local(_)
                 | Target::Named { .. }
