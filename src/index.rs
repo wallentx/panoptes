@@ -2726,6 +2726,63 @@ configMapGenerator:
     }
 
     #[test]
+    fn kubernetes_cluster_scopes_cover_builtin_api_groups() {
+        let kinds = [
+            ("networking.k8s.io", "IngressClass"),
+            ("networking.k8s.io", "IPAddress"),
+            ("networking.k8s.io", "ServiceCIDR"),
+            ("storage.k8s.io", "CSIDriver"),
+            ("storage.k8s.io", "CSINode"),
+            ("storage.k8s.io", "VolumeAttachment"),
+            ("storage.k8s.io", "VolumeAttributesClass"),
+            ("certificates.k8s.io", "CertificateSigningRequest"),
+            ("certificates.k8s.io", "ClusterTrustBundle"),
+            ("flowcontrol.apiserver.k8s.io", "FlowSchema"),
+            ("flowcontrol.apiserver.k8s.io", "PriorityLevelConfiguration"),
+            ("resource.k8s.io", "DeviceClass"),
+            ("resource.k8s.io", "ResourceSlice"),
+            ("admissionregistration.k8s.io", "ValidatingAdmissionPolicy"),
+            (
+                "admissionregistration.k8s.io",
+                "MutatingAdmissionPolicyBinding",
+            ),
+        ];
+        let mut manifests = String::new();
+        for (group, kind) in kinds {
+            manifests.push_str(&format!(
+                "---\napiVersion: {group}/v1\nkind: {kind}\nmetadata: {{name: sample}}\n"
+            ));
+        }
+        manifests.push_str(
+            "---\napiVersion: example.org/v1\nkind: IngressClass\nmetadata: {name: sample}\n",
+        );
+        manifests.push_str("---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata: {name: sample}\n");
+        let (mut db, root) = fixture(&[("resources.yml", &manifests)]);
+        let edges = automation_edges(&db);
+        for (_, kind) in kinds {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(_, _, d, _)| d == &format!("{kind}: sample")),
+                "missing cluster scope for {kind}"
+            );
+        }
+        assert!(
+            edges
+                .iter()
+                .any(|(_, _, d, _)| d == "IngressClass: default/sample")
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(_, _, d, _)| d == "NetworkPolicy: default/sample")
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn kustomize_root_directory_bases_preserve_imports_and_patch_scope() {
         for filename in ["kustomization.yaml", "kustomization.yml", "Kustomization"] {
             let (mut db, root) = fixture(&[

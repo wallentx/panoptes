@@ -37,11 +37,43 @@ fn labels<'a>(node: Node<'a>, yaml: &Yaml<'a, '_>) -> Option<Vec<(String, String
         .map(|(k, v)| Some((k, yaml::literal(v, yaml)?)))
         .collect()
 }
+/// Built-in API scopes, keyed by group as well as kind to avoid collisions
+/// with custom resources. Source: Kubernetes api/openapi-spec/swagger.json.
 fn cluster_scoped(group: &str, kind: &str) -> bool {
     matches!(
         (group, kind),
         ("", "Namespace" | "Node" | "PersistentVolume")
-            | ("storage.k8s.io", "StorageClass")
+            | (
+                "storage.k8s.io",
+                "StorageClass"
+                    | "CSIDriver"
+                    | "CSINode"
+                    | "VolumeAttachment"
+                    | "VolumeAttributesClass"
+            )
+            | (
+                "networking.k8s.io",
+                "IngressClass" | "IPAddress" | "ServiceCIDR"
+            )
+            | (
+                "certificates.k8s.io",
+                "CertificateSigningRequest" | "ClusterTrustBundle"
+            )
+            | (
+                "flowcontrol.apiserver.k8s.io",
+                "FlowSchema" | "PriorityLevelConfiguration"
+            )
+            | ("internal.apiserver.k8s.io", "StorageVersion")
+            | ("storagemigration.k8s.io", "StorageVersionMigration")
+            | (
+                "resource.k8s.io",
+                "DeviceClass" | "ResourceSlice" | "DeviceTaintRule" | "ResourcePoolStatusRequest"
+            )
+            | ("authentication.k8s.io", "TokenReview" | "SelfSubjectReview")
+            | (
+                "authorization.k8s.io",
+                "SubjectAccessReview" | "SelfSubjectAccessReview" | "SelfSubjectRulesReview"
+            )
             | (
                 "rbac.authorization.k8s.io",
                 "ClusterRole" | "ClusterRoleBinding"
@@ -52,7 +84,12 @@ fn cluster_scoped(group: &str, kind: &str) -> bool {
             | ("scheduling.k8s.io", "PriorityClass")
             | (
                 "admissionregistration.k8s.io",
-                "MutatingWebhookConfiguration" | "ValidatingWebhookConfiguration"
+                "MutatingWebhookConfiguration"
+                    | "ValidatingWebhookConfiguration"
+                    | "ValidatingAdmissionPolicy"
+                    | "ValidatingAdmissionPolicyBinding"
+                    | "MutatingAdmissionPolicy"
+                    | "MutatingAdmissionPolicyBinding"
             )
     )
 }
