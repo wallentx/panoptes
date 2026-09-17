@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-6";
+pub const EXTRACTOR_STAMP: &str = "panoptes-7";
 
 pub struct BuildStats {
     pub files: usize,
@@ -2419,6 +2419,35 @@ services:
             !automation_edges(&db)
                 .iter()
                 .any(|(_, s, _, _)| s == "service: app")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inherited_yaml_relationships_reach_compose_ansible_and_actions_consumers() {
+        let (db, root) = fixture(&[
+            (
+                "compose.yml",
+                "x-defaults: &defaults {image: nginx, depends_on: [db]}\nservices:\n  web: {<<: *defaults}\n  independent: {<<: *defaults, depends_on: []}\n  db: {image: postgres}\n",
+            ),
+            (
+                "play.yml",
+                "- hosts: all\n  vars:\n    common: &common {debug: {msg: changed}, notify: restart}\n  tasks:\n    - {<<: *common, name: Change}\n  handlers:\n    - {name: restart, debug: {msg: done}}\n",
+            ),
+            (
+                ".github/workflows/ci.yml",
+                "jobs:\n  first:\n    steps:\n      - &checkout {id: checkout, uses: actions/checkout@v7}\n  second:\n    steps:\n      - *checkout\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        assert!(has("service: web", "service: db"));
+        assert!(!has("service: independent", "service: db"));
+        assert!(has("task: Change", "handler: restart"));
+        assert!(has("step: second.checkout", "actions/checkout@v7"));
+        assert!(
+            has("services.web.<<", "defaults"),
+            "anchor provenance remains traceable"
         );
         let _ = std::fs::remove_dir_all(root);
     }

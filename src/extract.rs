@@ -240,10 +240,6 @@ const YAML_DEFS: &str = r#"
 (anchor (anchor_name) @name) @def
 "#;
 
-const YAML_CALLS: &str = r#"
-(alias (alias_name) @callee)
-"#;
-
 const HCL_DEFS: &str = r#"
 (block . (identifier) @name) @def
 (attribute (identifier) @name) @def
@@ -299,7 +295,7 @@ fn queries(lang: Lang) -> Queries {
         },
         Lang::Yaml => Queries {
             defs: YAML_DEFS,
-            calls: Some(YAML_CALLS),
+            calls: None,
             bindings: None,
             imports: None,
         },
@@ -1051,9 +1047,25 @@ fn extract_compiled(
         automation: Default::default(),
     };
     if lang == Lang::Yaml {
-        crate::ansible::enrich(root, src, path, &mut extracted);
-        crate::github_actions::enrich(root, src, path, &mut extracted);
-        crate::compose::enrich(root, src, path, &mut extracted);
+        let yaml = crate::yaml::Yaml::new(root, src);
+        // Alias bindings are document-local and point to the most recent anchor.
+        // Preserve those exact origins rather than resolving anchor names globally.
+        extracted.calls.clear();
+        for (alias, anchor) in &yaml.aliases {
+            if let Some(index) = spans
+                .iter()
+                .position(|&(start, end)| start == anchor.start_byte() && end == anchor.end_byte())
+            {
+                extracted.automation.links.push(crate::yaml::Link {
+                    from: owner_at(alias.start_byte()),
+                    scope: None,
+                    target: crate::yaml::Target::Symbol(index),
+                });
+            }
+        }
+        crate::ansible::enrich(root, &yaml, path, &mut extracted);
+        crate::github_actions::enrich(root, &yaml, path, &mut extracted);
+        crate::compose::enrich(root, &yaml, path, &mut extracted);
     }
     Ok(extracted)
 }
@@ -1480,11 +1492,8 @@ jobs:
             "{names:?}"
         );
         assert!(names.contains(&("linux", "anchor")), "{names:?}");
-        assert!(
-            e.calls.iter().any(|call| call.callee == "linux"),
-            "{:?}",
-            e.calls
-        );
+        assert!(e.automation.links.iter().any(|link| matches!(link.target,
+            crate::yaml::Target::Symbol(i) if e.symbols[i].name == "linux")));
         assert_eq!(e.imports, ["actions/checkout@v4"]);
         assert!(e.automation.links.iter().any(|link| matches!(&link.target,
             crate::yaml::Target::Action { spec, .. } if spec == "./.github/actions/setup")));

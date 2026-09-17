@@ -34,7 +34,7 @@ fn module_key(key: &str) -> &str {
         .unwrap_or(key)
 }
 
-fn task_like(node: Node<'_>, src: &str) -> bool {
+fn task_like<'tree>(node: Node<'tree>, src: &yaml::Yaml<'tree, '_>) -> bool {
     yaml::pairs(node, src).iter().any(|(key, _)| {
         key.split('.').count() == 3
             || key.starts_with("ansible.builtin.")
@@ -67,13 +67,18 @@ fn task_like(node: Node<'_>, src: &str) -> bool {
     })
 }
 
-pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
+pub fn enrich<'tree>(
+    root: Node<'tree>,
+    src: &yaml::Yaml<'tree, '_>,
+    path: &str,
+    ex: &mut Extracted,
+) {
     if path.starts_with(".github/") {
         return;
     }
     for doc in yaml::children(root).filter(|n| n.kind() == "document") {
-        let top = yaml::unwrap(doc);
-        let entries = yaml::items(top);
+        let top = yaml::resolve(doc, src);
+        let entries = yaml::items(top, src);
         let is_playbook = entries.iter().any(|&node| {
             yaml::get(node, src, "hosts").is_some()
                 || yaml::pairs(node, src)
@@ -105,12 +110,12 @@ pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
                     }
                 }
                 if let Some(roles) = yaml::get(play, src, "roles") {
-                    for role in yaml::items(roles) {
+                    for role in yaml::items(roles, src) {
                         role_link(ex, src, path, role, Some(id), Some(id));
                     }
                 }
                 if let Some(vars) = yaml::get(play, src, "vars_files") {
-                    for entry in yaml::items(vars) {
+                    for entry in yaml::items(vars, src) {
                         file_link(ex, src, path, entry, Some(id), Some(id), "vars");
                     }
                 }
@@ -123,7 +128,7 @@ pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
         {
             if parent(path).ends_with("meta") {
                 if let Some(dependencies) = yaml::get(top, src, "dependencies") {
-                    for role in yaml::items(dependencies) {
+                    for role in yaml::items(dependencies, src) {
                         role_link(ex, src, path, role, None, None);
                     }
                 }
@@ -135,16 +140,16 @@ pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
     }
 }
 
-fn task_list(
+fn task_list<'tree>(
     ex: &mut Extracted,
-    src: &str,
+    src: &yaml::Yaml<'tree, '_>,
     path: &str,
-    list: Node<'_>,
+    list: Node<'tree>,
     parent: Option<usize>,
     scope: Option<usize>,
     handler: bool,
 ) {
-    for task in yaml::items(list) {
+    for task in yaml::items(list, src) {
         let pairs = yaml::pairs(task, src);
         if pairs.is_empty() {
             continue;
@@ -197,17 +202,17 @@ fn task_list(
     }
 }
 
-fn file_link(
+fn file_link<'tree>(
     ex: &mut Extracted,
-    src: &str,
+    src: &yaml::Yaml<'tree, '_>,
     path: &str,
-    value: Node<'_>,
+    value: Node<'tree>,
     from: Option<usize>,
     scope: Option<usize>,
     kind: &str,
 ) {
     let value = yaml::get(value, src, "file").unwrap_or(value);
-    let items = yaml::items(value);
+    let items = yaml::items(value, src);
     if items.iter().any(|&n| yaml::literal(n, src).is_none()) {
         return;
     }
@@ -234,11 +239,11 @@ fn file_link(
     }
 }
 
-fn role_link(
+fn role_link<'tree>(
     ex: &mut Extracted,
-    src: &str,
+    src: &yaml::Yaml<'tree, '_>,
     path: &str,
-    value: Node<'_>,
+    value: Node<'tree>,
     from: Option<usize>,
     scope: Option<usize>,
 ) {

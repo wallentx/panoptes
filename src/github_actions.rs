@@ -15,7 +15,12 @@ fn link(ex: &mut Extracted, from: Option<usize>, target: Target) {
     });
 }
 
-pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
+pub fn enrich<'tree>(
+    root: Node<'tree>,
+    src: &yaml::Yaml<'tree, '_>,
+    path: &str,
+    ex: &mut Extracted,
+) {
     let workflow = Path::new(path).parent() == Some(Path::new(".github/workflows"));
     let action = matches!(
         Path::new(path).file_name().and_then(|p| p.to_str()),
@@ -25,7 +30,7 @@ pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
         return;
     }
     for doc in yaml::children(root).filter(|n| n.kind() == "document") {
-        let top = yaml::unwrap(doc);
+        let top = yaml::resolve(doc, src);
         if !workflow && yaml::get(top, src, "runs").is_none() {
             continue;
         }
@@ -105,10 +110,10 @@ pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
     }
 }
 
-fn definitions(
+fn definitions<'tree>(
     ex: &mut Extracted,
-    src: &str,
-    node: Node<'_>,
+    src: &yaml::Yaml<'tree, '_>,
+    node: Node<'tree>,
     key: &str,
     prefix: &str,
     parent: Option<usize>,
@@ -140,14 +145,14 @@ fn definitions(
     }
 }
 
-fn step_list(
+fn step_list<'tree>(
     ex: &mut Extracted,
-    src: &str,
-    steps: Node<'_>,
+    src: &yaml::Yaml<'tree, '_>,
+    steps: Node<'tree>,
     parent: Option<usize>,
     job: Option<&str>,
 ) {
-    for (ordinal, step) in yaml::items(steps).into_iter().enumerate() {
+    for (ordinal, step) in yaml::items(steps, src).into_iter().enumerate() {
         let id = yaml::get(step, src, "id")
             .and_then(|n| yaml::literal(n, src))
             .unwrap_or_else(|| format!("#{}", ordinal + 1));
@@ -168,7 +173,13 @@ fn step_name(job: Option<&str>, id: &str) -> String {
     }
 }
 
-fn uses_link(ex: &mut Extracted, src: &str, node: Node<'_>, owner: usize, workflow: bool) {
+fn uses_link<'tree>(
+    ex: &mut Extracted,
+    src: &yaml::Yaml<'tree, '_>,
+    node: Node<'tree>,
+    owner: usize,
+    workflow: bool,
+) {
     let Some(spec) = yaml::literal(node, src) else {
         return;
     };
@@ -182,10 +193,10 @@ fn uses_link(ex: &mut Extracted, src: &str, node: Node<'_>, owner: usize, workfl
     link(ex, Some(owner), Target::Action { spec, workflow });
 }
 
-fn scan_mapping(
+fn scan_mapping<'tree>(
     ex: &mut Extracted,
-    src: &str,
-    node: Node<'_>,
+    src: &yaml::Yaml<'tree, '_>,
+    node: Node<'tree>,
     owner: Option<usize>,
     job: Option<&str>,
     skip: &[&str],
@@ -197,15 +208,15 @@ fn scan_mapping(
     }
 }
 
-fn scan_node(
+fn scan_node<'tree>(
     ex: &mut Extracted,
-    src: &str,
-    node: Node<'_>,
+    src: &yaml::Yaml<'tree, '_>,
+    node: Node<'tree>,
     owner: Option<usize>,
     job: Option<&str>,
     implicit: bool,
 ) {
-    let node = yaml::unwrap(node);
+    let node = yaml::resolve(node, src);
     if matches!(
         node.kind(),
         "plain_scalar" | "single_quote_scalar" | "double_quote_scalar" | "block_scalar"
@@ -250,7 +261,7 @@ fn scan_node(
             scan_node(ex, src, value, owner, job, false);
         }
     } else {
-        for child in yaml::items(node) {
+        for child in yaml::items(node, src) {
             scan_node(ex, src, child, owner, job, false);
         }
     }

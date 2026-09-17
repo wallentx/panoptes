@@ -32,8 +32,7 @@ panoptes callers 'play: Configure web' --direction out --depth all --path .
 ```
 
 Resolution follows conventional repository-local paths. Custom `roles_path`,
-installed collections, inventory precedence, Jinja variable evaluation, YAML merge
-expansion, and dynamically computed paths are not interpreted. Extensionless YAML
+installed collections, inventory precedence, Jinja variable evaluation and dynamically computed paths are not interpreted. Extensionless YAML
 and Jinja templates are not indexed. Duplicate handler names remain unresolved
 instead of guessing Ansible's last-loaded handler. Static dependencies do not
 imply that an included role has executed before a notification.
@@ -73,7 +72,7 @@ Static dot access and quoted bracket access (`steps['build'].outputs.version`)
 are supported. Comments, expression string literals, and arbitrary YAML `uses`
 keys do not create dependencies. Ambiguous IDs and dynamic indexed targets remain
 unresolved. Matrix expansion, checkout path/ref changes, shell command execution,
-remote source retrieval, and YAML merge expansion are not modeled. Local action
+and remote source retrieval are not modeled. Local action
 resolution assumes the indexed repository is checked out at the workspace root.
 
 See GitHub's [workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax),
@@ -105,3 +104,19 @@ panoptes callers 'volume: data' --path .
 
 See the [Compose services reference](https://docs.docker.com/reference/compose-file/services/)
 and [include rules](https://docs.docker.com/reference/compose-file/include/).
+
+## Shared YAML inheritance
+
+Automation extractors follow scalar, sequence, and mapping aliases and YAML `<<`
+merge keys. Explicit keys override inherited keys; earlier mappings in a merge
+sequence take precedence. Quoted `"<<"` remains a literal key. Anchor redefinitions
+bind subsequent aliases, and aliases never cross document boundaries.
+
+Inherited values retain their original source spans. Alias-to-anchor graph links
+preserve provenance while semantic dependency links belong to the consuming task,
+job, step, or service. Effective mappings are cached within each parse to avoid
+repeated expansion of shared configurations. Recursive aliases, forward aliases,
+and inheritance chains exceeding 64 levels remain unresolved. This is structural
+analysis, not validation that every automation engine accepts YAML merge keys.
+
+See the [YAML merge-key specification](https://yaml.org/type/merge.html).

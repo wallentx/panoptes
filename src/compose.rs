@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::Node;
 
-fn literal(node: Node<'_>, src: &str) -> Option<String> {
+fn literal<'tree>(node: Node<'tree>, src: &yaml::Yaml<'tree, '_>) -> Option<String> {
     yaml::literal(node, src).filter(|s| !s.contains('$'))
 }
 fn link(ex: &mut Extracted, from: Option<usize>, target: Target) {
@@ -22,10 +22,10 @@ fn local(ex: &mut Extracted, from: usize, kind: &str, name: &str) {
         link(ex, Some(from), Target::Local(format!("{kind}: {name}")));
     }
 }
-fn names(node: Node<'_>, src: &str) -> Vec<String> {
+fn names<'tree>(node: Node<'tree>, src: &yaml::Yaml<'tree, '_>) -> Vec<String> {
     let pairs = yaml::pairs(node, src);
     if pairs.is_empty() {
-        yaml::items(node)
+        yaml::items(node, src)
             .into_iter()
             .filter_map(|n| literal(n, src))
             .collect()
@@ -34,7 +34,12 @@ fn names(node: Node<'_>, src: &str) -> Vec<String> {
     }
 }
 
-pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
+pub fn enrich<'tree>(
+    root: Node<'tree>,
+    src: &yaml::Yaml<'tree, '_>,
+    path: &str,
+    ex: &mut Extracted,
+) {
     if ex.automation.dialect != Dialect::Generic {
         return;
     }
@@ -51,7 +56,7 @@ pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
         || filename == "docker-compose"
         || filename.starts_with("docker-compose.");
     for doc in yaml::children(root).filter(|n| n.kind() == "document") {
-        let top = yaml::unwrap(doc);
+        let top = yaml::resolve(doc, src);
         let services = yaml::get(top, src, "services");
         let recognizable = services.is_some_and(|n| {
             yaml::pairs(n, src).iter().any(|(_, service)| {
@@ -84,7 +89,7 @@ pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
             }
         }
         if let Some(includes) = yaml::get(top, src, "include") {
-            for item in yaml::items(includes) {
+            for item in yaml::items(includes, src) {
                 let value = yaml::get(item, src, "path").unwrap_or(item);
                 let paths = literal(value, src)
                     .map(|s| vec![s])
@@ -134,7 +139,7 @@ pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
                             }
                         }
                         "configs" | "secrets" => {
-                            for entry in yaml::items(value) {
+                            for entry in yaml::items(value, src) {
                                 let source = yaml::get(entry, src, "source").unwrap_or(entry);
                                 if let Some(name) = literal(source, src) {
                                     local(
@@ -147,7 +152,7 @@ pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
                             }
                         }
                         "volumes" => {
-                            for entry in yaml::items(value) {
+                            for entry in yaml::items(value, src) {
                                 let source = if let Some(source) = yaml::get(entry, src, "source") {
                                     let volume = yaml::get(entry, src, "type")
                                         .and_then(|n| literal(n, src))
