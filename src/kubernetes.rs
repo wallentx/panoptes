@@ -445,7 +445,8 @@ pub fn resolve(pending: &[Pending]) -> Resolved {
         unresolved: 0,
     };
     let mut resources: HashMap<&Key, Vec<i64>> = HashMap::new();
-    for file in pending {
+    let patches = crate::kustomize::patch_only_paths(pending);
+    for file in pending.iter().filter(|f| !patches.contains(&f.rel)) {
         for resource in &file.extracted.automation.resources {
             resources
                 .entry(&resource.key)
@@ -453,10 +454,9 @@ pub fn resolve(pending: &[Pending]) -> Resolved {
                 .push(file.symbol_ids[resource.symbol]);
         }
     }
-    for file in pending
-        .iter()
-        .filter(|f| f.extracted.automation.dialect == Dialect::Kubernetes)
-    {
+    for file in pending.iter().filter(|f| {
+        f.extracted.automation.dialect == Dialect::Kubernetes && !patches.contains(&f.rel)
+    }) {
         for link in &file.extracted.automation.links {
             let from = link
                 .from
@@ -471,6 +471,7 @@ pub fn resolve(pending: &[Pending]) -> Resolved {
                     .unwrap_or_default(),
                 Target::SelectPods { namespace, labels } => pending
                     .iter()
+                    .filter(|f| !patches.contains(&f.rel))
                     .flat_map(|f| {
                         f.extracted.automation.resources.iter().filter_map(|r| {
                             (r.key.namespace == *namespace

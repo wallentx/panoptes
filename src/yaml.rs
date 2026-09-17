@@ -24,6 +24,7 @@ pub enum Dialect {
     GitHubActions,
     Compose,
     Kubernetes,
+    Kustomize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +39,11 @@ pub struct Link {
 pub enum Target {
     /// A uniquely named definition in this file only.
     Local(String),
+    KustomizeResource(Vec<String>),
+    Patch {
+        path: Option<String>,
+        selector: Option<crate::kustomize::Selector>,
+    },
     Kube(crate::kubernetes::Key),
     SelectPods {
         namespace: String,

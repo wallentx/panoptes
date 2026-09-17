@@ -143,3 +143,24 @@ with the same resource identity require separate indexing or remain ambiguous.
 See Kubernetes documentation for [Services](https://kubernetes.io/docs/concepts/services-networking/service/),
 [ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/), and
 [RBAC](https://kubernetes.io/docs/reference/access-authn-authz/rbac/).
+
+## Kustomize
+
+`kustomization.yaml`, `kustomization.yml`, and extensionless `Kustomization` files
+link to local resources, bases, and components. Directory references resolve to
+those standard filenames. Configuration, CRD, transformer, generator, and indexed
+generator-input files also appear as dependencies.
+
+Modern `patches`, `patchesJson6902`, and `patchesStrategicMerge` expose patch
+symbols. File patches link to their source; explicit targets and strategic file
+metadata link to matching resource declarations reachable from that overlay.
+Name/GVK/namespace regexes and equality/existence label selectors are supported.
+Files used only as patches are excluded from Kubernetes deployment identities.
+
+No overlays are rendered or executed. Namespace/name transformations, generated
+name hashes, remote bases, set-based/annotation selectors, and inline strategic
+patches without explicit targets are not resolved. Patch matches describe source
+resources before transformations. Generator inputs must already be indexed source
+files to become file nodes.
+
+See the [Kustomize guide](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/kustomization/).

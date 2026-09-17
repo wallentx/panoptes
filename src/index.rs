@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-8";
+pub const EXTRACTOR_STAMP: &str = "panoptes-9";
 
 pub struct BuildStats {
     pub files: usize,
@@ -409,6 +409,9 @@ pub fn build_with_jobs(
     let kube = crate::kubernetes::resolve(&pending);
     automation.edges.extend(kube.edges);
     automation.unresolved += kube.unresolved;
+    let kustomize = crate::kustomize::resolve(&pending, &file_symbol);
+    automation.edges.extend(kustomize.edges);
+    automation.unresolved += kustomize.unresolved;
     unresolved += automation.unresolved;
     for (from, target, kind) in automation.edges {
         n_edges += insert_edge.execute(rusqlite::params![repo_id, from, target, kind])?;
@@ -2570,6 +2573,104 @@ items:
                 .iter()
                 .any(|(_, s, _, _)| s == "Pod: default/consumer" || s == "Pod: default/dynamic")
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kustomize_overlays_components_and_patches_follow_only_reachable_sources() {
+        let (mut db, root) = fixture(&[
+            ("base/Kustomization", "resources: [app.yml, service.yml]\n"),
+            (
+                "base/app.yml",
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web, labels: {app: web}}\nspec: {template: {metadata: {labels: {app: web}}, spec: {containers: []}}}\n",
+            ),
+            (
+                "base/service.yml",
+                "apiVersion: v1\nkind: Service\nmetadata: {name: web}\nspec: {selector: {app: web}}\n",
+            ),
+            (
+                "component/kustomization.yaml",
+                "apiVersion: kustomize.config.k8s.io/v1alpha1\nkind: Component\nresources: [config.yml]\n",
+            ),
+            (
+                "component/config.yml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: settings}\n",
+            ),
+            (
+                "overlays/prod/kustomization.yml",
+                r#"
+resources: [../../base]
+components: [../../component]
+patches:
+  - path: replicas.yml
+    target: {group: apps, kind: Deployment, name: 'web.*', labelSelector: 'app=web'}
+  - patch: '[{"op":"add","path":"/metadata/labels/prod","value":"true"}]'
+    target: {kind: ConfigMap, name: settings}
+configMapGenerator:
+  - name: generated
+    files: [settings=values.yml]
+"#,
+            ),
+            (
+                "overlays/prod/replicas.yml",
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web}\nspec: {replicas: 3}\n",
+            ),
+            ("overlays/prod/values.yml", "feature: enabled\n"),
+            (
+                "other/app.yml",
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web, namespace: other, labels: {app: web}}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        assert!(has("overlays/prod/kustomization.yml", "base/Kustomization"));
+        assert!(has("patch: patches#1", "overlays/prod/replicas.yml"));
+        assert!(has("patch: patches#1", "Deployment: default/web"));
+        assert!(!has("patch: patches#1", "Deployment: other/web"));
+        assert!(has("patch: patches#2", "ConfigMap: default/settings"));
+        assert!(has("generator: generated", "overlays/prod/values.yml"));
+        let services: Vec<_> = edges
+            .iter()
+            .filter(|(_, s, d, _)| s == "Service: default/web" && d == "Deployment: default/web")
+            .collect();
+        assert_eq!(
+            services.len(),
+            1,
+            "patch metadata must not duplicate a deployed resource"
+        );
+        assert_eq!(services[0].3, "base/app.yml");
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kustomize_strategic_patch_metadata_and_unsupported_selectors() {
+        let (db, root) = fixture(&[
+            (
+                "kustomization.yaml",
+                "resources: [app.yml]\npatchesStrategicMerge: [patch.yml]\npatches:\n  - path: patch.yml\n    target: {kind: ConfigMap, labelSelector: 'app in (web, api)'}\n  - path: patch.yml\n    target: {kind: ConfigMap, annotationSelector: enabled}\n",
+            ),
+            (
+                "app.yml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: config, labels: {app: web}}\n",
+            ),
+            (
+                "patch.yml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: config}\ndata: {key: value}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, p)| s == "patch: patchesStrategicMerge#1"
+                    && d == "ConfigMap: default/config"
+                    && p == "app.yml")
+        );
+        assert!(!edges.iter().any(
+            |(_, s, d, _)| s.starts_with("patch: patches#") && d == "ConfigMap: default/config"
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
