@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-12";
+pub const EXTRACTOR_STAMP: &str = "panoptes-13";
 
 pub struct BuildStats {
     pub files: usize,
@@ -2000,6 +2000,61 @@ mod tests {
             == "collections/ansible_collections/acme/demo/roles/tools/tasks/main.yaml"));
         assert!(!edges.iter().any(|(p, s, _, _)| p == "config.yml"
             || ["task: Dynamic", "task: Escape", "task: Foreign module"].contains(&s.as_str())));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ansible_nested_task_files_prefer_siblings_and_retain_role_fallbacks() {
+        let (mut db, root) = fixture(&[
+            (
+                "roles/demo/tasks/nested/main.yml",
+                "- name: Import sibling\n  import_tasks: chosen.yml\n- name: Include sibling\n  include_tasks: chosen.yml\n- name: Include fallback\n  include_tasks: fallback.yml\n- name: Role variables\n  include_vars: chosen.yml\n",
+            ),
+            (
+                "roles/demo/tasks/nested/chosen.yml",
+                "- debug: {msg: sibling}\n",
+            ),
+            ("roles/demo/tasks/chosen.yml", "- debug: {msg: root}\n"),
+            (
+                "roles/demo/tasks/fallback.yml",
+                "- debug: {msg: fallback}\n",
+            ),
+            ("roles/demo/vars/chosen.yml", "message: variables\n"),
+        ]);
+        let edges = automation_edges(&db);
+        for source in ["task: Import sibling", "task: Include sibling"] {
+            let targets: Vec<_> = edges
+                .iter()
+                .filter(|(_, s, _, _)| s == source)
+                .map(|(_, _, _, p)| p.as_str())
+                .collect();
+            assert_eq!(targets, ["roles/demo/tasks/nested/chosen.yml"]);
+        }
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, _, p)| s == "task: Include fallback"
+                    && p == "roles/demo/tasks/fallback.yml")
+        );
+        assert!(
+            edges.iter().any(
+                |(_, s, _, p)| s == "task: Role variables" && p == "roles/demo/vars/chosen.yml"
+            )
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::remove_file(root.join("roles/demo/tasks/nested/chosen.yml")).unwrap();
+        let stats = build(&mut db, &root).unwrap();
+        assert_eq!(stats.parsed, 0);
+        assert_eq!(stats.deleted, 1);
+        let edges = automation_edges(&db);
+        for source in ["task: Import sibling", "task: Include sibling"] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(_, s, _, p)| s == source && p == "roles/demo/tasks/chosen.yml")
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

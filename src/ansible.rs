@@ -219,14 +219,22 @@ fn file_link<'tree>(
     let specs = yaml::strings(value, src);
     let mut candidates = Vec::new();
     for spec in specs {
-        // Role task/vars lookup starts in the role's corresponding directory.
+        // Nested task imports/includes prefer the importing file's directory.
+        // Variable lookup still starts in the role's vars directory.
+        if kind == "tasks"
+            && let Some(p) = yaml::path(parent(path), &spec)
+        {
+            candidates.push(p);
+        }
         if kind != "playbook"
             && let Some(role) = role_root(path)
             && let Some(p) = yaml::path(&role, &format!("{kind}/{spec}"))
         {
             candidates.push(p);
         }
-        if let Some(p) = yaml::path(parent(path), &spec) {
+        if kind != "tasks"
+            && let Some(p) = yaml::path(parent(path), &spec)
+        {
             candidates.push(p);
         }
     }
