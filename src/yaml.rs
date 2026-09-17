@@ -26,12 +26,13 @@ pub enum Dialect {
     Kubernetes,
     Kustomize,
     GitLab,
+    CloudFormation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Link {
     pub from: Option<usize>,
-    /// Ansible play symbol, or file scope for standalone task/role files.
+    /// Enclosing semantic scope, such as an Ansible play or template document.
     pub scope: Option<usize>,
     pub target: Target,
 }
@@ -40,6 +41,8 @@ pub struct Link {
 pub enum Target {
     /// A uniquely named definition in this file only.
     Local(String),
+    /// Alternative names in the enclosing scope; exactly one must resolve.
+    OneOf(Vec<String>),
     External(String),
     KustomizeResource(Vec<String>),
     Patch {

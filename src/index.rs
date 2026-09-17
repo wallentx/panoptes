@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-10";
+pub const EXTRACTOR_STAMP: &str = "panoptes-11";
 
 pub struct BuildStats {
     pub files: usize,
@@ -421,6 +421,9 @@ pub fn build_with_jobs(
     let gitlab = crate::gitlab_ci::resolve(&pending, &file_symbol, &external);
     automation.edges.extend(gitlab.edges);
     automation.unresolved += gitlab.unresolved;
+    let cloudformation = crate::cloudformation::resolve(&pending);
+    automation.edges.extend(cloudformation.edges);
+    automation.unresolved += cloudformation.unresolved;
     unresolved += automation.unresolved;
     for (from, target, kind) in automation.edges {
         n_edges += insert_edge.execute(rusqlite::params![repo_id, from, target, kind])?;
@@ -2772,6 +2775,127 @@ consumer:
                 .iter()
                 .any(|(p, s, _, _)| p == "plain.yml" || s == "gitlab job: consumer")
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cloudformation_intrinsics_conditions_substitutions_and_cache() {
+        let source = r#"
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  Env: {Type: String}
+  Shadow: {Type: String}
+Mappings:
+  Regions: {us: {Image: ami-123}}
+Conditions:
+  Production: !Equals [!Ref Env, prod]
+  Enabled: !And [!Condition Production, !Equals [1, 1]]
+Resources:
+  Bucket: {Type: 'AWS::S3::Bucket'}
+  Other: {Type: 'AWS::S3::Bucket'}
+  Worker:
+    Type: AWS::Lambda::Function
+    DependsOn: [Other]
+    Condition: Enabled
+    Properties:
+      Role: !GetAtt Bucket.Arn
+      Environment:
+        Variables:
+          Env: {Ref: Env}
+          Image: !FindInMap [Regions, us, Image]
+          Choice: !If [Production, !Ref Bucket, !Ref Other]
+          Name: !Sub ['${Bucket.Arn}/${Env}/${Shadow}/${AWS::Region}/${!Escaped}', {Shadow: !Ref Other}]
+  Plain:
+    Type: AWS::S3::Bucket
+    Properties: {BucketName: '${Bucket}'}
+Outputs:
+  Arn: {Value: {Fn::GetAtt: [Bucket, Arn]}}
+  Name:
+    Value:
+      Fn::Sub: |
+        ${Bucket}/${Env}/${AWS::StackName}
+"#;
+        let (mut db, root) = fixture(&[("stack.yaml", source)]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        for target in [
+            "cfn resource: Other",
+            "cfn resource: Bucket",
+            "cfn parameter: Env",
+            "cfn mapping: Regions",
+            "cfn condition: Production",
+            "cfn condition: Enabled",
+        ] {
+            assert!(
+                has("cfn resource: Worker", target),
+                "missing {target}: {edges:?}"
+            );
+        }
+        assert!(has("cfn condition: Production", "cfn parameter: Env"));
+        assert!(has("cfn condition: Enabled", "cfn condition: Production"));
+        assert!(has("cfn output: Arn", "cfn resource: Bucket"));
+        assert!(has("cfn output: Name", "cfn resource: Bucket"));
+        assert!(has("cfn output: Name", "cfn parameter: Env"));
+        assert!(!has("cfn resource: Worker", "cfn parameter: Shadow"));
+        assert!(!edges.iter().any(|(_, s, _, _)| s == "cfn resource: Plain"));
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(
+            root.join("stack.yaml"),
+            source.replace("  Bucket: {Type:", "  Renamed: {Type:"),
+        )
+        .unwrap();
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 1);
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, _, d, _)| d == "cfn resource: Bucket")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cloudformation_keeps_template_scope_and_ambiguous_dynamic_targets_unresolved() {
+        let (db, root) = fixture(&[
+            (
+                "one.yml",
+                r#"
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  Duplicate: {Type: String}
+  ResourceName: {Type: String}
+Resources:
+  Duplicate: {Type: 'AWS::S3::Bucket'}
+  Consumer:
+    Type: AWS::S3::Bucket
+    Properties:
+      Ambiguous: !Ref Duplicate
+      Missing: !Ref Elsewhere
+      Dynamic: !GetAtt [!Ref ResourceName, Arn]
+---
+Resources:
+  Elsewhere: {Type: 'AWS::S3::Bucket'}
+Outputs:
+  Own: {Value: !Ref Elsewhere}
+"#,
+            ),
+            (
+                "two.yml",
+                "Resources:\n  Elsewhere: {Type: 'AWS::S3::Bucket'}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let consumer: Vec<_> = edges
+            .iter()
+            .filter(|(_, s, _, _)| s == "cfn resource: Consumer")
+            .collect();
+        assert_eq!(consumer.len(), 1, "{edges:?}");
+        assert_eq!(consumer[0].2, "cfn parameter: ResourceName");
+        assert!(edges.iter().any(|(p, s, d, q)| p == "one.yml"
+            && q == "one.yml"
+            && s == "cfn output: Own"
+            && d == "cfn resource: Elsewhere"));
+        assert!(!edges.iter().any(|(p, _, _, q)| p != q));
         let _ = std::fs::remove_dir_all(root);
     }
 

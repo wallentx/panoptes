@@ -183,3 +183,31 @@ rules evaluation, and cross-project/pipeline `needs` are not expanded.
 
 See GitLab's [includes](https://docs.gitlab.com/ci/yaml/includes/) and
 [configuration reuse](https://docs.gitlab.com/ci/yaml/yaml_optimization/) references.
+
+## CloudFormation
+
+YAML templates expose parameters, mappings, conditions, resources, and outputs.
+`DependsOn`, resource/output conditions, `Ref`, `Fn::GetAtt`, `Fn::If`,
+`Fn::FindInMap`, and `Fn::Sub` link to the declarations they reference. Both long
+forms and YAML tags such as `!Ref` and `!Sub` are recognized, including intrinsics
+nested inside lists or other functions.
+
+Substitution variable maps override implicit parameter/resource names. Pseudo
+parameters and escaped `${!literal}` placeholders do not create resource links.
+Each template document has its own namespace; duplicate or dynamically computed
+logical IDs remain unresolved. Conditions contribute potential dependencies from
+both branches, without evaluating which branch will run.
+
+Macros, transforms, dynamic references, nested stack contents, cross-stack exports,
+and deployment state are not evaluated or fetched. JSON templates are not included
+in this YAML extractor. Nested traversal is bounded to 128 levels.
+
+```sh
+panoptes callers 'cfn resource: Bucket' --path .
+panoptes callers 'cfn parameter: Environment' --path .
+```
+
+See the CloudFormation references for
+[`DependsOn`](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-attribute-dependson.html),
+[`Fn::Sub`](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/intrinsic-function-reference-sub.html),
+and [conditions](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/intrinsic-function-reference-conditions.html).

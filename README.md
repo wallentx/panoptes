@@ -158,8 +158,11 @@ Indexes live at `$XDG_DATA_HOME/panoptes/panoptes.db`, falling back to
 Ansible playbooks and roles expose tasks, handlers, role dependencies, and
 notifications. GitHub Actions workflows and composite actions expose jobs, steps,
 `needs`, nested `uses`, and input/output references. Docker Compose connects services
-to their dependencies and declared resources. See
-[automation relationships](docs/automation.md) for supported syntax and limits.
+to their dependencies and declared resources. Kubernetes manifests, Kustomize
+overlays, GitLab CI pipelines, and CloudFormation templates expose their static
+resource and configuration dependencies. Shared YAML aliases and merge inheritance
+preserve source provenance. See [automation relationships](docs/automation.md) for
+supported syntax and limits.
 
 ## Build and verify
 
