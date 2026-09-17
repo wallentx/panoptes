@@ -124,15 +124,16 @@ jobs:
           RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
           set -euxo pipefail
-          docker run --rm -e RELEASE_VERSION -v "$GITHUB_WORKSPACE:/workspace:ro" termux/termux-docker:latest bash -lc '
+          docker run --rm -v "$GITHUB_WORKSPACE:/workspace:ro" termux/termux-docker:latest bash -lc '
             set -eu
+            release_version=$1
             pkg update -y
             pkg install -y rust clang make git pkg-config jq
             build_dir=$(mktemp -d)
             cp -R /workspace/. "$build_dir/"
             cd "$build_dir"
             export CARGO_BUILD_JOBS=1
-            if [ -n "$RELEASE_VERSION" ]; then
+            if [ -n "$release_version" ]; then
               cargo metadata --format-version 1 > /dev/null
             elif [ -f scripts/sync-version.sh ]; then
               sh scripts/sync-version.sh
@@ -140,4 +141,4 @@ jobs:
             cargo test --workspace --all-targets --locked
             cargo build --workspace --locked
             bash scripts/smoke.sh target/debug/panoptes
-          '
+          ' bash "$RELEASE_VERSION"
