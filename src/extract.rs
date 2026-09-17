@@ -63,6 +63,8 @@ pub struct Extracted {
     pub parents: Vec<Option<usize>>,
     /// Module specifiers this file imports, verbatim (`./stats.js`, `node:fs`).
     pub imports: Vec<String>,
+    #[serde(default)]
+    pub automation: crate::yaml::Automation,
 }
 
 /// Definition shapes. `@name` is the identifier stored; the outer capture is the
@@ -391,7 +393,12 @@ impl Extractor {
         }
     }
 
+    #[cfg(test)]
     pub fn extract(&mut self, lang: Lang, src: &str) -> Result<Extracted> {
+        self.extract_file(lang, src, "")
+    }
+
+    pub fn extract_file(&mut self, lang: Lang, src: &str, path: &str) -> Result<Extracted> {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.compiled.entry(lang) {
             entry.insert(CompiledExtractor::new(lang)?);
         }
@@ -401,6 +408,7 @@ impl Extractor {
                 .context("compiled extractor missing after insertion")?,
             lang,
             src,
+            path,
         )
     }
 }
@@ -719,7 +727,12 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
     Extractor::new().extract(lang, src)
 }
 
-fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> Result<Extracted> {
+fn extract_compiled(
+    compiled: &mut CompiledExtractor,
+    lang: Lang,
+    src: &str,
+    path: &str,
+) -> Result<Extracted> {
     let tree = compiled
         .parser
         .parse(src, None)
@@ -1039,14 +1052,19 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
         }
     }
 
-    Ok(Extracted {
+    let mut extracted = Extracted {
         symbols,
         calls,
         bindings,
         containers,
         parents,
         imports,
-    })
+        automation: Default::default(),
+    };
+    if lang == Lang::Yaml {
+        crate::ansible::enrich(root, src, path, &mut extracted);
+    }
+    Ok(extracted)
 }
 
 /// Resolve bare callee names against the whole-repo symbol index.

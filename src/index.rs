@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-3";
+pub const EXTRACTOR_STAMP: &str = "panoptes-4";
 
 pub struct BuildStats {
     pub files: usize,
@@ -117,13 +117,13 @@ struct ExistingFile {
     size: i64,
 }
 
-struct Pending {
-    rel: String,
-    lang: Lang,
-    file_id: i64,
-    file_symbol: i64,
-    symbol_ids: Vec<i64>,
-    extracted: extract::Extracted,
+pub(crate) struct Pending {
+    pub(crate) rel: String,
+    pub(crate) lang: Lang,
+    pub(crate) file_id: i64,
+    pub(crate) file_symbol: i64,
+    pub(crate) symbol_ids: Vec<i64>,
+    pub(crate) extracted: extract::Extracted,
 }
 
 /// Incrementally index `root` into `db`.
@@ -373,6 +373,20 @@ pub fn build_with_jobs(
                 hcl_by_dir
                     .get(directory)
                     .and_then(|names| resolve_hcl_callee(names, from_id, &call.callee))
+            } else if file.lang == Lang::Yaml {
+                let matches: Vec<_> = file
+                    .extracted
+                    .symbols
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, symbol)| symbol.kind == "anchor" && symbol.name == call.callee)
+                    .map(|(index, _)| file.symbol_ids[index])
+                    .collect();
+                if let [only] = matches.as_slice() {
+                    Some(*only)
+                } else {
+                    None
+                }
             } else {
                 extract::resolve(&by_name, from_id, &call.callee)
             } {
@@ -383,6 +397,12 @@ pub fn build_with_jobs(
                 None => unresolved += 1,
             }
         }
+    }
+
+    let automation = crate::ansible::resolve(&pending, &file_symbol);
+    unresolved += automation.unresolved;
+    for (from, target, kind) in automation.edges {
+        n_edges += insert_edge.execute(rusqlite::params![repo_id, from, target, kind])?;
     }
 
     drop(insert_edge);
@@ -499,7 +519,7 @@ fn extract_changed(
             .iter()
             .map(|&index| {
                 extractor
-                    .extract(files[index].lang, &files[index].text)
+                    .extract_file(files[index].lang, &files[index].text, &files[index].rel)
                     .with_context(|| format!("extract {}", files[index].rel))
                     .map(|extracted| (index, extracted))
             })
@@ -516,7 +536,11 @@ fn extract_changed(
                         .iter()
                         .map(|&index| {
                             extractor
-                                .extract(files[index].lang, &files[index].text)
+                                .extract_file(
+                                    files[index].lang,
+                                    &files[index].text,
+                                    &files[index].rel,
+                                )
                                 .with_context(|| format!("extract {}", files[index].rel))
                                 .map(|extracted| (index, extracted))
                         })
@@ -1723,6 +1747,266 @@ mod tests {
             .unwrap();
         assert_eq!(calls, 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn automation_edges(db: &Connection) -> Vec<(String, String, String, String)> {
+        db.prepare(
+            "select sf.path, src.name, dst.name, df.path from edges e
+            join symbols src on src.id=e.src_symbol_id join files sf on sf.id=src.file_id
+            join symbols dst on dst.id=e.dst_symbol_id join files df on df.id=dst.file_id
+            where e.kind in ('calls', 'imports') order by sf.path,src.name,dst.name,df.path",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    #[test]
+    fn ansible_imports_roles_handlers_and_cache_refresh() {
+        let (mut db, root) = fixture(&[
+            (
+                "site.yml",
+                r#"
+- name: Configure web
+  hosts: all
+  roles: [web]
+  vars_files: [vars/common.yml]
+  tasks:
+    - name: Load more
+      ansible.builtin.import_tasks: {file: tasks/more.yml}
+    - name: Change config
+      copy: {src: a, dest: b}
+      notify: [restart, reload services]
+    - name: Nested
+      block:
+        - name: Load vars
+          include_vars: vars/extra.yaml
+      rescue:
+        - name: Recover
+          import_role: {name: recovery, tasks_from: repair}
+  handlers:
+    - name: Local listener
+      debug: {msg: done}
+      listen: reload services
+"#,
+            ),
+            ("vars/common.yml", "port: 80\n"),
+            ("vars/extra.yaml", "enabled: true\n"),
+            (
+                "tasks/more.yml",
+                "- name: Included task\n  debug: {msg: changed}\n  notify: restart\n",
+            ),
+            (
+                "roles/web/tasks/main.yml",
+                "- name: Setup\n  import_tasks: install.yml\n",
+            ),
+            (
+                "roles/web/tasks/install.yml",
+                "- name: Install\n  package: {name: nginx}\n",
+            ),
+            (
+                "roles/web/handlers/main.yml",
+                "- name: restart\n  service: {name: nginx, state: restarted}\n  listen: reload services\n",
+            ),
+            (
+                "roles/web/meta/main.yml",
+                "dependencies: [{role: common}]\n",
+            ),
+            (
+                "roles/common/tasks/main.yaml",
+                "- name: Common\n  debug: {msg: ready}\n",
+            ),
+            (
+                "roles/recovery/tasks/repair.yml",
+                "- name: Repair\n  debug: {msg: ready}\n",
+            ),
+            (
+                "roles/recovery/tasks/main.yml",
+                "- debug: {msg: should not load}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |source: &str, target: &str| {
+            edges.iter().any(|(_, s, d, _)| s == source && d == target)
+        };
+        assert!(
+            has("play: Configure web", "roles/web/tasks/main.yml"),
+            "{edges:?}"
+        );
+        assert!(has("play: Configure web", "vars/common.yml"));
+        assert!(has("task: Load more", "tasks/more.yml"));
+        assert!(has("task: Load vars", "vars/extra.yaml"));
+        assert!(has("task: Setup", "roles/web/tasks/install.yml"));
+        assert!(has(
+            "roles/web/meta/main.yml",
+            "roles/common/tasks/main.yaml"
+        ));
+        assert!(has("task: Recover", "roles/recovery/tasks/repair.yml"));
+        assert!(!has("task: Recover", "roles/recovery/tasks/main.yml"));
+        assert!(has("task: Change config", "handler: restart"));
+        assert!(has("task: Change config", "handler: Local listener"));
+        assert!(has("task: Included task", "handler: restart"));
+        let repo = repo_id_of(&db, &root).unwrap().unwrap();
+        let (_, reached) = callers(&db, repo, "play: Configure web", true, 8).unwrap();
+        assert!(reached.iter().any(|r| r.name == "handler: restart"));
+        let stats = build(&mut db, &root).unwrap();
+        assert_eq!(stats.parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(
+            root.join("roles/web/handlers/main.yml"),
+            "- name: renamed\n  debug: {msg: done}\n",
+        )
+        .unwrap();
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 1);
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, _, dst, _)| dst == "handler: restart")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ansible_handler_names_are_scoped_to_plays_and_reachable_roles() {
+        let (db, root) = fixture(&[
+            (
+                "site.yml",
+                r#"
+- hosts: web
+  roles: [web]
+  tasks:
+    - name: Web change
+      debug: {msg: changed}
+      notify: restart
+- hosts: db
+  roles: [database]
+  tasks:
+    - name: DB change
+      debug: {msg: changed}
+      notify: restart
+- hosts: empty
+  tasks:
+    - name: No handler
+      debug: {msg: changed}
+      notify: restart
+"#,
+            ),
+            (
+                "roles/web/handlers/main.yml",
+                "- name: restart\n  debug: {msg: web}\n",
+            ),
+            (
+                "roles/database/handlers/main.yml",
+                "- name: restart\n  debug: {msg: db}\n",
+            ),
+            (
+                "unrelated.yml",
+                "- hosts: all\n  handlers:\n    - name: restart\n      debug: {msg: unrelated}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let targets = |task: &str| {
+            edges
+                .iter()
+                .filter(|(_, s, d, _)| s == task && d == "handler: restart")
+                .map(|(_, _, _, p)| p.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(targets("task: Web change"), ["roles/web/handlers/main.yml"]);
+        assert_eq!(
+            targets("task: DB change"),
+            ["roles/database/handlers/main.yml"]
+        );
+        assert!(targets("task: No handler").is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ansible_static_paths_are_local_and_dynamic_targets_are_not_guessed() {
+        let (db, root) = fixture(&[
+            (
+                "playbooks/site.yaml",
+                r#"
+- ansible.builtin.import_playbook: child.yml
+- hosts: all
+  roles: [web, acme.demo.tools]
+  tasks:
+    - name: Dynamic
+      import_tasks: '{{ chosen }}.yml'
+    - name: Escape
+      import_tasks: ../../escape.yml
+    - name: Foreign module
+      example.custom.import_tasks: child.yml
+"#,
+            ),
+            ("playbooks/child.yml", "- hosts: all\n  tasks: []\n"),
+            ("escape.yml", "- debug: {msg: unrelated}\n"),
+            (
+                "playbooks/roles/web/tasks/main.yml",
+                "- debug: {msg: local}\n",
+            ),
+            ("roles/web/tasks/main.yml", "- debug: {msg: root}\n"),
+            (
+                "collections/ansible_collections/acme/demo/roles/tools/tasks/main.yaml",
+                "- debug: {msg: collection}\n",
+            ),
+            (
+                "config.yml",
+                "name: app\nnotify: restart\nroles: [web]\ninclude_tasks: escape.yml\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "playbooks/site.yaml" && d == "playbooks/child.yml")
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "play: all" && d == "playbooks/roles/web/tasks/main.yml")
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, s, d, _)| s == "play: all" && d == "roles/web/tasks/main.yml")
+        );
+        assert!(edges.iter().any(|(_, _, d, _)| d
+            == "collections/ansible_collections/acme/demo/roles/tools/tasks/main.yaml"));
+        assert!(!edges.iter().any(|(p, s, _, _)| p == "config.yml"
+            || ["task: Dynamic", "task: Escape", "task: Foreign module"].contains(&s.as_str())));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ansible_standalone_roles_listen_fanout_and_duplicate_names() {
+        let (db, root) = fixture(&[
+            (
+                "tasks/main.yml",
+                "- name: Change\n  debug: {msg: changed}\n  notify: [restart, topic]\n",
+            ),
+            (
+                "handlers/main.yml",
+                "- name: restart\n  debug: {msg: one}\n- name: restart\n  debug: {msg: two}\n- name: listener one\n  listen: topic\n  debug: {msg: one}\n- name: listener two\n  listen: [topic]\n  debug: {msg: two}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, s, d, _)| s == "task: Change" && d == "handler: restart")
+        );
+        for listener in ["handler: listener one", "handler: listener two"] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(_, s, d, _)| s == "task: Change" && d == listener),
+                "{edges:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

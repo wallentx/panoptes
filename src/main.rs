@@ -5,6 +5,7 @@
 //! toplevel. MCP creates missing indexes when a provider connects; direct CLI reads report a
 //! directory that has never been indexed rather than answering from an empty graph.
 
+mod ansible;
 mod ask;
 mod db;
 mod export;
@@ -15,6 +16,7 @@ mod mcp;
 mod repo;
 mod search;
 mod viz;
+mod yaml;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
