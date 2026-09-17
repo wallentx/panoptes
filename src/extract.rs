@@ -1066,6 +1066,7 @@ fn extract_compiled(
         crate::ansible::enrich(root, &yaml, path, &mut extracted);
         crate::github_actions::enrich(root, &yaml, path, &mut extracted);
         crate::compose::enrich(root, &yaml, path, &mut extracted);
+        crate::kubernetes::enrich(root, &yaml, &mut extracted);
     }
     Ok(extracted)
 }

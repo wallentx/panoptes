@@ -120,3 +120,26 @@ and inheritance chains exceeding 64 levels remain unresolved. This is structural
 analysis, not validation that every automation engine accepts YAML merge keys.
 
 See the [YAML merge-key specification](https://yaml.org/type/merge.html).
+
+## Kubernetes manifests
+
+Manifest documents and `kind: List` items expose resource symbols such as
+`Deployment: prod/web`. References resolve by API group, kind, namespace, and
+name; duplicate identities remain unresolved. Omitted namespaces mean `default`
+for namespaced resources. Explicitly templated namespaces are not guessed.
+
+Pod and workload templates link to ConfigMaps, Secrets, persistent volume claims,
+image pull secrets, and service accounts. Services link to declared Pods/workload
+templates matching their nonempty label selectors in the same namespace.
+Ingress backends and TLS secrets, RBAC role references and service-account
+subjects, HPA scale targets, and PVC volume/storage-class references are linked.
+
+These are repository declarations, not observations of running Pods or endpoints.
+Custom resources are named but their bodies are not interpreted as built-in APIs.
+External controllers, generated resources, Helm rendering, and cluster state are
+not consulted. Scope is the indexed repository; duplicate deployment variants
+with the same resource identity require separate indexing or remain ambiguous.
+
+See Kubernetes documentation for [Services](https://kubernetes.io/docs/concepts/services-networking/service/),
+[ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/), and
+[RBAC](https://kubernetes.io/docs/reference/access-authn-authz/rbac/).

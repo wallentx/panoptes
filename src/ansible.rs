@@ -341,7 +341,11 @@ pub fn resolve(pending: &[Pending], files: &HashMap<String, i64>) -> Resolved {
             let from = id(link.from);
             let scope = id(link.scope);
             let targets = match &link.target {
-                Target::Local(_) | Target::Named { .. } | Target::Action { .. } => continue,
+                Target::Local(_)
+                | Target::Named { .. }
+                | Target::Action { .. }
+                | Target::Kube(_)
+                | Target::SelectPods { .. } => continue,
                 Target::Symbol(index) => {
                     result.edges.push((from, file.symbol_ids[*index], "calls"));
                     continue;

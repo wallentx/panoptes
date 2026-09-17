@@ -13,6 +13,8 @@ pub struct Automation {
     pub dialect: Dialect,
     pub links: Vec<Link>,
     pub handlers: Vec<Handler>,
+    #[serde(default)]
+    pub resources: Vec<crate::kubernetes::Resource>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +23,7 @@ pub enum Dialect {
     Generic,
     GitHubActions,
     Compose,
+    Kubernetes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +38,11 @@ pub struct Link {
 pub enum Target {
     /// A uniquely named definition in this file only.
     Local(String),
+    Kube(crate::kubernetes::Key),
+    SelectPods {
+        namespace: String,
+        labels: Vec<(String, String)>,
+    },
     Named {
         path: String,
         name: String,

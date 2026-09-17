@@ -14,6 +14,7 @@ mod extract;
 mod github_actions;
 mod index;
 mod init;
+mod kubernetes;
 mod mcp;
 mod repo;
 mod search;

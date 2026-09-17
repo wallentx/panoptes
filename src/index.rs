@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-7";
+pub const EXTRACTOR_STAMP: &str = "panoptes-8";
 
 pub struct BuildStats {
     pub files: usize,
@@ -406,6 +406,9 @@ pub fn build_with_jobs(
     let compose = crate::compose::resolve(&pending, &file_symbol);
     automation.edges.extend(compose.edges);
     automation.unresolved += compose.unresolved;
+    let kube = crate::kubernetes::resolve(&pending);
+    automation.edges.extend(kube.edges);
+    automation.unresolved += kube.unresolved;
     unresolved += automation.unresolved;
     for (from, target, kind) in automation.edges {
         n_edges += insert_edge.execute(rusqlite::params![repo_id, from, target, kind])?;
@@ -2448,6 +2451,124 @@ services:
         assert!(
             has("services.web.<<", "defaults"),
             "anchor provenance remains traceable"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kubernetes_workloads_configuration_services_ingress_and_rbac() {
+        let (mut db, root) = fixture(&[
+            (
+                "app.yml",
+                r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: prod}
+spec:
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      serviceAccountName: runner
+      imagePullSecrets: [{name: auth}]
+      containers:
+        - name: web
+          image: nginx
+          envFrom: [{configMapRef: {name: settings}}]
+          env: [{name: PASS, valueFrom: {secretKeyRef: {name: auth, key: password}}}]
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: data}
+        - name: config
+          projected: {sources: [{configMap: {name: settings}}, {secret: {name: auth}}]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web, namespace: prod}
+spec: {selector: {app: web}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: web, namespace: prod}
+spec:
+  defaultBackend: {service: {name: web, port: {number: 80}}}
+  tls: [{secretName: auth}]
+"#,
+            ),
+            (
+                "resources.yml",
+                r#"
+apiVersion: v1
+kind: List
+items:
+  - {apiVersion: v1, kind: ConfigMap, metadata: {name: settings, namespace: prod}}
+  - {apiVersion: v1, kind: Secret, metadata: {name: auth, namespace: prod}}
+  - {apiVersion: v1, kind: PersistentVolumeClaim, metadata: {name: data, namespace: prod}}
+  - {apiVersion: v1, kind: ServiceAccount, metadata: {name: runner, namespace: prod}}
+  - {apiVersion: rbac.authorization.k8s.io/v1, kind: ClusterRole, metadata: {name: reader}}
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata: {name: read, namespace: prod}
+    roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: reader}
+    subjects: [{kind: ServiceAccount, name: runner, namespace: prod}]
+"#,
+            ),
+            (
+                "dev.yml",
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web, namespace: dev}\nspec: {template: {metadata: {labels: {app: web}}, spec: {containers: []}}}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        for target in [
+            "ConfigMap: prod/settings",
+            "Secret: prod/auth",
+            "PersistentVolumeClaim: prod/data",
+            "ServiceAccount: prod/runner",
+        ] {
+            assert!(
+                has("Deployment: prod/web", target),
+                "missing {target}: {edges:?}"
+            );
+        }
+        assert!(has("Service: prod/web", "Deployment: prod/web"));
+        assert!(!has("Service: prod/web", "Deployment: dev/web"));
+        assert!(has("Ingress: prod/web", "Service: prod/web"));
+        assert!(has("Ingress: prod/web", "Secret: prod/auth"));
+        assert!(has("RoleBinding: prod/read", "ClusterRole: reader"));
+        assert!(has("RoleBinding: prod/read", "ServiceAccount: prod/runner"));
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kubernetes_missing_duplicate_and_dynamic_namespaces_do_not_guess() {
+        let (db, root) = fixture(&[
+            (
+                "pod.yml",
+                "apiVersion: v1\nkind: Pod\nmetadata: {name: consumer}\nspec: {containers: [{name: app, envFrom: [{configMapRef: {name: settings}}]}]}\n",
+            ),
+            (
+                "one.yml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: settings}\n",
+            ),
+            (
+                "two.yml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: settings}\n",
+            ),
+            (
+                "custom.yml",
+                "apiVersion: custom.example/v1\nkind: ConfigMap\nmetadata: {name: settings}\n",
+            ),
+            (
+                "dynamic.yml",
+                "apiVersion: v1\nkind: Pod\nmetadata: {name: dynamic, namespace: '{{ namespace }}'}\nspec: {serviceAccountName: runner}\n",
+            ),
+        ]);
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, s, _, _)| s == "Pod: default/consumer" || s == "Pod: default/dynamic")
         );
         let _ = std::fs::remove_dir_all(root);
     }
