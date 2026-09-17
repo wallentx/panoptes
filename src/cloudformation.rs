@@ -136,7 +136,14 @@ pub fn enrich<'a>(root: Node<'a>, yaml: &Yaml<'a, '_>, path: &str, ex: &mut Extr
                         reference(ex, id, template, &condition, &["condition"]);
                     }
                     if matches!(kind, "resource" | "output" | "condition") {
-                        walk(ex, id, template, body, yaml, 0);
+                        Walker {
+                            ex,
+                            id,
+                            scope: template,
+                            yaml,
+                            seen: HashMap::new(),
+                        }
+                        .walk(body, 0);
                     }
                 }
             }
@@ -144,135 +151,126 @@ pub fn enrich<'a>(root: Node<'a>, yaml: &Yaml<'a, '_>, path: &str, ex: &mut Extr
     }
 }
 
-fn intrinsic<'a>(
-    ex: &mut Extracted,
+// Expanded subtrees are visited once per owner and depth. A shallower visit may
+// recover descendants omitted by the depth limit, without expanding an alias DAG
+// once for each path through it.
+struct Walker<'a, 'tree, 'src> {
+    ex: &'a mut Extracted,
     id: usize,
     scope: usize,
-    kind: &str,
-    value: Node<'a>,
-    yaml: &Yaml<'a, '_>,
-    depth: usize,
-) {
-    match kind {
-        "Ref" => {
-            if let Some(name) = literal(value, yaml) {
-                reference(ex, id, scope, &name, &["parameter", "resource"]);
-            }
-        }
-        "GetAtt" => {
-            let values = sequence(value, yaml);
-            let name = if let Some(&first) = values.first() {
-                literal(first, yaml)
-            } else {
-                literal(value, yaml)
-                    .and_then(|s| s.split_once('.').map(|(name, _)| name.to_string()))
-            };
-            if let Some(name) = name {
-                reference(ex, id, scope, &name, &["resource"]);
-            }
-        }
-        "Condition" => {
-            if let Some(name) = literal(value, yaml) {
-                reference(ex, id, scope, &name, &["condition"]);
-            }
-        }
-        "If" | "FindInMap" => {
-            if let Some(&first) = sequence(value, yaml).first()
-                && let Some(name) = literal(first, yaml)
-            {
-                reference(
-                    ex,
-                    id,
-                    scope,
-                    &name,
-                    &[if kind == "If" { "condition" } else { "mapping" }],
-                );
-            }
-        }
-        "Sub" => {
-            let values = sequence(value, yaml);
-            let template = values.first().copied().unwrap_or(value);
-            let shadowed: HashSet<_> = values
-                .get(1)
-                .map(|&n| yaml::pairs(n, yaml).into_iter().map(|(k, _)| k).collect())
-                .unwrap_or_default();
-            let raw = yaml::resolve(template, yaml);
-            let text = literal(template, yaml).or_else(|| {
-                (raw.kind() == "block_scalar").then(|| yaml[raw.byte_range()].to_string())
-            });
-            if let Some(text) = text {
-                let mut rest = text.as_str();
-                while let Some((_, after)) = rest.split_once("${") {
-                    let Some((name, tail)) = after.split_once('}') else {
-                        break;
-                    };
-                    rest = tail;
-                    if name.starts_with('!') || shadowed.contains(name) {
-                        continue;
-                    }
-                    if let Some((name, _)) = name.split_once('.') {
-                        reference(ex, id, scope, name, &["resource"]);
-                    } else {
-                        reference(ex, id, scope, name, &["parameter", "resource"]);
-                    }
+    yaml: &'a Yaml<'tree, 'src>,
+    seen: HashMap<usize, usize>,
+}
+impl<'tree> Walker<'_, 'tree, '_> {
+    fn reference(&mut self, name: &str, kinds: &[&str]) {
+        reference(self.ex, self.id, self.scope, name, kinds);
+    }
+    fn intrinsic(&mut self, kind: &str, value: Node<'tree>, depth: usize) {
+        let yaml = self.yaml;
+        match kind {
+            "Ref" => {
+                if let Some(name) = literal(value, yaml) {
+                    self.reference(&name, &["parameter", "resource"]);
                 }
             }
-            if let Some(&variables) = values.get(1) {
-                walk(ex, id, scope, variables, yaml, depth + 1);
+            "GetAtt" => {
+                let values = sequence(value, yaml);
+                let name = if let Some(&first) = values.first() {
+                    literal(first, yaml)
+                } else {
+                    literal(value, yaml)
+                        .and_then(|s| s.split_once('.').map(|(name, _)| name.to_string()))
+                };
+                if let Some(name) = name {
+                    self.reference(&name, &["resource"]);
+                }
             }
+            "Condition" => {
+                if let Some(name) = literal(value, yaml) {
+                    self.reference(&name, &["condition"]);
+                }
+            }
+            "If" | "FindInMap" => {
+                if let Some(&first) = sequence(value, yaml).first()
+                    && let Some(name) = literal(first, yaml)
+                {
+                    self.reference(&name, &[if kind == "If" { "condition" } else { "mapping" }]);
+                }
+            }
+            "Sub" => {
+                let values = sequence(value, yaml);
+                let template = values.first().copied().unwrap_or(value);
+                let shadowed: HashSet<_> = values
+                    .get(1)
+                    .map(|&n| yaml::pairs(n, yaml).into_iter().map(|(k, _)| k).collect())
+                    .unwrap_or_default();
+                let raw = yaml::resolve(template, yaml);
+                let text = literal(template, yaml).or_else(|| {
+                    (raw.kind() == "block_scalar").then(|| yaml[raw.byte_range()].to_string())
+                });
+                if let Some(text) = text {
+                    let mut rest = text.as_str();
+                    while let Some((_, after)) = rest.split_once("${") {
+                        let Some((name, tail)) = after.split_once('}') else {
+                            break;
+                        };
+                        rest = tail;
+                        if name.starts_with('!') || shadowed.contains(name) {
+                            continue;
+                        }
+                        if let Some((name, _)) = name.split_once('.') {
+                            self.reference(name, &["resource"]);
+                        } else {
+                            self.reference(name, &["parameter", "resource"]);
+                        }
+                    }
+                }
+                if let Some(&variables) = values.get(1) {
+                    self.walk(variables, depth + 1);
+                }
+                return;
+            }
+            _ => {}
+        }
+        // Nested intrinsics can contribute dependencies even when the outer result
+        // (a dynamic logical ID, condition, or imported export name) is unknowable.
+        self.walk(value, depth + 1);
+    }
+    fn walk(&mut self, node: Node<'tree>, depth: usize) {
+        if depth >= 128 {
             return;
         }
-        _ => {}
-    }
-    // Nested intrinsics can contribute dependencies even when the outer result
-    // (a dynamic logical ID, condition, or imported export name) is unknowable.
-    walk(ex, id, scope, value, yaml, depth + 1);
-}
-fn walk<'a>(
-    ex: &mut Extracted,
-    id: usize,
-    scope: usize,
-    node: Node<'a>,
-    yaml: &Yaml<'a, '_>,
-    depth: usize,
-) {
-    if depth >= 128 {
-        return;
-    }
-    if let Some(tag) = tag(node, yaml) {
+        let yaml = self.yaml;
+        let tag = tag(node, yaml);
         let value = yaml::resolve(node, yaml);
-        intrinsic(
-            ex,
-            id,
-            scope,
-            tag.trim_start_matches('!'),
-            value,
-            yaml,
-            depth + 1,
-        );
-        return;
-    }
-    let node = yaml::resolve(node, yaml);
-    let pairs = yaml::pairs(node, yaml);
-    if let [(key, value)] = pairs.as_slice()
-        && (key == "Ref" || key == "Condition" || key.starts_with("Fn::"))
-    {
-        intrinsic(
-            ex,
-            id,
-            scope,
-            key.strip_prefix("Fn::").unwrap_or(key),
-            *value,
-            yaml,
-            depth + 1,
-        );
-        return;
-    }
-    for (_, value) in pairs {
-        walk(ex, id, scope, value, yaml, depth + 1);
-    }
-    for item in sequence(node, yaml) {
-        walk(ex, id, scope, item, yaml, depth + 1);
+        // Tags and their untagged arguments are separate visits so descending
+        // into an intrinsic still finds nested dependencies.
+        let key = if tag.is_some() { node.id() } else { value.id() };
+        if self
+            .seen
+            .get(&key)
+            .is_some_and(|&previous| previous <= depth)
+        {
+            return;
+        }
+        self.seen.insert(key, depth);
+        if let Some(tag) = tag {
+            self.intrinsic(tag.trim_start_matches('!'), value, depth + 1);
+            return;
+        }
+        let pairs = yaml::pairs(value, yaml);
+        if let [(key, value)] = pairs.as_slice()
+            && (key == "Ref" || key == "Condition" || key.starts_with("Fn::"))
+        {
+            self.intrinsic(key.strip_prefix("Fn::").unwrap_or(key), *value, depth + 1);
+            return;
+        }
+        for (_, value) in pairs {
+            self.walk(value, depth + 1);
+        }
+        for item in sequence(value, yaml) {
+            self.walk(item, depth + 1);
+        }
     }
 }
 

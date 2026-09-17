@@ -46,13 +46,22 @@ fn external(ex: &mut Extracted, from: Option<usize>, name: String) {
     link(ex, from, Target::External(name));
 }
 fn include<'a>(ex: &mut Extracted, from: Option<usize>, node: Node<'a>, yaml: &Yaml<'a, '_>) {
-    let sequence = yaml::items(node, yaml);
-    if !sequence.is_empty() {
-        for item in sequence {
-            include(ex, from, item, yaml);
+    let mut todo = vec![node];
+    let mut seen = HashSet::new();
+    while let Some(node) = todo.pop() {
+        let node = yaml::resolve(node, yaml);
+        if !seen.insert(node.id()) {
+            continue;
         }
-        return;
+        let sequence = yaml::items(node, yaml);
+        if sequence.is_empty() {
+            include_item(ex, from, node, yaml);
+        } else {
+            todo.extend(sequence.into_iter().rev());
+        }
     }
+}
+fn include_item<'a>(ex: &mut Extracted, from: Option<usize>, node: Node<'a>, yaml: &Yaml<'a, '_>) {
     if let Some(project) = yaml::get(node, yaml, "project").and_then(|n| literal(n, yaml)) {
         let reference = match yaml::get(node, yaml, "ref") {
             Some(n) => literal(n, yaml),
@@ -91,6 +100,7 @@ fn references<'a>(
     node: Node<'a>,
     yaml: &Yaml<'a, '_>,
     depth: usize,
+    seen: &mut HashMap<usize, usize>,
 ) {
     if depth >= 64 {
         return;
@@ -109,17 +119,24 @@ fn references<'a>(
         "block_node" | "flow_node" | "block_sequence_item"
     ) {
         for child in yaml::children(node) {
-            references(ex, id, child, yaml, depth + 1);
+            references(ex, id, child, yaml, depth + 1, seen);
         }
         return;
     }
     let node = yaml::resolve(node, yaml);
+    if seen
+        .get(&node.id())
+        .is_some_and(|&previous| previous <= depth)
+    {
+        return;
+    }
+    seen.insert(node.id(), depth);
     for (_, value) in yaml::pairs(node, yaml) {
-        references(ex, id, value, yaml, depth + 1);
+        references(ex, id, value, yaml, depth + 1, seen);
     }
     if matches!(node.kind(), "block_sequence" | "flow_sequence") {
         for item in yaml::children(node) {
-            references(ex, id, item, yaml, depth + 1);
+            references(ex, id, item, yaml, depth + 1, seen);
         }
     }
 }
@@ -161,7 +178,7 @@ pub fn enrich<'a>(root: Node<'a>, yaml: &Yaml<'a, '_>, path: &str, ex: &mut Extr
         }
         if let Some(default) = yaml::get(doc, yaml, "default") {
             let id = yaml::symbol(ex, yaml, default, "gitlab default".into(), "template", None);
-            references(ex, id, default, yaml, 0);
+            references(ex, id, default, yaml, 0, &mut HashMap::new());
         }
         for (name, value) in pairs.into_iter().filter(|(name, _)| !reserved(name)) {
             let fields = yaml::pairs(value, yaml);
@@ -248,7 +265,7 @@ pub fn enrich<'a>(root: Node<'a>, yaml: &Yaml<'a, '_>, path: &str, ex: &mut Extr
             if inherit.as_deref() != Some("false") {
                 link(ex, Some(id), Target::Local("gitlab default".into()));
             }
-            references(ex, id, value, yaml, 0);
+            references(ex, id, value, yaml, 0, &mut HashMap::new());
         }
     }
 }

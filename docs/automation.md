@@ -115,7 +115,10 @@ bind subsequent aliases, and aliases never cross document boundaries.
 Inherited values retain their original source spans. Alias-to-anchor graph links
 preserve provenance while semantic dependency links belong to the consuming task,
 job, step, or service. Effective mappings are cached within each parse to avoid
-repeated expansion of shared configurations. Recursive aliases, forward aliases,
+repeated expansion of shared configurations. CloudFormation intrinsic traversal and
+GitLab include/reference traversal also avoid revisiting expanded subtrees for each
+alias path, while retaining dependencies for each consuming resource or job.
+Recursive aliases, forward aliases,
 and inheritance chains exceeding 64 levels remain unresolved. This is structural
 analysis, not validation that every automation engine accepts YAML merge keys.
 

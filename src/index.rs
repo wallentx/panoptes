@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-11";
+pub const EXTRACTOR_STAMP: &str = "panoptes-12";
 
 pub struct BuildStats {
     pub files: usize,
@@ -2774,6 +2774,65 @@ consumer:
             !edges
                 .iter()
                 .any(|(p, s, _, _)| p == "plain.yml" || s == "gitlab job: consumer")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn yaml_alias_dags_preserve_dependencies_without_path_expansion() {
+        let mut aliases = "a0: &a0 [{Ref: Bucket}, !reference [.base, script]]\n".to_string();
+        for level in 1..=32 {
+            aliases.push_str(&format!(
+                "a{level}: &a{level} [*a{}, *a{}]\n",
+                level - 1,
+                level - 1
+            ));
+        }
+        let cloudformation = format!(
+            "{aliases}Resources:\n  Bucket: {{Type: 'AWS::S3::Bucket'}}\n  One: {{Type: 'AWS::S3::Bucket', Properties: {{Values: *a32}}}}\n  Two: {{Type: 'AWS::S3::Bucket', Properties: {{Values: *a32}}}}\n"
+        );
+        let gitlab = format!(
+            "{aliases}.base: {{script: echo base}}\none: {{script: *a20}}\ntwo: {{script: *a20}}\n"
+        );
+        let mut includes = "a0: &a0 [ci.yml]\n".to_string();
+        for level in 1..=32 {
+            includes.push_str(&format!(
+                "a{level}: &a{level} [*a{}, *a{}]\n",
+                level - 1,
+                level - 1
+            ));
+        }
+        includes.push_str("include: *a32\n");
+        let (db, root) = fixture(&[
+            ("stack.yaml", &cloudformation),
+            (".gitlab-ci.yml", &includes),
+            ("ci.yml", &gitlab),
+        ]);
+        let edges = automation_edges(&db);
+        for source in ["cfn resource: One", "cfn resource: Two"] {
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|(_, s, d, _)| s == source && d == "cfn resource: Bucket")
+                    .count(),
+                1
+            );
+        }
+        for source in ["gitlab job: one", "gitlab job: two"] {
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|(_, s, d, _)| s == source && d == "gitlab job: .base")
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|(_, s, d, _)| s == ".gitlab-ci.yml" && d == "ci.yml")
+                .count(),
+            1
         );
         let _ = std::fs::remove_dir_all(root);
     }
