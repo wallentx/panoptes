@@ -384,12 +384,16 @@ impl Extractor {
     }
 
     pub fn extract_file(&mut self, lang: Lang, src: &str, path: &str) -> Result<Extracted> {
-        self.extract_context(lang, src, path, false)
+        self.extract_context(lang, src, path, false, false)
     }
 
     /// Local CI includes supply format context for otherwise generic YAML.
     pub fn extract_gitlab_include(&mut self, src: &str, path: &str) -> Result<Extracted> {
-        self.extract_context(Lang::Yaml, src, path, true)
+        self.extract_context(Lang::Yaml, src, path, true, false)
+    }
+
+    pub fn extract_ansible_tasks(&mut self, src: &str, path: &str) -> Result<Extracted> {
+        self.extract_context(Lang::Yaml, src, path, false, true)
     }
 
     fn extract_context(
@@ -398,6 +402,7 @@ impl Extractor {
         src: &str,
         path: &str,
         gitlab_include: bool,
+        ansible_tasks: bool,
     ) -> Result<Extracted> {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.compiled.entry(lang) {
             entry.insert(CompiledExtractor::new(lang)?);
@@ -410,6 +415,7 @@ impl Extractor {
             src,
             path,
             gitlab_include,
+            ansible_tasks,
         )
     }
 }
@@ -734,6 +740,7 @@ fn extract_compiled(
     src: &str,
     path: &str,
     gitlab_include: bool,
+    ansible_tasks: bool,
 ) -> Result<Extracted> {
     let tree = compiled
         .parser
@@ -1080,7 +1087,7 @@ fn extract_compiled(
                 });
             }
         }
-        crate::ansible::enrich(root, &yaml, path, &mut extracted);
+        crate::ansible::enrich(root, &yaml, path, &mut extracted, ansible_tasks);
         crate::github_actions::enrich(root, &yaml, path, &mut extracted);
         crate::compose::enrich(root, &yaml, path, &mut extracted);
         crate::kubernetes::enrich(root, &yaml, &mut extracted);

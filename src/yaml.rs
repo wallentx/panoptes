@@ -18,6 +18,9 @@ pub struct Automation {
     /// Format inferred from a reachable CI include, not this file's own syntax.
     #[serde(default)]
     pub gitlab_included: bool,
+    /// Task-list context supplied by a reachable Ansible task import/include.
+    #[serde(default)]
+    pub ansible_included: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +72,7 @@ pub enum Target {
     Symbol(usize),
     /// Ordered alternatives; the first existing indexed file wins.
     File(Vec<String>),
+    AnsibleTasks(Vec<String>),
     Role {
         bases: Vec<String>,
         entries: Vec<String>,

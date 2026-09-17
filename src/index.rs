@@ -246,7 +246,11 @@ pub fn build_with_jobs(
         .collect::<Option<Vec<_>>>()
         .context("missing extraction after parallel parse")?;
     let mut parsed = changed.len();
-    for index in crate::gitlab_ci::contextualize(&mut pending, &files)? {
+    let mut context_changed = crate::ansible::contextualize(&mut pending, &files)?;
+    context_changed.extend(crate::gitlab_ci::contextualize(&mut pending, &files)?);
+    context_changed.sort_unstable();
+    context_changed.dedup();
+    for index in context_changed {
         // Include reachability is a cache input independent of the file hash.
         tx.execute("delete from files where id=?1", [pending[index].file_id])?;
         pending[index] = index_extracted(
@@ -3062,6 +3066,43 @@ consumer:
                 .count(),
             1
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ansible_task_imports_supply_context_without_module_whitelists() {
+        let play = "- hosts: all\n  tasks:\n    - import_tasks: setup.yml\n    - include_vars: vars.yml\n  handlers:\n    - name: changed\n      debug: {msg: changed}\n";
+        let tasks = "- name: create user\n  user: {name: demo}\n  notify: changed\n";
+        let (mut db, root) = fixture(&[
+            ("site.yml", play),
+            ("setup.yml", tasks),
+            ("vars.yml", tasks),
+            ("unrelated.yml", tasks),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges.iter().any(|(p, s, d, _)| p == "setup.yml"
+                && s == "task: create user"
+                && d == "handler: changed"),
+            "{edges:?}"
+        );
+        assert!(!edges.iter().any(
+            |(p, s, _, _)| ["vars.yml", "unrelated.yml"].contains(&p.as_str())
+                && s == "task: create user"
+        ));
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(root.join("site.yml"), "- hosts: all\n  tasks: []\n").unwrap();
+        build(&mut db, &root).unwrap();
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, s, d, _)| s == "task: create user" || d == "task: create user")
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        std::fs::write(root.join("site.yml"), play).unwrap();
+        build(&mut db, &root).unwrap();
+        assert_eq!(automation_edges(&db), edges);
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -72,10 +72,12 @@ pub fn enrich<'tree>(
     src: &yaml::Yaml<'tree, '_>,
     path: &str,
     ex: &mut Extracted,
+    included: bool,
 ) {
     if path.starts_with(".github/") {
         return;
     }
+    ex.automation.ansible_included = included;
     for doc in yaml::children(root).filter(|n| n.kind() == "document") {
         let top = yaml::resolve(doc, src);
         let entries = yaml::items(top, src);
@@ -120,7 +122,8 @@ pub fn enrich<'tree>(
                     }
                 }
             }
-        } else if role_root(path).is_some()
+        } else if included
+            || role_root(path).is_some()
             || parent(path)
                 .split('/')
                 .any(|p| p == "tasks" || p == "handlers")
@@ -182,9 +185,15 @@ fn task_list<'tree>(
                 "block" | "rescue" | "always" => {
                     task_list(ex, src, path, value, Some(id), scope, handler)
                 }
-                "include_tasks" | "import_tasks" => {
-                    file_link(ex, src, path, value, Some(id), scope, "tasks")
-                }
+                "include_tasks" | "import_tasks" => file_link(
+                    ex,
+                    src,
+                    path,
+                    value,
+                    Some(id),
+                    scope,
+                    if handler { "handlers" } else { "tasks" },
+                ),
                 "include_vars" => file_link(ex, src, path, value, Some(id), scope, "vars"),
                 "include_role" | "import_role" => role_link(ex, src, path, value, Some(id), scope),
                 "notify" => {
@@ -221,7 +230,7 @@ fn file_link<'tree>(
     for spec in specs {
         // Nested task imports/includes prefer the importing file's directory.
         // Variable lookup still starts in the role's vars directory.
-        if kind == "tasks"
+        if matches!(kind, "tasks" | "handlers")
             && let Some(p) = yaml::path(parent(path), &spec)
         {
             candidates.push(p);
@@ -232,7 +241,7 @@ fn file_link<'tree>(
         {
             candidates.push(p);
         }
-        if kind != "tasks"
+        if !matches!(kind, "tasks" | "handlers")
             && let Some(p) = yaml::path(parent(path), &spec)
         {
             candidates.push(p);
@@ -242,7 +251,11 @@ fn file_link<'tree>(
         ex.automation.links.push(Link {
             from,
             scope,
-            target: Target::File(candidates),
+            target: if kind == "tasks" {
+                Target::AnsibleTasks(candidates)
+            } else {
+                Target::File(candidates)
+            },
         });
     }
 }
@@ -362,7 +375,7 @@ pub fn resolve(pending: &[Pending], files: &HashMap<String, i64>) -> Resolved {
                     result.edges.push((from, file.symbol_ids[*index], "calls"));
                     continue;
                 }
-                Target::File(candidates) => candidates
+                Target::File(candidates) | Target::AnsibleTasks(candidates) => candidates
                     .iter()
                     .filter(|p| {
                         matches!(
@@ -481,4 +494,67 @@ pub fn resolve(pending: &[Pending], files: &HashMap<String, i64>) -> Resolved {
     result.edges.sort_unstable();
     result.edges.dedup();
     result
+}
+
+/// Import targets are task lists even when their module names provide no format
+/// hint. Context is recomputed from imports so cached symbols disappear when an
+/// include is removed; variable files never acquire task context.
+pub fn contextualize(
+    pending: &mut [Pending],
+    sources: &[crate::repo::SourceFile],
+) -> anyhow::Result<Vec<usize>> {
+    let indexes: HashMap<_, _> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.rel.as_str(), i))
+        .collect();
+    let mut todo: Vec<_> = pending
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.extracted.automation.ansible_included)
+        .map(|(i, _)| (i, false))
+        .collect();
+    let mut seen = HashSet::new();
+    let mut reached = HashSet::new();
+    let mut changed = Vec::new();
+    let mut extractor = crate::extract::Extractor::new();
+    while let Some((index, included)) = todo.pop() {
+        if included {
+            reached.insert(index);
+        }
+        if !seen.insert((index, included)) || pending[index].lang != crate::repo::Lang::Yaml {
+            continue;
+        }
+        let file = &mut pending[index];
+        if file.extracted.automation.dialect != yaml::Dialect::Generic {
+            continue;
+        }
+        if included
+            && !file.extracted.automation.ansible_included
+            && !file
+                .extracted
+                .symbols
+                .iter()
+                .any(|s| matches!(s.kind.as_str(), "task" | "handler" | "play"))
+        {
+            file.extracted = extractor.extract_ansible_tasks(&sources[index].text, &file.rel)?;
+            changed.push(index);
+        }
+        for link in &file.extracted.automation.links {
+            if let Target::AnsibleTasks(paths) = &link.target
+                && let Some(&target) = paths.iter().find_map(|p| indexes.get(p.as_str()))
+            {
+                todo.push((target, true));
+            }
+        }
+    }
+    for (index, file) in pending.iter_mut().enumerate() {
+        if file.extracted.automation.ansible_included && !reached.contains(&index) {
+            file.extracted = extractor.extract_file(file.lang, &sources[index].text, &file.rel)?;
+            changed.push(index);
+        }
+    }
+    changed.sort_unstable();
+    changed.dedup();
+    Ok(changed)
 }
