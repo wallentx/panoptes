@@ -8,9 +8,17 @@ use tree_sitter::Node;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Automation {
     #[serde(default)]
-    pub github_actions: bool,
+    pub dialect: Dialect,
     pub links: Vec<Link>,
     pub handlers: Vec<Handler>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Dialect {
+    #[default]
+    Generic,
+    GitHubActions,
+    Compose,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +33,10 @@ pub struct Link {
 pub enum Target {
     /// A uniquely named definition in this file only.
     Local(String),
+    Named {
+        path: String,
+        name: String,
+    },
     Action {
         spec: String,
         workflow: bool,
@@ -78,7 +90,7 @@ pub fn pairs<'a>(node: Node<'a>, src: &str) -> Vec<(String, Node<'a>)> {
             }
             Some((
                 scalar(pair.child_by_field_name("key")?, src)?,
-                pair.child_by_field_name("value")?,
+                pair.child_by_field_name("value").unwrap_or(pair),
             ))
         })
         .collect()

@@ -79,3 +79,29 @@ resolution assumes the indexed repository is checked out at the workspace root.
 See GitHub's [workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax),
 [action metadata](https://docs.github.com/en/actions/reference/workflows-and-actions/metadata-syntax),
 and [expression contexts](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts).
+
+## Docker Compose
+
+Compose files expose named services, networks, volumes, configs, and secrets.
+Service dependencies include `depends_on`, `links`, `volumes_from`, and
+`service:` references in `network_mode`, `ipc`, and `pid`. Short and long volume,
+config, secret, and network syntax links to declared resources. Bind mounts and
+anonymous volumes are not mistaken for named volumes.
+
+Local `include` files extend the names visible to the including configuration;
+`extends` links to the named service in the specified file. Unrelated Compose
+projects never participate in name lookup. Config/secret `file` references link
+when the target is an indexed source file. No secret values are read specially.
+
+Environment interpolation, implicit default networks, include `project_directory`
+overrides, CLI-selected override files, and runtime profile selection are not
+interpreted. Duplicate resource names in included files remain unresolved rather
+than guessing a merged model. Included files do not inherit their caller's names.
+
+```sh
+panoptes callers 'service: db' --path .
+panoptes callers 'volume: data' --path .
+```
+
+See the [Compose services reference](https://docs.docker.com/reference/compose-file/services/)
+and [include rules](https://docs.docker.com/reference/compose-file/include/).

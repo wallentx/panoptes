@@ -7,6 +7,7 @@
 
 mod ansible;
 mod ask;
+mod compose;
 mod db;
 mod export;
 mod extract;

@@ -313,7 +313,7 @@ pub fn resolve(pending: &[Pending], files: &HashMap<String, i64>) -> Resolved {
     let mut notifications = Vec::new();
     let mut plays = Vec::new();
     for file in pending {
-        if file.extracted.automation.github_actions {
+        if file.extracted.automation.dialect != yaml::Dialect::Generic {
             continue;
         }
         let id = |index: Option<usize>| {
@@ -336,7 +336,7 @@ pub fn resolve(pending: &[Pending], files: &HashMap<String, i64>) -> Resolved {
             let from = id(link.from);
             let scope = id(link.scope);
             let targets = match &link.target {
-                Target::Local(_) | Target::Action { .. } => continue,
+                Target::Local(_) | Target::Named { .. } | Target::Action { .. } => continue,
                 Target::Symbol(index) => {
                     result.edges.push((from, file.symbol_ids[*index], "calls"));
                     continue;

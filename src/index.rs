@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-5";
+pub const EXTRACTOR_STAMP: &str = "panoptes-6";
 
 pub struct BuildStats {
     pub files: usize,
@@ -403,6 +403,9 @@ pub fn build_with_jobs(
     let actions = crate::github_actions::resolve(&pending, &file_symbol, &external);
     automation.edges.extend(actions.edges);
     automation.unresolved += actions.unresolved;
+    let compose = crate::compose::resolve(&pending, &file_symbol);
+    automation.edges.extend(compose.edges);
+    automation.unresolved += compose.unresolved;
     unresolved += automation.unresolved;
     for (from, target, kind) in automation.edges {
         n_edges += insert_edge.execute(rusqlite::params![repo_id, from, target, kind])?;
@@ -2312,6 +2315,111 @@ jobs:
         assert!(edges.iter().any(|(p, s, d, _)| p == "action.yml"
             && s == "play: all"
             && d == "task: Ansible action"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compose_services_resources_includes_and_extends_are_scoped() {
+        let (mut db, root) = fixture(&[
+            (
+                "compose.yaml",
+                r#"
+include: [shared/compose.yml]
+services:
+  web:
+    image: nginx
+    depends_on: {db: {condition: service_healthy}}
+    networks: [frontend]
+    volumes: [data:/var/data, './bind:/data', '/anonymous']
+    configs: [{source: settings, target: /settings}]
+    secrets: [password]
+    extends: {file: base/compose.yml, service: base}
+  db:
+    image: postgres
+    volumes: [{type: volume, source: data, target: /var/db}]
+  sidecar:
+    image: busybox
+    network_mode: service:web
+    volumes_from: [db:ro]
+    links: [cache:redis]
+networks:
+  frontend:
+volumes:
+  data:
+configs:
+  settings: {file: config.yml}
+secrets:
+  password: {external: true}
+"#,
+            ),
+            ("shared/compose.yml", "services:\n  cache: {image: redis}\n"),
+            ("base/compose.yml", "services:\n  base: {image: alpine}\n"),
+            ("other/compose.yml", "services:\n  db: {image: unrelated}\n"),
+            ("config.yml", "port: 8080\n"),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        for target in [
+            "service: db",
+            "network: frontend",
+            "volume: data",
+            "config: settings",
+            "secret: password",
+            "service: base",
+        ] {
+            assert!(has("service: web", target), "missing {target}: {edges:?}");
+        }
+        assert!(has("service: db", "volume: data"));
+        assert!(has("service: sidecar", "service: web"));
+        assert!(has("service: sidecar", "service: db"));
+        assert!(has("service: sidecar", "service: cache"));
+        assert!(has("config: settings", "config.yml"));
+        assert!(
+            !edges
+                .iter()
+                .any(|(p, _, _, target)| p == "compose.yaml" && target == "other/compose.yml")
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(
+            root.join("shared/compose.yml"),
+            "services:\n  renamed: {image: redis}\n",
+        )
+        .unwrap();
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 1);
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, _, d, _)| d == "service: cache")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compose_ambiguous_and_interpolated_targets_are_not_guessed() {
+        let (db, root) = fixture(&[
+            (
+                "compose.yml",
+                r#"
+include:
+  - path: [one.yml, two.yml]
+services:
+  app:
+    image: app
+    depends_on: [db, '${DATABASE}']
+    volumes: ['./data:/data', '${VOLUME}:/var/lib', '/tmp:/tmp']
+    extends: {service: '${BASE}'}
+"#,
+            ),
+            ("one.yml", "services:\n  db: {image: one}\n"),
+            ("two.yml", "services:\n  db: {image: two}\n"),
+            ("unrelated.yml", "services: [app, db]\n"),
+        ]);
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, s, _, _)| s == "service: app")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

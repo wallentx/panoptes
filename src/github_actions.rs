@@ -29,7 +29,7 @@ pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
         if !workflow && yaml::get(top, src, "runs").is_none() {
             continue;
         }
-        ex.automation.github_actions = true;
+        ex.automation.dialect = yaml::Dialect::GitHubActions;
         if workflow {
             if let Some(on) = yaml::get(top, src, "on") {
                 for trigger in ["workflow_call", "workflow_dispatch"] {
@@ -388,7 +388,7 @@ pub fn resolve(
     };
     for file in pending
         .iter()
-        .filter(|f| f.extracted.automation.github_actions)
+        .filter(|f| f.extracted.automation.dialect == yaml::Dialect::GitHubActions)
     {
         let mut names: HashMap<&str, Vec<i64>> = HashMap::new();
         for (i, s) in file.extracted.symbols.iter().enumerate() {

@@ -1053,6 +1053,7 @@ fn extract_compiled(
     if lang == Lang::Yaml {
         crate::ansible::enrich(root, src, path, &mut extracted);
         crate::github_actions::enrich(root, src, path, &mut extracted);
+        crate::compose::enrich(root, src, path, &mut extracted);
     }
     Ok(extracted)
 }
