@@ -40,3 +40,42 @@ imply that an included role has executed before a notification.
 
 See the Ansible documentation for [roles and entry points](https://docs.ansible.com/projects/ansible/latest/playbook_guide/playbooks_reuse_roles.html)
 and [file search paths](https://docs.ansible.com/projects/ansible/latest/playbook_guide/playbook_pathing.html).
+
+## GitHub Actions
+
+Workflow files under `.github/workflows/` expose `job: <id>` and
+`step: <job>.<id>` symbols. Action metadata (`action.yml` or `action.yaml`) exposes
+composite `step: <id>` symbols. Steps without an `id` use `#1`, `#2`, and so on;
+their names and source remain searchable.
+
+- `needs` links dependent jobs to their prerequisites in the same workflow.
+  Workflows call their jobs, and jobs/composites call their steps, allowing
+  transitive traversal through execution structure.
+- Job-level `uses` links to local reusable workflows. Step-level `uses` links to
+  local action metadata, including recursively nested composites. Local `uses`
+  paths are relative to the repository root. Remote actions, reusable workflows,
+  and `docker://` images remain external dependency nodes with the complete ref.
+- Expression references to `steps`, `needs`, `jobs`, and declared `inputs` link to
+  their producers. Step IDs are scoped to their job or composite. Job, reusable
+  workflow, and composite output definitions connect to the referenced producer.
+  Reusable-job output references connect to the calling job.
+- JavaScript action `runs.main`, `runs.pre`, and `runs.post` link to indexed entry
+  files relative to the action metadata directory.
+
+```sh
+panoptes callers 'job: deploy' --direction out --depth all --path .
+panoptes callers 'step: build.package' --direction out --depth all --path .
+panoptes callers '.github/actions/setup/action.yml' --path .
+```
+
+Only `${{ ... }}` interpolations and direct job/step `if` expressions are inspected.
+Static dot access and quoted bracket access (`steps['build'].outputs.version`)
+are supported. Comments, expression string literals, and arbitrary YAML `uses`
+keys do not create dependencies. Ambiguous IDs and dynamic indexed targets remain
+unresolved. Matrix expansion, checkout path/ref changes, shell command execution,
+remote source retrieval, and YAML merge expansion are not modeled. Local action
+resolution assumes the indexed repository is checked out at the workspace root.
+
+See GitHub's [workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax),
+[action metadata](https://docs.github.com/en/actions/reference/workflows-and-actions/metadata-syntax),
+and [expression contexts](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts).

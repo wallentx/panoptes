@@ -7,6 +7,8 @@ use tree_sitter::Node;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Automation {
+    #[serde(default)]
+    pub github_actions: bool,
     pub links: Vec<Link>,
     pub handlers: Vec<Handler>,
 }
@@ -21,6 +23,12 @@ pub struct Link {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Target {
+    /// A uniquely named definition in this file only.
+    Local(String),
+    Action {
+        spec: String,
+        workflow: bool,
+    },
     /// A definition in this extraction payload (execution/containment dependency).
     Symbol(usize),
     /// Ordered alternatives; the first existing indexed file wins.

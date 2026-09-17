@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-4";
+pub const EXTRACTOR_STAMP: &str = "panoptes-5";
 
 pub struct BuildStats {
     pub files: usize,
@@ -399,7 +399,10 @@ pub fn build_with_jobs(
         }
     }
 
-    let automation = crate::ansible::resolve(&pending, &file_symbol);
+    let mut automation = crate::ansible::resolve(&pending, &file_symbol);
+    let actions = crate::github_actions::resolve(&pending, &file_symbol, &external);
+    automation.edges.extend(actions.edges);
+    automation.unresolved += actions.unresolved;
     unresolved += automation.unresolved;
     for (from, target, kind) in automation.edges {
         n_edges += insert_edge.execute(rusqlite::params![repo_id, from, target, kind])?;
@@ -785,19 +788,9 @@ fn resolve_import(
             ids.sort_unstable();
             return ids;
         }
-        Lang::Yaml => {
-            if !spec.starts_with('.') {
-                return Vec::new();
-            }
-            // GitHub Actions resolves local `uses:` paths from the repository
-            // root, not from the workflow file's directory.
-            let path = normalize_path(Path::new(spec));
-            vec![
-                path.clone(),
-                format!("{path}/action.yml"),
-                format!("{path}/action.yaml"),
-            ]
-        }
+        // Local YAML automation links have context-specific resolution rules.
+        // The plain imports list contains only external action references.
+        Lang::Yaml => return Vec::new(),
     };
     for candidate in candidates {
         if let Some(&id) = files.get(&candidate) {
@@ -1196,28 +1189,37 @@ pub fn callers_scoped(
             and (?3 is null or lower(s.container) in (lower(?3), lower(?4)))
           order by f.path, s.start_line",
     )?;
-    let seeds: Vec<Seed> = seeds_stmt
-        .query_map(
-            rusqlite::params![repo_id, name, container, container_tail],
-            |r| {
-                Ok(Seed {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    kind: r.get(2)?,
-                    path: r.get(3)?,
-                    start_line: r.get(4)?,
-                    end_line: r.get(5)?,
+    let mut lookup =
+        |name: &str, container: Option<&str>, container_tail: Option<&str>| -> Result<Vec<Seed>> {
+            Ok(seeds_stmt
+                .query_map(
+                    rusqlite::params![repo_id, name, container, container_tail],
+                    |r| {
+                        Ok(Seed {
+                            id: r.get(0)?,
+                            name: r.get(1)?,
+                            kind: r.get(2)?,
+                            path: r.get(3)?,
+                            start_line: r.get(4)?,
+                            end_line: r.get(5)?,
+                        })
+                    },
+                )?
+                .filter_map(|row| match row {
+                    Ok(seed) if scope.is_none_or(|scope| path_in_scope(&seed.path, scope)) => {
+                        Some(Ok(seed))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
                 })
-            },
-        )?
-        .filter_map(|row| match row {
-            Ok(seed) if scope.is_none_or(|scope| path_in_scope(&seed.path, scope)) => {
-                Some(Ok(seed))
-            }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<_, _>>()?;
+                .collect::<Result<_, _>>()?)
+        };
+    // YAML, automation, and HCL definitions use literal dotted names. Prefer
+    // an exact definition before interpreting dots as class qualification.
+    let mut seeds = lookup(qualified_name, None, None)?;
+    if seeds.is_empty() && container.is_some() {
+        seeds = lookup(name, container, container_tail)?;
+    }
 
     let (from_col, to_col) = if out {
         ("src_symbol_id", "dst_symbol_id")
@@ -2006,6 +2008,310 @@ mod tests {
                 "{edges:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn actions_composites_reusable_workflows_and_outputs_are_traversable() {
+        let (mut db, root) = fixture(&[
+            (
+                ".github/workflows/ci.yml",
+                r#"
+name: CI
+on:
+  workflow_dispatch:
+    inputs:
+      target: {type: string}
+jobs:
+  build:
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - id: package
+        uses: ./.github/actions/package
+        with:
+          target: ${{ inputs.target }}
+      - id: consume
+        if: steps.package.outcome == 'success'
+        run: echo '${{ steps.package.outputs.version }}'
+  deploy:
+    needs: [build]
+    uses: ./.github/workflows/deploy.yaml
+    with:
+      version: ${{ needs.build.outputs.version }}
+  remote:
+    needs: deploy
+    uses: example/ci/.github/workflows/publish.yml@v2
+    with:
+      published: ${{ needs.deploy.outputs.published }}
+"#,
+            ),
+            (
+                ".github/workflows/deploy.yaml",
+                r#"
+on:
+  workflow_call:
+    inputs:
+      version: {type: string}
+    outputs:
+      published:
+        value: ${{ jobs.publish.outputs.result }}
+jobs:
+  publish:
+    outputs:
+      result: ${{ steps.deploy.outputs.result }}
+    steps:
+      - id: deploy
+        uses: docker://alpine:3.22
+        with: {version: '${{ inputs.version }}'}
+"#,
+            ),
+            (
+                ".github/actions/package/action.yml",
+                r#"
+name: Package
+inputs:
+  target: {description: Target}
+outputs:
+  version:
+    value: ${{ steps.build.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - id: setup
+      uses: ./.github/actions/setup
+    - id: build
+      if: steps.setup.outcome == 'success'
+      run: echo '${{ inputs.target }}'
+      shell: bash
+    - uses: actions/upload-artifact@v4
+"#,
+            ),
+            (
+                ".github/actions/setup/action.yaml",
+                "name: Setup\nruns:\n  using: composite\n  steps:\n    - id: checkout\n      uses: actions/checkout@v7\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| {
+            edges
+                .iter()
+                .any(|(_, source, target, _)| source == s && target == d)
+        };
+        assert!(has("job: deploy", "job: build"), "{edges:?}");
+        assert!(has("job: remote", "job: deploy"));
+        assert!(has("job: deploy", "output: job.build.version"));
+        assert!(has("output: job.build.version", "step: build.package"));
+        assert!(has("step: build.consume", "step: build.package"));
+        assert!(has("step: build.package", "input.target"));
+        assert!(has(
+            "step: build.package",
+            ".github/actions/package/action.yml"
+        ));
+        assert!(has("step: setup", ".github/actions/setup/action.yaml"));
+        assert!(has("step: build", "step: setup"));
+        assert!(has("step: build", "input.target"));
+        assert!(has("output: action.version", "step: build"));
+        assert!(has(
+            "output: workflow.published",
+            "output: job.publish.result"
+        ));
+        assert!(has("job: deploy", ".github/workflows/deploy.yaml"));
+        assert!(has(
+            "job: remote",
+            "example/ci/.github/workflows/publish.yml@v2"
+        ));
+        assert!(has("step: publish.deploy", "docker://alpine:3.22"));
+        let repo = repo_id_of(&db, &root).unwrap().unwrap();
+        let (seeds, reached) = callers(&db, repo, "step: build.package", true, 8).unwrap();
+        assert_eq!(seeds.len(), 1, "literal dotted symbol lookup");
+        assert!(
+            reached.iter().any(|r| r.name == "actions/checkout@v7"),
+            "{reached:?}"
+        );
+        let (_, incoming) = callers(&db, repo, "actions/checkout@v7", false, 8).unwrap();
+        assert!(incoming.iter().any(|r| r.name == "job: build"));
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(root.join(".github/actions/setup/action.yaml"), "name: Setup\nruns:\n  using: composite\n  steps:\n    - id: checkout\n      uses: actions/checkout@v8\n").unwrap();
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 1);
+        let edges = automation_edges(&db);
+        assert!(!edges.iter().any(|(_, _, d, _)| d == "actions/checkout@v7"));
+        assert!(edges.iter().any(|(_, _, d, _)| d == "actions/checkout@v8"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn actions_references_are_scoped_and_ignore_literals_comments_and_dynamic_indexes() {
+        let (db, root) = fixture(&[
+            (
+                ".github/workflows/ci.yml",
+                r#"
+jobs:
+  build:
+    steps:
+      - id: setup
+        run: echo ready
+      - id: phantom
+        run: echo present
+      - id: consume
+        if: steps['setup'].outcome == 'success'
+        run: |
+          echo '${{ steps.setup.outputs.x }}'
+          echo "${{ format('steps.phantom.outputs.x needs.ghost.result') }}"
+          echo '${{ steps[inputs.target].outputs.x }}'
+          echo 'steps.phantom.outputs.x'
+        # ${{ steps.phantom.outputs.x }}
+        with:
+          if: steps.phantom.outputs.x
+  other:
+    steps:
+      - id: setup
+        run: echo ready
+      - id: consume
+        if: steps.setup.outcome == 'success'
+  last:
+    steps:
+      - id: consume
+        if: steps.setup.outcome == 'success'
+"#,
+            ),
+            (
+                ".github/workflows/unrelated.yml",
+                "jobs:\n  build:\n    steps:\n      - id: setup\n        run: echo unrelated\n",
+            ),
+            (
+                "config.yml",
+                "jobs:\n  build:\n    needs: other\nuses: ./.github/actions/setup\n",
+            ),
+            (
+                ".github/actions/setup/action.yml",
+                "name: Setup\nruns: {using: composite, steps: []}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|(_, s, _, _)| s == "step: build.consume")
+            .collect();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].2, "step: build.setup");
+        assert_eq!(calls[0].3, ".github/workflows/ci.yml");
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "step: other.consume" && d == "step: other.setup")
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(p, s, _, _)| p == "config.yml" || s == "step: last.consume")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn actions_root_actions_js_entrypoints_and_missing_local_targets() {
+        let (db, root) = fixture(&[
+            (
+                ".github/workflows/ci.yml",
+                r#"
+jobs:
+  build:
+    steps:
+      - id: root
+        uses: ./
+      - id: wrong
+        uses: ./scripts/main.js
+      - id: dynamic
+        uses: ${{ inputs.action }}
+      - id: escape
+        uses: ./../../outside
+  invalid:
+    uses: ./scripts/main.js
+"#,
+            ),
+            (
+                "action.yaml",
+                "name: Root\nruns: {using: node24, main: scripts/main.js, post: scripts/post.js}\n",
+            ),
+            ("scripts/main.js", "export function main() {}\n"),
+            ("scripts/post.js", "export function post() {}\n"),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "step: build.root" && d == "action.yaml"),
+            "{edges:?}"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "action.yaml" && d == "scripts/main.js")
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "action.yaml" && d == "scripts/post.js")
+        );
+        assert!(!edges.iter().any(|(_, s, _, _)| {
+            [
+                "step: build.wrong",
+                "step: build.dynamic",
+                "step: build.escape",
+                "job: invalid",
+            ]
+            .contains(&s.as_str())
+        }));
+        let repo = repo_id_of(&db, &root).unwrap().unwrap();
+        let (seeds, _) = callers(&db, repo, "jobs.build.steps.uses", false, 1).unwrap();
+        assert_eq!(seeds.len(), 4, "existing YAML dotted keys remain queryable");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn actions_reusable_output_consumers_and_ambiguous_steps() {
+        let (db, root) = fixture(&[
+            (
+                ".github/workflows/ci.yml",
+                r#"
+jobs:
+  producer:
+    uses: example/ci/.github/workflows/build.yml@v1
+  consumer:
+    needs: producer
+    steps:
+      - id: consume
+        run: echo '${{ needs.producer.outputs.version }}'
+      - id: duplicate
+        run: echo one
+      - id: duplicate
+        run: echo two
+      - id: ambiguous
+        if: steps.duplicate.outcome == 'success'
+        run: echo unknown
+"#,
+            ),
+            (
+                "action.yml",
+                "- hosts: all\n  tasks:\n    - name: Ansible action\n      debug: {msg: ready}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "step: consumer.consume" && d == "job: producer")
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, s, _, _)| s == "step: consumer.ambiguous")
+        );
+        assert!(edges.iter().any(|(p, s, d, _)| p == "action.yml"
+            && s == "play: all"
+            && d == "task: Ansible action"));
         let _ = std::fs::remove_dir_all(root);
     }
 

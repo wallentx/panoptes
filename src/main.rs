@@ -10,6 +10,7 @@ mod ask;
 mod db;
 mod export;
 mod extract;
+mod github_actions;
 mod index;
 mod init;
 mod mcp;

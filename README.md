@@ -155,9 +155,10 @@ Run `panoptes --help` or `panoptes <command> --help` for the full interface.
 Indexes live at `$XDG_DATA_HOME/panoptes/panoptes.db`, falling back to
 `~/.local/share/panoptes/panoptes.db`.
 
-Ansible playbooks and roles have named tasks, handlers, imports, role dependencies,
-and notification links. See [automation relationships](docs/automation.md) for
-supported syntax and static-analysis limits.
+Ansible playbooks and roles expose tasks, handlers, role dependencies, and
+notifications. GitHub Actions workflows and composite actions expose jobs, steps,
+`needs`, nested `uses`, and input/output references. See
+[automation relationships](docs/automation.md) for supported syntax and limits.
 
 ## Build and verify
 

@@ -244,17 +244,6 @@ const YAML_CALLS: &str = r#"
 (alias (alias_name) @callee)
 "#;
 
-const YAML_IMPORTS: &str = r#"
-(block_mapping_pair
-  key: (_) @_key
-  value: (_) @spec
-  (#eq? @_key "uses"))
-(flow_pair
-  key: (_) @_key
-  value: (_) @spec
-  (#eq? @_key "uses"))
-"#;
-
 const HCL_DEFS: &str = r#"
 (block . (identifier) @name) @def
 (attribute (identifier) @name) @def
@@ -312,7 +301,7 @@ fn queries(lang: Lang) -> Queries {
             defs: YAML_DEFS,
             calls: Some(YAML_CALLS),
             bindings: None,
-            imports: Some(YAML_IMPORTS),
+            imports: None,
         },
         Lang::Hcl => Queries {
             defs: HCL_DEFS,
@@ -1063,6 +1052,7 @@ fn extract_compiled(
     };
     if lang == Lang::Yaml {
         crate::ansible::enrich(root, src, path, &mut extracted);
+        crate::github_actions::enrich(root, src, path, &mut extracted);
     }
     Ok(extracted)
 }
@@ -1474,7 +1464,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
 "#;
-        let e = extract(Lang::Yaml, src).unwrap();
+        let e = Extractor::new()
+            .extract_file(Lang::Yaml, src, ".github/workflows/ci.yml")
+            .unwrap();
         let names: Vec<_> = e
             .symbols
             .iter()
@@ -1492,10 +1484,9 @@ jobs:
             "{:?}",
             e.calls
         );
-        assert_eq!(
-            e.imports,
-            ["actions/checkout@v4", "./.github/actions/setup"]
-        );
+        assert_eq!(e.imports, ["actions/checkout@v4"]);
+        assert!(e.automation.links.iter().any(|link| matches!(&link.target,
+            crate::yaml::Target::Action { spec, .. } if spec == "./.github/actions/setup")));
     }
 
     #[test]

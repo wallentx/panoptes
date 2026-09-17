@@ -68,7 +68,7 @@ fn task_like(node: Node<'_>, src: &str) -> bool {
 }
 
 pub fn enrich(root: Node<'_>, src: &str, path: &str, ex: &mut Extracted) {
-    if path.starts_with(".github/") || Path::new(path).file_stem().is_some_and(|s| s == "action") {
+    if path.starts_with(".github/") {
         return;
     }
     for doc in yaml::children(root).filter(|n| n.kind() == "document") {
@@ -313,6 +313,9 @@ pub fn resolve(pending: &[Pending], files: &HashMap<String, i64>) -> Resolved {
     let mut notifications = Vec::new();
     let mut plays = Vec::new();
     for file in pending {
+        if file.extracted.automation.github_actions {
+            continue;
+        }
         let id = |index: Option<usize>| {
             index
                 .map(|i| file.symbol_ids[i])
@@ -333,6 +336,7 @@ pub fn resolve(pending: &[Pending], files: &HashMap<String, i64>) -> Resolved {
             let from = id(link.from);
             let scope = id(link.scope);
             let targets = match &link.target {
+                Target::Local(_) | Target::Action { .. } => continue,
                 Target::Symbol(index) => {
                     result.edges.push((from, file.symbol_ids[*index], "calls"));
                     continue;
