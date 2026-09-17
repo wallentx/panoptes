@@ -28,7 +28,8 @@ fn reference(ex: &mut Extracted, from: usize, scope: usize, name: &str, kinds: &
         ),
     );
 }
-fn tag<'a>(mut node: Node<'a>, yaml: &Yaml<'a, '_>) -> Option<String> {
+fn tag<'a>(node: Node<'a>, yaml: &Yaml<'a, '_>) -> Option<String> {
+    let mut node = yaml::dereference(node, yaml);
     loop {
         if let Some(tag) = yaml::children(node).find(|n| n.kind() == "tag") {
             return Some(yaml[tag.byte_range()].to_string());
@@ -241,6 +242,7 @@ impl<'tree> Walker<'_, 'tree, '_> {
             return;
         }
         let yaml = self.yaml;
+        let node = yaml::dereference(node, yaml);
         let tag = tag(node, yaml);
         let value = yaml::resolve(node, yaml);
         // Tags and their untagged arguments are separate visits so descending

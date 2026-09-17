@@ -105,6 +105,7 @@ fn references<'a>(
     if depth >= 64 {
         return;
     }
+    let node = yaml::dereference(node, yaml);
     if yaml::children(node).any(|n| n.kind() == "tag" && &yaml[n.byte_range()] == "!reference") {
         if let Some(name) = yaml::items(node, yaml)
             .first()

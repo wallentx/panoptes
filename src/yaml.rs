@@ -144,7 +144,7 @@ impl<'tree, 'src> Yaml<'tree, 'src> {
                             && node.end_byte() <= value.end_byte())
                         {
                             aliases.push((node, anchor));
-                            targets.insert(node.id(), value);
+                            targets.insert(node.id(), parent);
                         }
                     }
                 }
@@ -162,16 +162,21 @@ impl<'tree, 'src> Yaml<'tree, 'src> {
     }
 }
 
-pub fn resolve<'a>(node: Node<'a>, src: &Yaml<'a, '_>) -> Node<'a> {
-    let mut current = unwrap(node);
+/// Follow aliases without discarding tags on the anchored value.
+pub fn dereference<'a>(node: Node<'a>, src: &Yaml<'a, '_>) -> Node<'a> {
+    let mut current = node;
     for _ in 0..64 {
-        let Some(&target) = src.targets.get(&current.id()) else {
+        let Some(&target) = src.targets.get(&unwrap(current).id()) else {
             return current;
         };
-        current = unwrap(target);
+        current = target;
     }
     // Leave excessively deep chains unresolved.
-    unwrap(node)
+    node
+}
+
+pub fn resolve<'a>(node: Node<'a>, src: &Yaml<'a, '_>) -> Node<'a> {
+    unwrap(dereference(node, src))
 }
 
 fn raw_pairs<'a>(node: Node<'a>, src: &Yaml<'a, '_>) -> Vec<(String, Node<'a>, bool)> {

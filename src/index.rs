@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-15";
+pub const EXTRACTOR_STAMP: &str = "panoptes-16";
 
 pub struct BuildStats {
     pub files: usize,
@@ -3005,6 +3005,66 @@ consumer:
                 .count(),
             1
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tagged_aliases_preserve_intrinsics_for_each_consumer() {
+        let (mut db, root) = fixture(&[
+            (
+                "stack.yaml",
+                r#"
+shared: &ref !Ref Bucket
+attribute: &att !GetAtt Bucket.Arn
+Resources:
+  Bucket: {Type: 'AWS::S3::Bucket'}
+  One: {Type: 'AWS::S3::Bucket', Properties: {Value: *ref}}
+  Two: {Type: 'AWS::S3::Bucket', Properties: {Values: [*ref, *att]}}
+Outputs:
+  Arn: {Value: *att}
+---
+Resources:
+  Other: {Type: 'AWS::S3::Bucket', Properties: {Value: *ref}}
+"#,
+            ),
+            (
+                ".gitlab-ci.yml",
+                r#"
+.base: {script: echo base}
+.shared: {script: &ref !reference [.base, script]}
+one: {script: *ref}
+two: {script: [*ref, *ref]}
+"#,
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        for source in ["cfn resource: One", "cfn resource: Two", "cfn output: Arn"] {
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|(_, s, d, _)| s == source && d == "cfn resource: Bucket")
+                    .count(),
+                1,
+                "{edges:?}"
+            );
+        }
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, s, d, _)| s == "cfn resource: Other" && d == "cfn resource: Bucket")
+        );
+        for source in ["gitlab job: one", "gitlab job: two"] {
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|(_, s, d, _)| s == source && d == "gitlab job: .base")
+                    .count(),
+                1,
+                "{edges:?}"
+            );
+        }
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
         let _ = std::fs::remove_dir_all(root);
     }
 
