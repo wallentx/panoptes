@@ -37,9 +37,7 @@ fn reserved(name: &str) -> bool {
     )
 }
 fn root_file(path: &str) -> bool {
-    Path::new(path)
-        .file_name()
-        .is_some_and(|s| s == ".gitlab-ci.yml" || s == ".gitlab-ci.yaml")
+    matches!(path, ".gitlab-ci.yml" | ".gitlab-ci.yaml")
 }
 fn external(ex: &mut Extracted, from: Option<usize>, name: String) {
     ex.imports.push(name.clone());
@@ -149,6 +147,17 @@ pub fn enrich<'a>(
     included: bool,
 ) {
     if ex.automation.dialect != Dialect::Generic {
+        return;
+    }
+    // A nested conventional filename supplies no root-pipeline context. It can
+    // still be activated by a local include or a child-pipeline trigger.
+    if !included
+        && !root_file(path)
+        && Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(root_file)
+    {
         return;
     }
     for doc in yaml::children(root).filter(|n| n.kind() == "document") {

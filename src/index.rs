@@ -3030,6 +3030,48 @@ child:
     }
 
     #[test]
+    fn gitlab_nested_conventional_names_require_include_context() {
+        let pipeline =
+            "include: included/.gitlab-ci.yml\nconsumer: {script: echo test, extends: .base}\n";
+        let nested = ".base: {image: alpine}\nnested: {script: echo nested, extends: .base}\n";
+        let (mut db, root) = fixture(&[
+            (".gitlab-ci.yml", pipeline),
+            ("included/.gitlab-ci.yml", nested),
+            ("unrelated/.gitlab-ci.yml", nested),
+            (
+                "unrelated/.gitlab-ci.yaml",
+                "include: https://example.org/unused.yml\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges.iter().any(|(_, s, d, p)| s == "gitlab job: consumer"
+                && d == "gitlab job: .base"
+                && p == "included/.gitlab-ci.yml"),
+            "{edges:?}"
+        );
+        assert!(!edges.iter().any(|(p, _, _, _)| p.starts_with("unrelated/")));
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(
+            root.join(".gitlab-ci.yml"),
+            "consumer: {script: echo test}\n",
+        )
+        .unwrap();
+        build(&mut db, &root).unwrap();
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(p, _, _, _)| p == "included/.gitlab-ci.yml")
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        std::fs::write(root.join(".gitlab-ci.yml"), pipeline).unwrap();
+        build(&mut db, &root).unwrap();
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn gitlab_remote_includes_duplicates_and_runtime_targets_are_conservative() {
         let (db, root) = fixture(&[
             (
