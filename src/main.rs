@@ -1034,10 +1034,7 @@ fn main() -> Result<()> {
         Cmd::Upgrade => {
             println!("panoptes does not download or execute updates itself.");
             println!("Update through the same package or source method used for this binary.");
-            println!("Inspect-first checkout: git pull --ff-only, then ./install.sh");
-            println!(
-                "Direct Cargo install: cargo install --git https://github.com/wallentx/panoptes.git --branch main --locked --root \"$HOME/.local\" panoptes"
-            );
+            println!("Source checkout: git pull --ff-only && git fetch --tags && ./install.sh");
         }
 
         Cmd::Viz {

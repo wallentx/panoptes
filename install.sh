@@ -55,6 +55,8 @@ if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; the
     exit 1
 fi
 
+sh "$repo_dir/scripts/sync-version.sh"
+
 mkdir -p "$install_root"
 install_root=$(CDPATH='' cd -- "$install_root" && pwd)
 git_sha=source-build

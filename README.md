@@ -88,7 +88,13 @@ cd panoptes
 ./install.sh
 ```
 
-For source installations, make sure `~/.local/bin` is on `PATH`.
+For source installations, make sure `~/.local/bin` is on `PATH`. The installer
+sets Cargo's package version from local Git tags: `v1.0.1` builds as `1.0.1`,
+and later commits build as `1.0.2-g<short-hash>`. It uses the nearest reachable
+SemVer tag, so tags on unrelated branches do not affect the installed version.
+Gitless archives or checkouts without release tags retain the manifest version.
+The installer updates only the package version in `Cargo.toml` and `Cargo.lock`;
+it does not fetch tags. Use `git fetch --tags` to refresh locally available tags.
 
 ### Connect coding agents (optional)
 

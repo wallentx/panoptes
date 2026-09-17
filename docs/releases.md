@@ -31,6 +31,7 @@ continues to use the source installer; a Linux archive is not an Android binary.
 Rust with rustfmt/Clippy, Bash, jq, Git, and a C compiler are required.
 
 ```sh
+sh scripts/sync-version.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
@@ -42,7 +43,16 @@ On Termux, set `CARGO_BUILD_JOBS=1` before compiling to limit memory use. Run
 `actionlint` when editing workflows. The smoke script isolates its repository,
 database, and provider configuration in temporary directories.
 
-To package the current Cargo version for your host:
+Cargo itself reads a static manifest version. The installer, CI, and packaging
+script synchronize it before invoking Cargo; for direct Cargo commands, run
+`scripts/sync-version.sh` with `sh` first. An exact SemVer tag supplies its version.
+Commits after that tag use the next patch version plus `-g<short-hash>` (for
+example, `1.0.2-g0123abcd` after `v1.0.1`). The `g` prefix keeps numeric hashes valid
+SemVer prerelease identifiers. Only reachable local tags participate; no tags or
+Git metadata means the manifest version is retained. Synchronization updates the
+root package in both Cargo files without changing dependency versions.
+
+To package the Git-derived version for your host:
 
 ```sh
 bash scripts/package-release.sh release
@@ -89,13 +99,18 @@ publication jobs. Branch protections are respected; it never force-pushes.
 If tests or builds fail after version preparation, the version commit remains
 on `main`, but no new release is published. Fix the failure and rerun with the
 same explicit version. Existing tags are rebuilt at their original commit;
-their Cargo versions must already match. A tag that moves during a build causes
-publication to fail. Existing release assets may be replaced on a successful
+the requested tag supplies the package version in each temporary build checkout,
+even if its committed manifest has an older version. This changes only version
+metadata, not the source tag. The checks and builds receive the same version
+input. A tag that moves during a build causes publication to fail. Existing release assets may be replaced on a successful
 rerun of the same tag.
 
 Publishing a release manually on GitHub also starts the asset pipeline. Because
-that tag already exists, this path validates its Cargo version instead of
-changing source. Prefer the manual workflow when the version needs updating.
+that tag already exists, this path applies its version to the build checkouts
+without moving the tag. Prefer the manual workflow to also commit the version
+to the default branch before creating a new tag. To rebuild an older release
+with the current workflow, dispatch the workflow from `main` with its exact tag;
+rerunning an old workflow run uses that run's original workflow definition.
 SemVer prerelease tags such as `v0.2.0-rc.1` create prereleases.
 
 ## Update Homebrew

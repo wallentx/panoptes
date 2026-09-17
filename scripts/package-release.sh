@@ -6,6 +6,11 @@ cd "$repo_dir"
 output_dir=${1:-"$repo_dir/release"}
 mkdir -p "$output_dir"
 output_dir=$(cd "$output_dir" && pwd)
+if [ -n "${RELEASE_TAG:-}" ]; then
+  sh "$repo_dir/scripts/sync-version.sh" --version "$RELEASE_TAG"
+else
+  sh "$repo_dir/scripts/sync-version.sh"
+fi
 metadata=$(cargo metadata --no-deps --format-version 1 --locked)
 version=$(jq -er '.packages[] | select(.name == "panoptes") | .version' <<< "$metadata")
 target_dir=$(jq -er .target_directory <<< "$metadata")
