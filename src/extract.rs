@@ -1068,6 +1068,7 @@ fn extract_compiled(
         crate::compose::enrich(root, &yaml, path, &mut extracted);
         crate::kubernetes::enrich(root, &yaml, &mut extracted);
         crate::kustomize::enrich(root, &yaml, path, &mut extracted);
+        crate::gitlab_ci::enrich(root, &yaml, path, &mut extracted);
     }
     Ok(extracted)
 }

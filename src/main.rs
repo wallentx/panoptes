@@ -12,6 +12,7 @@ mod db;
 mod export;
 mod extract;
 mod github_actions;
+mod gitlab_ci;
 mod index;
 mod init;
 mod kubernetes;

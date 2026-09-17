@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-9";
+pub const EXTRACTOR_STAMP: &str = "panoptes-10";
 
 pub struct BuildStats {
     pub files: usize,
@@ -301,7 +301,13 @@ pub fn build_with_jobs(
 
     let mut external: HashMap<String, i64> = HashMap::new();
     let go_module = go_module_path(root);
+    let active_gitlab = crate::gitlab_ci::active_paths(&pending);
     for file in &pending {
+        if file.extracted.automation.dialect == crate::yaml::Dialect::GitLab
+            && !active_gitlab.contains(file.rel.as_str())
+        {
+            continue;
+        }
         for spec in &file.extracted.imports {
             let mut targets = resolve_import(
                 &file.rel,
@@ -412,6 +418,9 @@ pub fn build_with_jobs(
     let kustomize = crate::kustomize::resolve(&pending, &file_symbol);
     automation.edges.extend(kustomize.edges);
     automation.unresolved += kustomize.unresolved;
+    let gitlab = crate::gitlab_ci::resolve(&pending, &file_symbol, &external);
+    automation.edges.extend(gitlab.edges);
+    automation.unresolved += gitlab.unresolved;
     unresolved += automation.unresolved;
     for (from, target, kind) in automation.edges {
         n_edges += insert_edge.execute(rusqlite::params![repo_id, from, target, kind])?;
@@ -2671,6 +2680,98 @@ configMapGenerator:
         assert!(!edges.iter().any(
             |(_, s, d, _)| s.starts_with("patch: patches#") && d == "ConfigMap: default/config"
         ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gitlab_includes_templates_needs_artifacts_and_child_pipeline_scopes() {
+        let (mut db, root) = fixture(&[
+            (
+                ".gitlab-ci.yml",
+                r#"
+include: [{local: ci/jobs.yml}, {local: ci/templates.yml}]
+stages: [build, test]
+consumer:
+  stage: test
+  needs: [{job: build, artifacts: true}]
+  dependencies: [build]
+  script: echo test
+child:
+  trigger: {include: [{local: ci/child.yml}]}
+"#,
+            ),
+            (
+                "ci/jobs.yml",
+                "build:\n  stage: build\n  extends: .base\n  script:\n    - !reference [.commands, script]\n",
+            ),
+            (
+                "ci/templates.yml",
+                ".base: {image: alpine}\n.commands: {script: echo build}\ndefault: {before_script: echo prepare}\n",
+            ),
+            ("ci/child.yml", "build: {script: echo child}\n"),
+            ("other.yml", "build: {script: echo unrelated}\n"),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        assert!(has("gitlab job: build", "gitlab job: .base"), "{edges:?}");
+        assert!(has("gitlab job: build", "gitlab job: .commands"));
+        assert!(has("gitlab job: build", "gitlab stage: build"));
+        assert!(has("gitlab job: consumer", "gitlab default"));
+        assert!(has("gitlab job: child", "ci/child.yml"));
+        let needs: Vec<_> = edges
+            .iter()
+            .filter(|(_, s, d, _)| s == "gitlab job: consumer" && d == "gitlab job: build")
+            .collect();
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].3, "ci/jobs.yml");
+        assert!(
+            !edges
+                .iter()
+                .any(|(p, _, d, _)| p == "ci/child.yml" && d == "gitlab default")
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gitlab_remote_includes_duplicates_and_runtime_targets_are_conservative() {
+        let (db, root) = fixture(&[
+            (
+                ".gitlab-ci.yml",
+                r#"
+include:
+  - local: one.yml
+  - local: two.yml
+  - project: team/templates
+    ref: v1
+    file: [ci.yml]
+  - remote: https://example.org/ci.yml
+consumer:
+  script: echo test
+  needs: [build, '$TARGET', {job: build, project: another, ref: main}]
+  inherit: {default: false}
+  extends: '$TEMPLATE'
+"#,
+            ),
+            (
+                "one.yml",
+                "build: {script: echo one}\ndefault: {image: alpine}\n",
+            ),
+            ("two.yml", "build: {script: echo two}\n"),
+            ("plain.yml", "include: https://example.org/not-ci.yml\n"),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(edges.iter().any(|(p,_,d,_)|p==".gitlab-ci.yml"&&d=="gitlab:team/templates@v1:ci.yml"));
+        assert!(
+            edges.iter().any(|(p, _, d, _)| p == ".gitlab-ci.yml"
+                && d == "gitlab:remote:https://example.org/ci.yml")
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(p, s, _, _)| p == "plain.yml" || s == "gitlab job: consumer")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

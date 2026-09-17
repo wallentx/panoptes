@@ -25,6 +25,7 @@ pub enum Dialect {
     Compose,
     Kubernetes,
     Kustomize,
+    GitLab,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +40,7 @@ pub struct Link {
 pub enum Target {
     /// A uniquely named definition in this file only.
     Local(String),
+    External(String),
     KustomizeResource(Vec<String>),
     Patch {
         path: Option<String>,

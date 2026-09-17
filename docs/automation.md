@@ -164,3 +164,22 @@ resources before transformations. Generator inputs must already be indexed sourc
 files to become file nodes.
 
 See the [Kustomize guide](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/kustomization/).
+
+## GitLab CI
+
+`.gitlab-ci.yml` and recognizable CI fragments expose jobs, hidden templates,
+declared stages, and defaults. `extends`, `needs`, artifact `dependencies`, and
+`!reference` link to definitions in the same pipeline's local include graph.
+Included sibling files share that scope. `inherit: {default: false}` suppresses
+the default dependency. Child-pipeline includes link to separate pipeline files;
+the child's jobs do not enter the parent's name lookup.
+
+Local includes are repository-root relative. Remote, project, template, component,
+and project-pipeline references remain external nodes; no remote content is
+fetched. Include-only fragments become active when reached from a CI root/job
+file. Duplicate job/default names remain ambiguous instead of emulating GitLab's
+cross-file deep merge. Include globs, variables, input interpolation, matrices,
+rules evaluation, and cross-project/pipeline `needs` are not expanded.
+
+See GitLab's [includes](https://docs.gitlab.com/ci/yaml/includes/) and
+[configuration reuse](https://docs.gitlab.com/ci/yaml/yaml_optimization/) references.
