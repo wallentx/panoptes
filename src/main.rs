@@ -5,16 +5,24 @@
 //! toplevel. MCP creates missing indexes when a provider connects; direct CLI reads report a
 //! directory that has never been indexed rather than answering from an empty graph.
 
+mod ansible;
 mod ask;
+mod cloudformation;
+mod compose;
 mod db;
 mod export;
 mod extract;
+mod github_actions;
+mod gitlab_ci;
 mod index;
 mod init;
+mod kubernetes;
+mod kustomize;
 mod mcp;
 mod repo;
 mod search;
 mod viz;
+mod yaml;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};

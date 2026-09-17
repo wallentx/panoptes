@@ -63,6 +63,8 @@ pub struct Extracted {
     pub parents: Vec<Option<usize>>,
     /// Module specifiers this file imports, verbatim (`./stats.js`, `node:fs`).
     pub imports: Vec<String>,
+    #[serde(default)]
+    pub automation: crate::yaml::Automation,
 }
 
 /// Definition shapes. `@name` is the identifier stored; the outer capture is the
@@ -238,21 +240,6 @@ const YAML_DEFS: &str = r#"
 (anchor (anchor_name) @name) @def
 "#;
 
-const YAML_CALLS: &str = r#"
-(alias (alias_name) @callee)
-"#;
-
-const YAML_IMPORTS: &str = r#"
-(block_mapping_pair
-  key: (_) @_key
-  value: (_) @spec
-  (#eq? @_key "uses"))
-(flow_pair
-  key: (_) @_key
-  value: (_) @spec
-  (#eq? @_key "uses"))
-"#;
-
 const HCL_DEFS: &str = r#"
 (block . (identifier) @name) @def
 (attribute (identifier) @name) @def
@@ -308,9 +295,9 @@ fn queries(lang: Lang) -> Queries {
         },
         Lang::Yaml => Queries {
             defs: YAML_DEFS,
-            calls: Some(YAML_CALLS),
+            calls: None,
             bindings: None,
-            imports: Some(YAML_IMPORTS),
+            imports: None,
         },
         Lang::Hcl => Queries {
             defs: HCL_DEFS,
@@ -391,7 +378,32 @@ impl Extractor {
         }
     }
 
+    #[cfg(test)]
     pub fn extract(&mut self, lang: Lang, src: &str) -> Result<Extracted> {
+        self.extract_file(lang, src, "")
+    }
+
+    pub fn extract_file(&mut self, lang: Lang, src: &str, path: &str) -> Result<Extracted> {
+        self.extract_context(lang, src, path, false, false)
+    }
+
+    /// Local CI includes supply format context for otherwise generic YAML.
+    pub fn extract_gitlab_include(&mut self, src: &str, path: &str) -> Result<Extracted> {
+        self.extract_context(Lang::Yaml, src, path, true, false)
+    }
+
+    pub fn extract_ansible_tasks(&mut self, src: &str, path: &str) -> Result<Extracted> {
+        self.extract_context(Lang::Yaml, src, path, false, true)
+    }
+
+    fn extract_context(
+        &mut self,
+        lang: Lang,
+        src: &str,
+        path: &str,
+        gitlab_include: bool,
+        ansible_tasks: bool,
+    ) -> Result<Extracted> {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.compiled.entry(lang) {
             entry.insert(CompiledExtractor::new(lang)?);
         }
@@ -401,6 +413,9 @@ impl Extractor {
                 .context("compiled extractor missing after insertion")?,
             lang,
             src,
+            path,
+            gitlab_include,
+            ansible_tasks,
         )
     }
 }
@@ -719,7 +734,14 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
     Extractor::new().extract(lang, src)
 }
 
-fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> Result<Extracted> {
+fn extract_compiled(
+    compiled: &mut CompiledExtractor,
+    lang: Lang,
+    src: &str,
+    path: &str,
+    gitlab_include: bool,
+    ansible_tasks: bool,
+) -> Result<Extracted> {
     let tree = compiled
         .parser
         .parse(src, None)
@@ -1039,14 +1061,41 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
         }
     }
 
-    Ok(Extracted {
+    let mut extracted = Extracted {
         symbols,
         calls,
         bindings,
         containers,
         parents,
         imports,
-    })
+        automation: Default::default(),
+    };
+    if lang == Lang::Yaml {
+        let yaml = crate::yaml::Yaml::new(root, src);
+        // Alias bindings are document-local and point to the most recent anchor.
+        // Preserve those exact origins rather than resolving anchor names globally.
+        extracted.calls.clear();
+        for (alias, anchor) in &yaml.aliases {
+            if let Some(index) = spans
+                .iter()
+                .position(|&(start, end)| start == anchor.start_byte() && end == anchor.end_byte())
+            {
+                extracted.automation.links.push(crate::yaml::Link {
+                    from: owner_at(alias.start_byte()),
+                    scope: None,
+                    target: crate::yaml::Target::Symbol(index),
+                });
+            }
+        }
+        crate::ansible::enrich(root, &yaml, path, &mut extracted, ansible_tasks);
+        crate::github_actions::enrich(root, &yaml, path, &mut extracted);
+        crate::compose::enrich(root, &yaml, path, &mut extracted);
+        crate::kubernetes::enrich(root, &yaml, &mut extracted);
+        crate::kustomize::enrich(root, &yaml, path, &mut extracted);
+        crate::gitlab_ci::enrich(root, &yaml, path, &mut extracted, gitlab_include);
+        crate::cloudformation::enrich(root, &yaml, path, &mut extracted);
+    }
+    Ok(extracted)
 }
 
 /// Resolve bare callee names against the whole-repo symbol index.
@@ -1456,7 +1505,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
 "#;
-        let e = extract(Lang::Yaml, src).unwrap();
+        let e = Extractor::new()
+            .extract_file(Lang::Yaml, src, ".github/workflows/ci.yml")
+            .unwrap();
         let names: Vec<_> = e
             .symbols
             .iter()
@@ -1469,15 +1520,11 @@ jobs:
             "{names:?}"
         );
         assert!(names.contains(&("linux", "anchor")), "{names:?}");
-        assert!(
-            e.calls.iter().any(|call| call.callee == "linux"),
-            "{:?}",
-            e.calls
-        );
-        assert_eq!(
-            e.imports,
-            ["actions/checkout@v4", "./.github/actions/setup"]
-        );
+        assert!(e.automation.links.iter().any(|link| matches!(link.target,
+            crate::yaml::Target::Symbol(i) if e.symbols[i].name == "linux")));
+        assert_eq!(e.imports, ["actions/checkout@v4"]);
+        assert!(e.automation.links.iter().any(|link| matches!(&link.target,
+            crate::yaml::Target::Action { spec, .. } if spec == "./.github/actions/setup")));
     }
 
     #[test]

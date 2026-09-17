@@ -32,6 +32,9 @@ pub enum Lang {
 
 impl Lang {
     pub fn of_path(p: &Path) -> Option<Lang> {
+        if p.file_name().is_some_and(|name| name == "Kustomization") {
+            return Some(Lang::Yaml);
+        }
         match p.extension()?.to_str()? {
             // .d.ts carries no bodies and no call edges — only re-declarations of
             // symbols that already exist elsewhere. Indexing it produces duplicate

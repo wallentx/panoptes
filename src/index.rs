@@ -12,7 +12,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "panoptes-3";
+pub const EXTRACTOR_STAMP: &str = "panoptes-16";
 
 pub struct BuildStats {
     pub files: usize,
@@ -117,13 +117,13 @@ struct ExistingFile {
     size: i64,
 }
 
-struct Pending {
-    rel: String,
-    lang: Lang,
-    file_id: i64,
-    file_symbol: i64,
-    symbol_ids: Vec<i64>,
-    extracted: extract::Extracted,
+pub(crate) struct Pending {
+    pub(crate) rel: String,
+    pub(crate) lang: Lang,
+    pub(crate) file_id: i64,
+    pub(crate) file_symbol: i64,
+    pub(crate) symbol_ids: Vec<i64>,
+    pub(crate) extracted: extract::Extracted,
 }
 
 /// Incrementally index `root` into `db`.
@@ -241,11 +241,29 @@ pub fn build_with_jobs(
     for (index, extracted) in parsed_files {
         pending[index] = Some(index_extracted(&tx, repo_id, &files[index], extracted)?);
     }
-    let pending: Vec<Pending> = pending
+    let mut pending: Vec<Pending> = pending
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .context("missing extraction after parallel parse")?;
-    let parsed = changed.len();
+    let mut parsed = changed.len();
+    let mut context_changed = crate::ansible::contextualize(&mut pending, &files)?;
+    context_changed.extend(crate::gitlab_ci::contextualize(&mut pending, &files)?);
+    context_changed.sort_unstable();
+    context_changed.dedup();
+    for index in context_changed {
+        // Include reachability is a cache input independent of the file hash.
+        tx.execute("delete from files where id=?1", [pending[index].file_id])?;
+        pending[index] = index_extracted(
+            &tx,
+            repo_id,
+            &files[index],
+            pending[index].extracted.clone(),
+        )?;
+        if changed.binary_search(&index).is_err() {
+            parsed += 1;
+            reused -= 1;
+        }
+    }
 
     let mut by_name: HashMap<String, Vec<i64>> = HashMap::new();
     let mut hcl_by_dir: HashMap<&Path, HashMap<String, Vec<i64>>> = HashMap::new();
@@ -301,7 +319,13 @@ pub fn build_with_jobs(
 
     let mut external: HashMap<String, i64> = HashMap::new();
     let go_module = go_module_path(root);
+    let active_gitlab = crate::gitlab_ci::active_paths(&pending);
     for file in &pending {
+        if file.extracted.automation.dialect == crate::yaml::Dialect::GitLab
+            && !active_gitlab.contains(file.rel.as_str())
+        {
+            continue;
+        }
         for spec in &file.extracted.imports {
             let mut targets = resolve_import(
                 &file.rel,
@@ -373,6 +397,20 @@ pub fn build_with_jobs(
                 hcl_by_dir
                     .get(directory)
                     .and_then(|names| resolve_hcl_callee(names, from_id, &call.callee))
+            } else if file.lang == Lang::Yaml {
+                let matches: Vec<_> = file
+                    .extracted
+                    .symbols
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, symbol)| symbol.kind == "anchor" && symbol.name == call.callee)
+                    .map(|(index, _)| file.symbol_ids[index])
+                    .collect();
+                if let [only] = matches.as_slice() {
+                    Some(*only)
+                } else {
+                    None
+                }
             } else {
                 extract::resolve(&by_name, from_id, &call.callee)
             } {
@@ -383,6 +421,30 @@ pub fn build_with_jobs(
                 None => unresolved += 1,
             }
         }
+    }
+
+    let mut automation = crate::ansible::resolve(&pending, &file_symbol);
+    let actions = crate::github_actions::resolve(&pending, &file_symbol, &external);
+    automation.edges.extend(actions.edges);
+    automation.unresolved += actions.unresolved;
+    let compose = crate::compose::resolve(&pending, &file_symbol);
+    automation.edges.extend(compose.edges);
+    automation.unresolved += compose.unresolved;
+    let kube = crate::kubernetes::resolve(&pending);
+    automation.edges.extend(kube.edges);
+    automation.unresolved += kube.unresolved;
+    let kustomize = crate::kustomize::resolve(&pending, &file_symbol);
+    automation.edges.extend(kustomize.edges);
+    automation.unresolved += kustomize.unresolved;
+    let gitlab = crate::gitlab_ci::resolve(&pending, &file_symbol, &external);
+    automation.edges.extend(gitlab.edges);
+    automation.unresolved += gitlab.unresolved;
+    let cloudformation = crate::cloudformation::resolve(&pending);
+    automation.edges.extend(cloudformation.edges);
+    automation.unresolved += cloudformation.unresolved;
+    unresolved += automation.unresolved;
+    for (from, target, kind) in automation.edges {
+        n_edges += insert_edge.execute(rusqlite::params![repo_id, from, target, kind])?;
     }
 
     drop(insert_edge);
@@ -499,7 +561,7 @@ fn extract_changed(
             .iter()
             .map(|&index| {
                 extractor
-                    .extract(files[index].lang, &files[index].text)
+                    .extract_file(files[index].lang, &files[index].text, &files[index].rel)
                     .with_context(|| format!("extract {}", files[index].rel))
                     .map(|extracted| (index, extracted))
             })
@@ -516,7 +578,11 @@ fn extract_changed(
                         .iter()
                         .map(|&index| {
                             extractor
-                                .extract(files[index].lang, &files[index].text)
+                                .extract_file(
+                                    files[index].lang,
+                                    &files[index].text,
+                                    &files[index].rel,
+                                )
                                 .with_context(|| format!("extract {}", files[index].rel))
                                 .map(|extracted| (index, extracted))
                         })
@@ -761,19 +827,9 @@ fn resolve_import(
             ids.sort_unstable();
             return ids;
         }
-        Lang::Yaml => {
-            if !spec.starts_with('.') {
-                return Vec::new();
-            }
-            // GitHub Actions resolves local `uses:` paths from the repository
-            // root, not from the workflow file's directory.
-            let path = normalize_path(Path::new(spec));
-            vec![
-                path.clone(),
-                format!("{path}/action.yml"),
-                format!("{path}/action.yaml"),
-            ]
-        }
+        // Local YAML automation links have context-specific resolution rules.
+        // The plain imports list contains only external action references.
+        Lang::Yaml => return Vec::new(),
     };
     for candidate in candidates {
         if let Some(&id) = files.get(&candidate) {
@@ -1172,28 +1228,37 @@ pub fn callers_scoped(
             and (?3 is null or lower(s.container) in (lower(?3), lower(?4)))
           order by f.path, s.start_line",
     )?;
-    let seeds: Vec<Seed> = seeds_stmt
-        .query_map(
-            rusqlite::params![repo_id, name, container, container_tail],
-            |r| {
-                Ok(Seed {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    kind: r.get(2)?,
-                    path: r.get(3)?,
-                    start_line: r.get(4)?,
-                    end_line: r.get(5)?,
+    let mut lookup =
+        |name: &str, container: Option<&str>, container_tail: Option<&str>| -> Result<Vec<Seed>> {
+            Ok(seeds_stmt
+                .query_map(
+                    rusqlite::params![repo_id, name, container, container_tail],
+                    |r| {
+                        Ok(Seed {
+                            id: r.get(0)?,
+                            name: r.get(1)?,
+                            kind: r.get(2)?,
+                            path: r.get(3)?,
+                            start_line: r.get(4)?,
+                            end_line: r.get(5)?,
+                        })
+                    },
+                )?
+                .filter_map(|row| match row {
+                    Ok(seed) if scope.is_none_or(|scope| path_in_scope(&seed.path, scope)) => {
+                        Some(Ok(seed))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
                 })
-            },
-        )?
-        .filter_map(|row| match row {
-            Ok(seed) if scope.is_none_or(|scope| path_in_scope(&seed.path, scope)) => {
-                Some(Ok(seed))
-            }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<_, _>>()?;
+                .collect::<Result<_, _>>()?)
+        };
+    // YAML, automation, and HCL definitions use literal dotted names. Prefer
+    // an exact definition before interpreting dots as class qualification.
+    let mut seeds = lookup(qualified_name, None, None)?;
+    if seeds.is_empty() && container.is_some() {
+        seeds = lookup(name, container, container_tail)?;
+    }
 
     let (from_col, to_col) = if out {
         ("src_symbol_id", "dst_symbol_id")
@@ -1723,6 +1788,1605 @@ mod tests {
             .unwrap();
         assert_eq!(calls, 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn automation_edges(db: &Connection) -> Vec<(String, String, String, String)> {
+        db.prepare(
+            "select sf.path, src.name, dst.name, df.path from edges e
+            join symbols src on src.id=e.src_symbol_id join files sf on sf.id=src.file_id
+            join symbols dst on dst.id=e.dst_symbol_id join files df on df.id=dst.file_id
+            where e.kind in ('calls', 'imports') order by sf.path,src.name,dst.name,df.path",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    #[test]
+    fn ansible_imports_roles_handlers_and_cache_refresh() {
+        let (mut db, root) = fixture(&[
+            (
+                "site.yml",
+                r#"
+- name: Configure web
+  hosts: all
+  roles: [web]
+  vars_files: [vars/common.yml]
+  tasks:
+    - name: Load more
+      ansible.builtin.import_tasks: {file: tasks/more.yml}
+    - name: Change config
+      copy: {src: a, dest: b}
+      notify: [restart, reload services]
+    - name: Nested
+      block:
+        - name: Load vars
+          include_vars: vars/extra.yaml
+      rescue:
+        - name: Recover
+          import_role: {name: recovery, tasks_from: repair}
+  handlers:
+    - name: Local listener
+      debug: {msg: done}
+      listen: reload services
+"#,
+            ),
+            ("vars/common.yml", "port: 80\n"),
+            ("vars/extra.yaml", "enabled: true\n"),
+            (
+                "tasks/more.yml",
+                "- name: Included task\n  debug: {msg: changed}\n  notify: restart\n",
+            ),
+            (
+                "roles/web/tasks/main.yml",
+                "- name: Setup\n  import_tasks: install.yml\n",
+            ),
+            (
+                "roles/web/tasks/install.yml",
+                "- name: Install\n  package: {name: nginx}\n",
+            ),
+            (
+                "roles/web/handlers/main.yml",
+                "- name: restart\n  service: {name: nginx, state: restarted}\n  listen: reload services\n",
+            ),
+            (
+                "roles/web/meta/main.yml",
+                "dependencies: [{role: common}]\n",
+            ),
+            (
+                "roles/common/tasks/main.yaml",
+                "- name: Common\n  debug: {msg: ready}\n",
+            ),
+            (
+                "roles/recovery/tasks/repair.yml",
+                "- name: Repair\n  debug: {msg: ready}\n",
+            ),
+            (
+                "roles/recovery/tasks/main.yml",
+                "- debug: {msg: should not load}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |source: &str, target: &str| {
+            edges.iter().any(|(_, s, d, _)| s == source && d == target)
+        };
+        assert!(
+            has("play: Configure web", "roles/web/tasks/main.yml"),
+            "{edges:?}"
+        );
+        assert!(has("play: Configure web", "vars/common.yml"));
+        assert!(has("task: Load more", "tasks/more.yml"));
+        assert!(has("task: Load vars", "vars/extra.yaml"));
+        assert!(has("task: Setup", "roles/web/tasks/install.yml"));
+        assert!(has(
+            "roles/web/meta/main.yml",
+            "roles/common/tasks/main.yaml"
+        ));
+        assert!(has("task: Recover", "roles/recovery/tasks/repair.yml"));
+        assert!(!has("task: Recover", "roles/recovery/tasks/main.yml"));
+        assert!(has("task: Change config", "handler: restart"));
+        assert!(has("task: Change config", "handler: Local listener"));
+        assert!(has("task: Included task", "handler: restart"));
+        let repo = repo_id_of(&db, &root).unwrap().unwrap();
+        let (_, reached) = callers(&db, repo, "play: Configure web", true, 8).unwrap();
+        assert!(reached.iter().any(|r| r.name == "handler: restart"));
+        let stats = build(&mut db, &root).unwrap();
+        assert_eq!(stats.parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(
+            root.join("roles/web/handlers/main.yml"),
+            "- name: renamed\n  debug: {msg: done}\n",
+        )
+        .unwrap();
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 1);
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, _, dst, _)| dst == "handler: restart")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ansible_handler_names_are_scoped_to_plays_and_reachable_roles() {
+        let (db, root) = fixture(&[
+            (
+                "site.yml",
+                r#"
+- hosts: web
+  roles: [web]
+  tasks:
+    - name: Web change
+      debug: {msg: changed}
+      notify: restart
+- hosts: db
+  roles: [database]
+  tasks:
+    - name: DB change
+      debug: {msg: changed}
+      notify: restart
+- hosts: empty
+  tasks:
+    - name: No handler
+      debug: {msg: changed}
+      notify: restart
+"#,
+            ),
+            (
+                "roles/web/handlers/main.yml",
+                "- name: restart\n  debug: {msg: web}\n",
+            ),
+            (
+                "roles/database/handlers/main.yml",
+                "- name: restart\n  debug: {msg: db}\n",
+            ),
+            (
+                "unrelated.yml",
+                "- hosts: all\n  handlers:\n    - name: restart\n      debug: {msg: unrelated}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let targets = |task: &str| {
+            edges
+                .iter()
+                .filter(|(_, s, d, _)| s == task && d == "handler: restart")
+                .map(|(_, _, _, p)| p.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(targets("task: Web change"), ["roles/web/handlers/main.yml"]);
+        assert_eq!(
+            targets("task: DB change"),
+            ["roles/database/handlers/main.yml"]
+        );
+        assert!(targets("task: No handler").is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ansible_static_paths_are_local_and_dynamic_targets_are_not_guessed() {
+        let (db, root) = fixture(&[
+            (
+                "playbooks/site.yaml",
+                r#"
+- ansible.builtin.import_playbook: child.yml
+- hosts: all
+  roles: [web, acme.demo.tools]
+  tasks:
+    - name: Dynamic
+      import_tasks: '{{ chosen }}.yml'
+    - name: Escape
+      import_tasks: ../../escape.yml
+    - name: Foreign module
+      example.custom.import_tasks: child.yml
+"#,
+            ),
+            ("playbooks/child.yml", "- hosts: all\n  tasks: []\n"),
+            ("escape.yml", "- debug: {msg: unrelated}\n"),
+            (
+                "playbooks/roles/web/tasks/main.yml",
+                "- debug: {msg: local}\n",
+            ),
+            ("roles/web/tasks/main.yml", "- debug: {msg: root}\n"),
+            (
+                "collections/ansible_collections/acme/demo/roles/tools/tasks/main.yaml",
+                "- debug: {msg: collection}\n",
+            ),
+            (
+                "config.yml",
+                "name: app\nnotify: restart\nroles: [web]\ninclude_tasks: escape.yml\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "playbooks/site.yaml" && d == "playbooks/child.yml")
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "play: all" && d == "playbooks/roles/web/tasks/main.yml")
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, s, d, _)| s == "play: all" && d == "roles/web/tasks/main.yml")
+        );
+        assert!(edges.iter().any(|(_, _, d, _)| d
+            == "collections/ansible_collections/acme/demo/roles/tools/tasks/main.yaml"));
+        assert!(!edges.iter().any(|(p, s, _, _)| p == "config.yml"
+            || ["task: Dynamic", "task: Escape", "task: Foreign module"].contains(&s.as_str())));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ansible_nested_task_files_prefer_siblings_and_retain_role_fallbacks() {
+        let (mut db, root) = fixture(&[
+            (
+                "roles/demo/tasks/nested/main.yml",
+                "- name: Import sibling\n  import_tasks: chosen.yml\n- name: Include sibling\n  include_tasks: chosen.yml\n- name: Include fallback\n  include_tasks: fallback.yml\n- name: Role variables\n  include_vars: chosen.yml\n",
+            ),
+            (
+                "roles/demo/tasks/nested/chosen.yml",
+                "- debug: {msg: sibling}\n",
+            ),
+            ("roles/demo/tasks/chosen.yml", "- debug: {msg: root}\n"),
+            (
+                "roles/demo/tasks/fallback.yml",
+                "- debug: {msg: fallback}\n",
+            ),
+            ("roles/demo/vars/chosen.yml", "message: variables\n"),
+        ]);
+        let edges = automation_edges(&db);
+        for source in ["task: Import sibling", "task: Include sibling"] {
+            let targets: Vec<_> = edges
+                .iter()
+                .filter(|(_, s, _, _)| s == source)
+                .map(|(_, _, _, p)| p.as_str())
+                .collect();
+            assert_eq!(targets, ["roles/demo/tasks/nested/chosen.yml"]);
+        }
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, _, p)| s == "task: Include fallback"
+                    && p == "roles/demo/tasks/fallback.yml")
+        );
+        assert!(
+            edges.iter().any(
+                |(_, s, _, p)| s == "task: Role variables" && p == "roles/demo/vars/chosen.yml"
+            )
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::remove_file(root.join("roles/demo/tasks/nested/chosen.yml")).unwrap();
+        let stats = build(&mut db, &root).unwrap();
+        assert_eq!(stats.parsed, 0);
+        assert_eq!(stats.deleted, 1);
+        let edges = automation_edges(&db);
+        for source in ["task: Import sibling", "task: Include sibling"] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(_, s, _, p)| s == source && p == "roles/demo/tasks/chosen.yml")
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ansible_standalone_roles_listen_fanout_and_duplicate_names() {
+        let (db, root) = fixture(&[
+            (
+                "tasks/main.yml",
+                "- name: Change\n  debug: {msg: changed}\n  notify: [restart, topic]\n",
+            ),
+            (
+                "handlers/main.yml",
+                "- name: restart\n  debug: {msg: one}\n- name: restart\n  debug: {msg: two}\n- name: listener one\n  listen: topic\n  debug: {msg: one}\n- name: listener two\n  listen: [topic]\n  debug: {msg: two}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, s, d, _)| s == "task: Change" && d == "handler: restart")
+        );
+        for listener in ["handler: listener one", "handler: listener two"] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(_, s, d, _)| s == "task: Change" && d == listener),
+                "{edges:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn actions_composites_reusable_workflows_and_outputs_are_traversable() {
+        let (mut db, root) = fixture(&[
+            (
+                ".github/workflows/ci.yml",
+                r#"
+name: CI
+on:
+  workflow_dispatch:
+    inputs:
+      target: {type: string}
+jobs:
+  build:
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - id: package
+        uses: ./.github/actions/package
+        with:
+          target: ${{ inputs.target }}
+      - id: consume
+        if: steps.package.outcome == 'success'
+        run: echo '${{ steps.package.outputs.version }}'
+  deploy:
+    needs: [build]
+    uses: ./.github/workflows/deploy.yaml
+    with:
+      version: ${{ needs.build.outputs.version }}
+  remote:
+    needs: deploy
+    uses: example/ci/.github/workflows/publish.yml@v2
+    with:
+      published: ${{ needs.deploy.outputs.published }}
+"#,
+            ),
+            (
+                ".github/workflows/deploy.yaml",
+                r#"
+on:
+  workflow_call:
+    inputs:
+      version: {type: string}
+    outputs:
+      published:
+        value: ${{ jobs.publish.outputs.result }}
+jobs:
+  publish:
+    outputs:
+      result: ${{ steps.deploy.outputs.result }}
+    steps:
+      - id: deploy
+        uses: docker://alpine:3.22
+        with: {version: '${{ inputs.version }}'}
+"#,
+            ),
+            (
+                ".github/actions/package/action.yml",
+                r#"
+name: Package
+inputs:
+  target: {description: Target}
+outputs:
+  version:
+    value: ${{ steps.build.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - id: setup
+      uses: ./.github/actions/setup
+    - id: build
+      if: steps.setup.outcome == 'success'
+      run: echo '${{ inputs.target }}'
+      shell: bash
+    - uses: actions/upload-artifact@v4
+"#,
+            ),
+            (
+                ".github/actions/setup/action.yaml",
+                "name: Setup\nruns:\n  using: composite\n  steps:\n    - id: checkout\n      uses: actions/checkout@v7\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| {
+            edges
+                .iter()
+                .any(|(_, source, target, _)| source == s && target == d)
+        };
+        assert!(has("job: deploy", "job: build"), "{edges:?}");
+        assert!(has("job: remote", "job: deploy"));
+        assert!(has("job: deploy", "output: job.build.version"));
+        assert!(has("output: job.build.version", "step: build.package"));
+        assert!(has("step: build.consume", "step: build.package"));
+        assert!(has("step: build.package", "input.target"));
+        assert!(has(
+            "step: build.package",
+            ".github/actions/package/action.yml"
+        ));
+        assert!(has("step: setup", ".github/actions/setup/action.yaml"));
+        assert!(has("step: build", "step: setup"));
+        assert!(has("step: build", "input.target"));
+        assert!(has("output: action.version", "step: build"));
+        assert!(has(
+            "output: workflow.published",
+            "output: job.publish.result"
+        ));
+        assert!(has("job: deploy", ".github/workflows/deploy.yaml"));
+        assert!(has(
+            "job: remote",
+            "example/ci/.github/workflows/publish.yml@v2"
+        ));
+        assert!(has("step: publish.deploy", "docker://alpine:3.22"));
+        let repo = repo_id_of(&db, &root).unwrap().unwrap();
+        let (seeds, reached) = callers(&db, repo, "step: build.package", true, 8).unwrap();
+        assert_eq!(seeds.len(), 1, "literal dotted symbol lookup");
+        assert!(
+            reached.iter().any(|r| r.name == "actions/checkout@v7"),
+            "{reached:?}"
+        );
+        let (_, incoming) = callers(&db, repo, "actions/checkout@v7", false, 8).unwrap();
+        assert!(incoming.iter().any(|r| r.name == "job: build"));
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(root.join(".github/actions/setup/action.yaml"), "name: Setup\nruns:\n  using: composite\n  steps:\n    - id: checkout\n      uses: actions/checkout@v8\n").unwrap();
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 1);
+        let edges = automation_edges(&db);
+        assert!(!edges.iter().any(|(_, _, d, _)| d == "actions/checkout@v7"));
+        assert!(edges.iter().any(|(_, _, d, _)| d == "actions/checkout@v8"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn actions_references_are_scoped_and_ignore_literals_comments_and_dynamic_indexes() {
+        let (db, root) = fixture(&[
+            (
+                ".github/workflows/ci.yml",
+                r#"
+jobs:
+  build:
+    steps:
+      - id: setup
+        run: echo ready
+      - id: phantom
+        run: echo present
+      - id: consume
+        if: steps['setup'].outcome == 'success'
+        run: |
+          echo '${{ steps.setup.outputs.x }}'
+          echo "${{ format('steps.phantom.outputs.x needs.ghost.result') }}"
+          echo '${{ steps[inputs.target].outputs.x }}'
+          echo 'steps.phantom.outputs.x'
+        # ${{ steps.phantom.outputs.x }}
+        with:
+          if: steps.phantom.outputs.x
+  other:
+    steps:
+      - id: setup
+        run: echo ready
+      - id: consume
+        if: steps.setup.outcome == 'success'
+  last:
+    steps:
+      - id: consume
+        if: steps.setup.outcome == 'success'
+"#,
+            ),
+            (
+                ".github/workflows/unrelated.yml",
+                "jobs:\n  build:\n    steps:\n      - id: setup\n        run: echo unrelated\n",
+            ),
+            (
+                "config.yml",
+                "jobs:\n  build:\n    needs: other\nuses: ./.github/actions/setup\n",
+            ),
+            (
+                ".github/actions/setup/action.yml",
+                "name: Setup\nruns: {using: composite, steps: []}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|(_, s, _, _)| s == "step: build.consume")
+            .collect();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].2, "step: build.setup");
+        assert_eq!(calls[0].3, ".github/workflows/ci.yml");
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "step: other.consume" && d == "step: other.setup")
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(p, s, _, _)| p == "config.yml" || s == "step: last.consume")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn actions_root_actions_js_entrypoints_and_missing_local_targets() {
+        let (db, root) = fixture(&[
+            (
+                ".github/workflows/ci.yml",
+                r#"
+jobs:
+  build:
+    steps:
+      - id: root
+        uses: ./
+      - id: wrong
+        uses: ./scripts/main.js
+      - id: dynamic
+        uses: ${{ inputs.action }}
+      - id: escape
+        uses: ./../../outside
+  invalid:
+    uses: ./scripts/main.js
+"#,
+            ),
+            (
+                "action.yaml",
+                "name: Root\nruns: {using: node24, main: scripts/main.js, post: scripts/post.js}\n",
+            ),
+            ("scripts/main.js", "export function main() {}\n"),
+            ("scripts/post.js", "export function post() {}\n"),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "step: build.root" && d == "action.yaml"),
+            "{edges:?}"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "action.yaml" && d == "scripts/main.js")
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "action.yaml" && d == "scripts/post.js")
+        );
+        assert!(!edges.iter().any(|(_, s, _, _)| {
+            [
+                "step: build.wrong",
+                "step: build.dynamic",
+                "step: build.escape",
+                "job: invalid",
+            ]
+            .contains(&s.as_str())
+        }));
+        let repo = repo_id_of(&db, &root).unwrap().unwrap();
+        let (seeds, _) = callers(&db, repo, "jobs.build.steps.uses", false, 1).unwrap();
+        assert_eq!(seeds.len(), 4, "existing YAML dotted keys remain queryable");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn actions_reusable_output_consumers_and_ambiguous_steps() {
+        let (db, root) = fixture(&[
+            (
+                ".github/workflows/ci.yml",
+                r#"
+jobs:
+  producer:
+    uses: example/ci/.github/workflows/build.yml@v1
+  consumer:
+    needs: producer
+    steps:
+      - id: consume
+        run: echo '${{ needs.producer.outputs.version }}'
+      - id: duplicate
+        run: echo one
+      - id: duplicate
+        run: echo two
+      - id: ambiguous
+        if: steps.duplicate.outcome == 'success'
+        run: echo unknown
+"#,
+            ),
+            (
+                "action.yml",
+                "- hosts: all\n  tasks:\n    - name: Ansible action\n      debug: {msg: ready}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, _)| s == "step: consumer.consume" && d == "job: producer")
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, s, _, _)| s == "step: consumer.ambiguous")
+        );
+        assert!(edges.iter().any(|(p, s, d, _)| p == "action.yml"
+            && s == "play: all"
+            && d == "task: Ansible action"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compose_services_resources_includes_and_extends_are_scoped() {
+        let (mut db, root) = fixture(&[
+            (
+                "compose.yaml",
+                r#"
+include: [shared/compose.yml]
+services:
+  web:
+    image: nginx
+    depends_on: {db: {condition: service_healthy}}
+    networks: [frontend]
+    volumes: [data:/var/data, './bind:/data', '/anonymous']
+    configs: [{source: settings, target: /settings}]
+    secrets: [password]
+    extends: {file: base/compose.yml, service: base}
+  db:
+    image: postgres
+    volumes: [{type: volume, source: data, target: /var/db}]
+  sidecar:
+    image: busybox
+    network_mode: service:web
+    volumes_from: [db:ro]
+    links: [cache:redis]
+networks:
+  frontend:
+volumes:
+  data:
+configs:
+  settings: {file: config.yml}
+secrets:
+  password: {external: true}
+"#,
+            ),
+            ("shared/compose.yml", "services:\n  cache: {image: redis}\n"),
+            ("base/compose.yml", "services:\n  base: {image: alpine}\n"),
+            ("other/compose.yml", "services:\n  db: {image: unrelated}\n"),
+            ("config.yml", "port: 8080\n"),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        for target in [
+            "service: db",
+            "network: frontend",
+            "volume: data",
+            "config: settings",
+            "secret: password",
+            "service: base",
+        ] {
+            assert!(has("service: web", target), "missing {target}: {edges:?}");
+        }
+        assert!(has("service: db", "volume: data"));
+        assert!(has("service: sidecar", "service: web"));
+        assert!(has("service: sidecar", "service: db"));
+        assert!(has("service: sidecar", "service: cache"));
+        assert!(has("config: settings", "config.yml"));
+        assert!(
+            !edges
+                .iter()
+                .any(|(p, _, _, target)| p == "compose.yaml" && target == "other/compose.yml")
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(
+            root.join("shared/compose.yml"),
+            "services:\n  renamed: {image: redis}\n",
+        )
+        .unwrap();
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 1);
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, _, d, _)| d == "service: cache")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compose_ambiguous_and_interpolated_targets_are_not_guessed() {
+        let (db, root) = fixture(&[
+            (
+                "compose.yml",
+                r#"
+include:
+  - path: [one.yml, two.yml]
+services:
+  app:
+    image: app
+    depends_on: [db, '${DATABASE}']
+    volumes: ['./data:/data', '${VOLUME}:/var/lib', '/tmp:/tmp']
+    extends: {service: '${BASE}'}
+"#,
+            ),
+            ("one.yml", "services:\n  db: {image: one}\n"),
+            ("two.yml", "services:\n  db: {image: two}\n"),
+            ("unrelated.yml", "services: [app, db]\n"),
+        ]);
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, s, _, _)| s == "service: app")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inherited_yaml_relationships_reach_compose_ansible_and_actions_consumers() {
+        let (db, root) = fixture(&[
+            (
+                "compose.yml",
+                "x-defaults: &defaults {image: nginx, depends_on: [db]}\nservices:\n  web: {<<: *defaults}\n  independent: {<<: *defaults, depends_on: []}\n  db: {image: postgres}\n",
+            ),
+            (
+                "play.yml",
+                "- hosts: all\n  vars:\n    common: &common {debug: {msg: changed}, notify: restart}\n  tasks:\n    - {<<: *common, name: Change}\n  handlers:\n    - {name: restart, debug: {msg: done}}\n",
+            ),
+            (
+                ".github/workflows/ci.yml",
+                "jobs:\n  first:\n    steps:\n      - &checkout {id: checkout, uses: actions/checkout@v7}\n  second:\n    steps:\n      - *checkout\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        assert!(has("service: web", "service: db"));
+        assert!(!has("service: independent", "service: db"));
+        assert!(has("task: Change", "handler: restart"));
+        assert!(has("step: second.checkout", "actions/checkout@v7"));
+        assert!(
+            has("services.web.<<", "defaults"),
+            "anchor provenance remains traceable"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kubernetes_workloads_configuration_services_ingress_and_rbac() {
+        let (mut db, root) = fixture(&[
+            (
+                "app.yml",
+                r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: prod}
+spec:
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      serviceAccountName: runner
+      imagePullSecrets: [{name: auth}]
+      containers:
+        - name: web
+          image: nginx
+          envFrom: [{configMapRef: {name: settings}}]
+          env: [{name: PASS, valueFrom: {secretKeyRef: {name: auth, key: password}}}]
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: data}
+        - name: config
+          projected: {sources: [{configMap: {name: settings}}, {secret: {name: auth}}]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web, namespace: prod}
+spec: {selector: {app: web}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: web, namespace: prod}
+spec:
+  defaultBackend: {service: {name: web, port: {number: 80}}}
+  tls: [{secretName: auth}]
+"#,
+            ),
+            (
+                "resources.yml",
+                r#"
+apiVersion: v1
+kind: List
+items:
+  - {apiVersion: v1, kind: ConfigMap, metadata: {name: settings, namespace: prod}}
+  - {apiVersion: v1, kind: Secret, metadata: {name: auth, namespace: prod}}
+  - {apiVersion: v1, kind: PersistentVolumeClaim, metadata: {name: data, namespace: prod}}
+  - {apiVersion: v1, kind: ServiceAccount, metadata: {name: runner, namespace: prod}}
+  - {apiVersion: rbac.authorization.k8s.io/v1, kind: ClusterRole, metadata: {name: reader}}
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata: {name: read, namespace: prod}
+    roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: reader}
+    subjects: [{kind: ServiceAccount, name: runner, namespace: prod}]
+"#,
+            ),
+            (
+                "dev.yml",
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web, namespace: dev}\nspec: {template: {metadata: {labels: {app: web}}, spec: {containers: []}}}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        for target in [
+            "ConfigMap: prod/settings",
+            "Secret: prod/auth",
+            "PersistentVolumeClaim: prod/data",
+            "ServiceAccount: prod/runner",
+        ] {
+            assert!(
+                has("Deployment: prod/web", target),
+                "missing {target}: {edges:?}"
+            );
+        }
+        assert!(has("Service: prod/web", "Deployment: prod/web"));
+        assert!(!has("Service: prod/web", "Deployment: dev/web"));
+        assert!(has("Ingress: prod/web", "Service: prod/web"));
+        assert!(has("Ingress: prod/web", "Secret: prod/auth"));
+        assert!(has("RoleBinding: prod/read", "ClusterRole: reader"));
+        assert!(has("RoleBinding: prod/read", "ServiceAccount: prod/runner"));
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kubernetes_missing_duplicate_and_dynamic_namespaces_do_not_guess() {
+        let (db, root) = fixture(&[
+            (
+                "pod.yml",
+                "apiVersion: v1\nkind: Pod\nmetadata: {name: consumer}\nspec: {containers: [{name: app, envFrom: [{configMapRef: {name: settings}}]}]}\n",
+            ),
+            (
+                "one.yml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: settings}\n",
+            ),
+            (
+                "two.yml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: settings}\n",
+            ),
+            (
+                "custom.yml",
+                "apiVersion: custom.example/v1\nkind: ConfigMap\nmetadata: {name: settings}\n",
+            ),
+            (
+                "dynamic.yml",
+                "apiVersion: v1\nkind: Pod\nmetadata: {name: dynamic, namespace: '{{ namespace }}'}\nspec: {serviceAccountName: runner}\n",
+            ),
+        ]);
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, s, _, _)| s == "Pod: default/consumer" || s == "Pod: default/dynamic")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kustomize_overlays_components_and_patches_follow_only_reachable_sources() {
+        let (mut db, root) = fixture(&[
+            ("base/Kustomization", "resources: [app.yml, service.yml]\n"),
+            (
+                "base/app.yml",
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web, labels: {app: web}}\nspec: {template: {metadata: {labels: {app: web}}, spec: {containers: []}}}\n",
+            ),
+            (
+                "base/service.yml",
+                "apiVersion: v1\nkind: Service\nmetadata: {name: web}\nspec: {selector: {app: web}}\n",
+            ),
+            (
+                "component/kustomization.yaml",
+                "apiVersion: kustomize.config.k8s.io/v1alpha1\nkind: Component\nresources: [config.yml]\n",
+            ),
+            (
+                "component/config.yml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: settings}\n",
+            ),
+            (
+                "overlays/prod/kustomization.yml",
+                r#"
+resources: [../../base]
+components: [../../component]
+patches:
+  - path: replicas.yml
+    target: {group: apps, kind: Deployment, name: 'web.*', labelSelector: 'app=web'}
+  - patch: '[{"op":"add","path":"/metadata/labels/prod","value":"true"}]'
+    target: {kind: ConfigMap, name: settings}
+configMapGenerator:
+  - name: generated
+    files: [settings=values.yml]
+"#,
+            ),
+            (
+                "overlays/prod/replicas.yml",
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web}\nspec: {replicas: 3}\n",
+            ),
+            ("overlays/prod/values.yml", "feature: enabled\n"),
+            (
+                "other/app.yml",
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web, namespace: other, labels: {app: web}}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        assert!(has("overlays/prod/kustomization.yml", "base/Kustomization"));
+        assert!(has("patch: patches#1", "overlays/prod/replicas.yml"));
+        assert!(has("patch: patches#1", "Deployment: default/web"));
+        assert!(!has("patch: patches#1", "Deployment: other/web"));
+        assert!(has("patch: patches#2", "ConfigMap: default/settings"));
+        assert!(has("generator: generated", "overlays/prod/values.yml"));
+        let services: Vec<_> = edges
+            .iter()
+            .filter(|(_, s, d, _)| s == "Service: default/web" && d == "Deployment: default/web")
+            .collect();
+        assert_eq!(
+            services.len(),
+            1,
+            "patch metadata must not duplicate a deployed resource"
+        );
+        assert_eq!(services[0].3, "base/app.yml");
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kubernetes_cluster_scopes_cover_builtin_api_groups() {
+        let kinds = [
+            ("networking.k8s.io", "IngressClass"),
+            ("networking.k8s.io", "IPAddress"),
+            ("networking.k8s.io", "ServiceCIDR"),
+            ("storage.k8s.io", "CSIDriver"),
+            ("storage.k8s.io", "CSINode"),
+            ("storage.k8s.io", "VolumeAttachment"),
+            ("storage.k8s.io", "VolumeAttributesClass"),
+            ("certificates.k8s.io", "CertificateSigningRequest"),
+            ("certificates.k8s.io", "ClusterTrustBundle"),
+            ("flowcontrol.apiserver.k8s.io", "FlowSchema"),
+            ("flowcontrol.apiserver.k8s.io", "PriorityLevelConfiguration"),
+            ("resource.k8s.io", "DeviceClass"),
+            ("resource.k8s.io", "ResourceSlice"),
+            ("admissionregistration.k8s.io", "ValidatingAdmissionPolicy"),
+            (
+                "admissionregistration.k8s.io",
+                "MutatingAdmissionPolicyBinding",
+            ),
+        ];
+        let mut manifests = String::new();
+        for (group, kind) in kinds {
+            manifests.push_str(&format!(
+                "---\napiVersion: {group}/v1\nkind: {kind}\nmetadata: {{name: sample}}\n"
+            ));
+        }
+        manifests.push_str(
+            "---\napiVersion: example.org/v1\nkind: IngressClass\nmetadata: {name: sample}\n",
+        );
+        manifests.push_str("---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata: {name: sample}\n");
+        let (mut db, root) = fixture(&[("resources.yml", &manifests)]);
+        let edges = automation_edges(&db);
+        for (_, kind) in kinds {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(_, _, d, _)| d == &format!("{kind}: sample")),
+                "missing cluster scope for {kind}"
+            );
+        }
+        assert!(
+            edges
+                .iter()
+                .any(|(_, _, d, _)| d == "IngressClass: default/sample")
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(_, _, d, _)| d == "NetworkPolicy: default/sample")
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kustomize_component_patches_use_consumers_without_crossing_base_scopes() {
+        let resource = "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web}\n";
+        let patch = "patches:\n  - target: {kind: Deployment, name: web}\n    patch: '[{op: add, path: /spec/replicas, value: 3}]'\n";
+        let (mut db, root) = fixture(&[
+            ("components/inner/kustomization.yaml", patch),
+            (
+                "components/outer/kustomization.yaml",
+                "components: [../inner]\n",
+            ),
+            (
+                "prod/kustomization.yaml",
+                "resources: [app.yaml]\ncomponents: [../components/outer]\n",
+            ),
+            ("prod/app.yaml", resource),
+            (
+                "dev/kustomization.yaml",
+                "resources: [app.yaml]\ncomponents: [../components/inner]\n",
+            ),
+            ("dev/app.yaml", resource),
+            ("unrelated/app.yaml", resource),
+            (
+                "higher/kustomization.yaml",
+                "resources: [../prod, app.yaml]\n",
+            ),
+            ("higher/app.yaml", resource),
+        ]);
+        let edges = automation_edges(&db);
+        let targets: Vec<_> = edges
+            .iter()
+            .filter(|(p, s, d, _)| {
+                p == "components/inner/kustomization.yaml"
+                    && s == "patch: patches#1"
+                    && d == "Deployment: default/web"
+            })
+            .map(|(_, _, _, p)| p.as_str())
+            .collect();
+        assert_eq!(targets, ["dev/app.yaml", "prod/app.yaml"], "{edges:?}");
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(
+            root.join("dev/kustomization.yaml"),
+            "resources: [app.yaml]\n",
+        )
+        .unwrap();
+        build(&mut db, &root).unwrap();
+        let updated = automation_edges(&db);
+        let targets: Vec<_> = updated
+            .iter()
+            .filter(|(p, s, d, _)| {
+                p == "components/inner/kustomization.yaml"
+                    && s == "patch: patches#1"
+                    && d == "Deployment: default/web"
+            })
+            .map(|(_, _, _, p)| p.as_str())
+            .collect();
+        assert_eq!(targets, ["prod/app.yaml"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kustomize_root_directory_bases_preserve_imports_and_patch_scope() {
+        for filename in ["kustomization.yaml", "kustomization.yml", "Kustomization"] {
+            let (mut db, root) = fixture(&[
+                (filename, "resources: [deployment.yaml]\n"),
+                (
+                    "deployment.yaml",
+                    "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web}\nspec: {}\n",
+                ),
+                (
+                    "overlays/prod/kustomization.yaml",
+                    "resources: [../..]\npatches:\n  - target: {kind: Deployment, name: web}\n    patch: '[{op: add, path: /spec/replicas, value: 3}]'\n",
+                ),
+            ]);
+            let edges = automation_edges(&db);
+            assert!(
+                edges
+                    .iter()
+                    .any(|(p, _, _, q)| p == "overlays/prod/kustomization.yaml" && q == filename),
+                "{edges:?}"
+            );
+            assert!(
+                edges
+                    .iter()
+                    .any(|(p, s, d, q)| p == "overlays/prod/kustomization.yaml"
+                        && s == "patch: patches#1"
+                        && d == "Deployment: default/web"
+                        && q == "deployment.yaml"),
+                "{edges:?}"
+            );
+            assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+            assert_eq!(automation_edges(&db), edges);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn kustomize_strategic_patch_metadata_and_unsupported_selectors() {
+        let (db, root) = fixture(&[
+            (
+                "kustomization.yaml",
+                "resources: [app.yml]\npatchesStrategicMerge: [patch.yml]\npatches:\n  - path: patch.yml\n    target: {kind: ConfigMap, labelSelector: 'app in (web, api)'}\n  - path: patch.yml\n    target: {kind: ConfigMap, annotationSelector: enabled}\n",
+            ),
+            (
+                "app.yml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: config, labels: {app: web}}\n",
+            ),
+            (
+                "patch.yml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: config}\ndata: {key: value}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges
+                .iter()
+                .any(|(_, s, d, p)| s == "patch: patchesStrategicMerge#1"
+                    && d == "ConfigMap: default/config"
+                    && p == "app.yml")
+        );
+        assert!(!edges.iter().any(
+            |(_, s, d, _)| s.starts_with("patch: patches#") && d == "ConfigMap: default/config"
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gitlab_includes_templates_needs_artifacts_and_child_pipeline_scopes() {
+        let (mut db, root) = fixture(&[
+            (
+                ".gitlab-ci.yml",
+                r#"
+include: [{local: ci/jobs.yml}, {local: ci/templates.yml}]
+stages: [build, test]
+consumer:
+  stage: test
+  needs: [{job: build, artifacts: true}]
+  dependencies: [build]
+  script: echo test
+child:
+  trigger: {include: [{local: ci/child.yml}]}
+"#,
+            ),
+            (
+                "ci/jobs.yml",
+                "build:\n  stage: build\n  extends: .base\n  script:\n    - !reference [.commands, script]\n",
+            ),
+            (
+                "ci/templates.yml",
+                ".base: {image: alpine}\n.commands: {script: echo build}\ndefault: {before_script: echo prepare}\n",
+            ),
+            ("ci/child.yml", "build: {script: echo child}\n"),
+            ("other.yml", "build: {script: echo unrelated}\n"),
+        ]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        assert!(has("gitlab job: build", "gitlab job: .base"), "{edges:?}");
+        assert!(has("gitlab job: build", "gitlab job: .commands"));
+        assert!(has("gitlab job: build", "gitlab stage: build"));
+        assert!(has("gitlab job: consumer", "gitlab default"));
+        assert!(has("gitlab job: child", "ci/child.yml"));
+        let needs: Vec<_> = edges
+            .iter()
+            .filter(|(_, s, d, _)| s == "gitlab job: consumer" && d == "gitlab job: build")
+            .collect();
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].3, "ci/jobs.yml");
+        assert!(
+            !edges
+                .iter()
+                .any(|(p, _, d, _)| p == "ci/child.yml" && d == "gitlab default")
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gitlab_included_templates_use_context_and_refresh_when_includes_change() {
+        let pipeline = "include: chain.yml\nconsumer:\n  script: echo test\n  extends: [.base, .vars, .tags, .empty]\n";
+        let (mut db, root) = fixture(&[
+            (".gitlab-ci.yml", pipeline),
+            (
+                "chain.yml",
+                "include: [templates/base.yml, templates/vars.yml, templates/tags.yml, templates/empty.yml, cycle.yml]\n",
+            ),
+            ("cycle.yml", "include: chain.yml\n"),
+            ("templates/base.yml", ".base: {image: alpine}\n"),
+            ("templates/vars.yml", ".vars: {variables: {ENV: prod}}\n"),
+            ("templates/tags.yml", ".tags: {tags: [linux]}\n"),
+            ("templates/empty.yml", ".empty: {}\n"),
+            ("unrelated.yml", ".base: {image: debian}\n"),
+        ]);
+        let edges = automation_edges(&db);
+        for name in [".base", ".vars", ".tags", ".empty"] {
+            let target = format!("gitlab job: {name}");
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|(_, s, d, _)| s == "gitlab job: consumer" && d == &target)
+                    .count(),
+                1,
+                "{edges:?}"
+            );
+        }
+        let template_paths = |db: &Connection| -> Vec<String> {
+            let mut statement = db.prepare("select f.path from symbols s join files f on s.file_id=f.id where s.name='gitlab job: .base' order by f.path").unwrap();
+            statement
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(template_paths(&db), ["templates/base.yml"]);
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+
+        // Only the include changes. Previously inferred templates must lose CI
+        // symbols, and the newly reached generic file must gain them.
+        std::fs::write(
+            root.join(".gitlab-ci.yml"),
+            pipeline.replace("include: chain.yml", "include: unrelated.yml"),
+        )
+        .unwrap();
+        build(&mut db, &root).unwrap();
+        assert_eq!(template_paths(&db), ["unrelated.yml"]);
+        let moved = automation_edges(&db);
+        let targets: Vec<_> = moved
+            .iter()
+            .filter(|(_, s, _, _)| s == "gitlab job: consumer")
+            .map(|(_, _, d, p)| (d.as_str(), p.as_str()))
+            .collect();
+        assert_eq!(targets, [("gitlab job: .base", "unrelated.yml")]);
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), moved);
+
+        std::fs::write(root.join(".gitlab-ci.yml"), pipeline).unwrap();
+        build(&mut db, &root).unwrap();
+        assert_eq!(automation_edges(&db), edges);
+        assert_eq!(template_paths(&db), ["templates/base.yml"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gitlab_nested_conventional_names_require_include_context() {
+        let pipeline =
+            "include: included/.gitlab-ci.yml\nconsumer: {script: echo test, extends: .base}\n";
+        let nested = ".base: {image: alpine}\nnested: {script: echo nested, extends: .base}\n";
+        let (mut db, root) = fixture(&[
+            (".gitlab-ci.yml", pipeline),
+            ("included/.gitlab-ci.yml", nested),
+            ("unrelated/.gitlab-ci.yml", nested),
+            (
+                "unrelated/.gitlab-ci.yaml",
+                "include: https://example.org/unused.yml\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges.iter().any(|(_, s, d, p)| s == "gitlab job: consumer"
+                && d == "gitlab job: .base"
+                && p == "included/.gitlab-ci.yml"),
+            "{edges:?}"
+        );
+        assert!(!edges.iter().any(|(p, _, _, _)| p.starts_with("unrelated/")));
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(
+            root.join(".gitlab-ci.yml"),
+            "consumer: {script: echo test}\n",
+        )
+        .unwrap();
+        build(&mut db, &root).unwrap();
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(p, _, _, _)| p == "included/.gitlab-ci.yml")
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        std::fs::write(root.join(".gitlab-ci.yml"), pipeline).unwrap();
+        build(&mut db, &root).unwrap();
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gitlab_remote_includes_duplicates_and_runtime_targets_are_conservative() {
+        let (db, root) = fixture(&[
+            (
+                ".gitlab-ci.yml",
+                r#"
+include:
+  - local: one.yml
+  - local: two.yml
+  - project: team/templates
+    ref: v1
+    file: [ci.yml]
+  - remote: https://example.org/ci.yml
+consumer:
+  script: echo test
+  needs: [build, '$TARGET', {job: build, project: another, ref: main}]
+  inherit: {default: false}
+  extends: '$TEMPLATE'
+"#,
+            ),
+            (
+                "one.yml",
+                "build: {script: echo one}\ndefault: {image: alpine}\n",
+            ),
+            ("two.yml", "build: {script: echo two}\n"),
+            ("plain.yml", "include: https://example.org/not-ci.yml\n"),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(edges.iter().any(|(p,_,d,_)|p==".gitlab-ci.yml"&&d=="gitlab:team/templates@v1:ci.yml"));
+        assert!(
+            edges.iter().any(|(p, _, d, _)| p == ".gitlab-ci.yml"
+                && d == "gitlab:remote:https://example.org/ci.yml")
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(p, s, _, _)| p == "plain.yml" || s == "gitlab job: consumer")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn yaml_alias_dags_preserve_dependencies_without_path_expansion() {
+        let mut aliases = "a0: &a0 [{Ref: Bucket}, !reference [.base, script]]\n".to_string();
+        for level in 1..=32 {
+            aliases.push_str(&format!(
+                "a{level}: &a{level} [*a{}, *a{}]\n",
+                level - 1,
+                level - 1
+            ));
+        }
+        let cloudformation = format!(
+            "{aliases}Resources:\n  Bucket: {{Type: 'AWS::S3::Bucket'}}\n  One: {{Type: 'AWS::S3::Bucket', Properties: {{Values: *a32}}}}\n  Two: {{Type: 'AWS::S3::Bucket', Properties: {{Values: *a32}}}}\n"
+        );
+        let gitlab = format!(
+            "{aliases}.base: {{script: echo base}}\none: {{script: *a20}}\ntwo: {{script: *a20}}\n"
+        );
+        let mut includes = "a0: &a0 [ci.yml]\n".to_string();
+        for level in 1..=32 {
+            includes.push_str(&format!(
+                "a{level}: &a{level} [*a{}, *a{}]\n",
+                level - 1,
+                level - 1
+            ));
+        }
+        includes.push_str("include: *a32\n");
+        let (db, root) = fixture(&[
+            ("stack.yaml", &cloudformation),
+            (".gitlab-ci.yml", &includes),
+            ("ci.yml", &gitlab),
+        ]);
+        let edges = automation_edges(&db);
+        for source in ["cfn resource: One", "cfn resource: Two"] {
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|(_, s, d, _)| s == source && d == "cfn resource: Bucket")
+                    .count(),
+                1
+            );
+        }
+        for source in ["gitlab job: one", "gitlab job: two"] {
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|(_, s, d, _)| s == source && d == "gitlab job: .base")
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|(_, s, d, _)| s == ".gitlab-ci.yml" && d == "ci.yml")
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ansible_task_imports_supply_context_without_module_whitelists() {
+        let play = "- hosts: all\n  tasks:\n    - import_tasks: setup.yml\n    - include_vars: vars.yml\n  handlers:\n    - name: changed\n      debug: {msg: changed}\n";
+        let tasks = "- name: create user\n  user: {name: demo}\n  notify: changed\n";
+        let (mut db, root) = fixture(&[
+            ("site.yml", play),
+            ("setup.yml", tasks),
+            ("vars.yml", tasks),
+            ("unrelated.yml", tasks),
+        ]);
+        let edges = automation_edges(&db);
+        assert!(
+            edges.iter().any(|(p, s, d, _)| p == "setup.yml"
+                && s == "task: create user"
+                && d == "handler: changed"),
+            "{edges:?}"
+        );
+        assert!(!edges.iter().any(
+            |(p, s, _, _)| ["vars.yml", "unrelated.yml"].contains(&p.as_str())
+                && s == "task: create user"
+        ));
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(root.join("site.yml"), "- hosts: all\n  tasks: []\n").unwrap();
+        build(&mut db, &root).unwrap();
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, s, d, _)| s == "task: create user" || d == "task: create user")
+        );
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        std::fs::write(root.join("site.yml"), play).unwrap();
+        build(&mut db, &root).unwrap();
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tagged_aliases_preserve_intrinsics_for_each_consumer() {
+        let (mut db, root) = fixture(&[
+            (
+                "stack.yaml",
+                r#"
+shared: &ref !Ref Bucket
+attribute: &att !GetAtt Bucket.Arn
+Resources:
+  Bucket: {Type: 'AWS::S3::Bucket'}
+  One: {Type: 'AWS::S3::Bucket', Properties: {Value: *ref}}
+  Two: {Type: 'AWS::S3::Bucket', Properties: {Values: [*ref, *att]}}
+Outputs:
+  Arn: {Value: *att}
+---
+Resources:
+  Other: {Type: 'AWS::S3::Bucket', Properties: {Value: *ref}}
+"#,
+            ),
+            (
+                ".gitlab-ci.yml",
+                r#"
+.base: {script: echo base}
+.shared: {script: &ref !reference [.base, script]}
+one: {script: *ref}
+two: {script: [*ref, *ref]}
+"#,
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        for source in ["cfn resource: One", "cfn resource: Two", "cfn output: Arn"] {
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|(_, s, d, _)| s == source && d == "cfn resource: Bucket")
+                    .count(),
+                1,
+                "{edges:?}"
+            );
+        }
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, s, d, _)| s == "cfn resource: Other" && d == "cfn resource: Bucket")
+        );
+        for source in ["gitlab job: one", "gitlab job: two"] {
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|(_, s, d, _)| s == source && d == "gitlab job: .base")
+                    .count(),
+                1,
+                "{edges:?}"
+            );
+        }
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cloudformation_intrinsics_conditions_substitutions_and_cache() {
+        let source = r#"
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  Env: {Type: String}
+  Shadow: {Type: String}
+Mappings:
+  Regions: {us: {Image: ami-123}}
+Conditions:
+  Production: !Equals [!Ref Env, prod]
+  Enabled: !And [!Condition Production, !Equals [1, 1]]
+Resources:
+  Bucket: {Type: 'AWS::S3::Bucket'}
+  Other: {Type: 'AWS::S3::Bucket'}
+  Worker:
+    Type: AWS::Lambda::Function
+    DependsOn: [Other]
+    Condition: Enabled
+    Properties:
+      Role: !GetAtt Bucket.Arn
+      Environment:
+        Variables:
+          Env: {Ref: Env}
+          Image: !FindInMap [Regions, us, Image]
+          Choice: !If [Production, !Ref Bucket, !Ref Other]
+          Name: !Sub ['${Bucket.Arn}/${Env}/${Shadow}/${AWS::Region}/${!Escaped}', {Shadow: !Ref Other}]
+  Plain:
+    Type: AWS::S3::Bucket
+    Properties: {BucketName: '${Bucket}'}
+Outputs:
+  Arn: {Value: {Fn::GetAtt: [Bucket, Arn]}}
+  Name:
+    Value:
+      Fn::Sub: |
+        ${Bucket}/${Env}/${AWS::StackName}
+"#;
+        let (mut db, root) = fixture(&[("stack.yaml", source)]);
+        let edges = automation_edges(&db);
+        let has = |s: &str, d: &str| edges.iter().any(|(_, a, b, _)| a == s && b == d);
+        for target in [
+            "cfn resource: Other",
+            "cfn resource: Bucket",
+            "cfn parameter: Env",
+            "cfn mapping: Regions",
+            "cfn condition: Production",
+            "cfn condition: Enabled",
+        ] {
+            assert!(
+                has("cfn resource: Worker", target),
+                "missing {target}: {edges:?}"
+            );
+        }
+        assert!(has("cfn condition: Production", "cfn parameter: Env"));
+        assert!(has("cfn condition: Enabled", "cfn condition: Production"));
+        assert!(has("cfn output: Arn", "cfn resource: Bucket"));
+        assert!(has("cfn output: Name", "cfn resource: Bucket"));
+        assert!(has("cfn output: Name", "cfn parameter: Env"));
+        assert!(!has("cfn resource: Worker", "cfn parameter: Shadow"));
+        assert!(!edges.iter().any(|(_, s, _, _)| s == "cfn resource: Plain"));
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 0);
+        assert_eq!(automation_edges(&db), edges);
+        std::fs::write(
+            root.join("stack.yaml"),
+            source.replace("  Bucket: {Type:", "  Renamed: {Type:"),
+        )
+        .unwrap();
+        assert_eq!(build(&mut db, &root).unwrap().parsed, 1);
+        assert!(
+            !automation_edges(&db)
+                .iter()
+                .any(|(_, _, d, _)| d == "cfn resource: Bucket")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cloudformation_keeps_template_scope_and_ambiguous_dynamic_targets_unresolved() {
+        let (db, root) = fixture(&[
+            (
+                "one.yml",
+                r#"
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  Duplicate: {Type: String}
+  ResourceName: {Type: String}
+Resources:
+  Duplicate: {Type: 'AWS::S3::Bucket'}
+  Consumer:
+    Type: AWS::S3::Bucket
+    Properties:
+      Ambiguous: !Ref Duplicate
+      Missing: !Ref Elsewhere
+      Dynamic: !GetAtt [!Ref ResourceName, Arn]
+---
+Resources:
+  Elsewhere: {Type: 'AWS::S3::Bucket'}
+Outputs:
+  Own: {Value: !Ref Elsewhere}
+"#,
+            ),
+            (
+                "two.yml",
+                "Resources:\n  Elsewhere: {Type: 'AWS::S3::Bucket'}\n",
+            ),
+        ]);
+        let edges = automation_edges(&db);
+        let consumer: Vec<_> = edges
+            .iter()
+            .filter(|(_, s, _, _)| s == "cfn resource: Consumer")
+            .collect();
+        assert_eq!(consumer.len(), 1, "{edges:?}");
+        assert_eq!(consumer[0].2, "cfn parameter: ResourceName");
+        assert!(edges.iter().any(|(p, s, d, q)| p == "one.yml"
+            && q == "one.yml"
+            && s == "cfn output: Own"
+            && d == "cfn resource: Elsewhere"));
+        assert!(!edges.iter().any(|(p, _, _, q)| p != q));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
