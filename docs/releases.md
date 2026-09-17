@@ -101,7 +101,13 @@ SemVer prerelease tags such as `v0.2.0-rc.1` create prereleases.
 ## Update Homebrew
 
 After a release, update `Formula/panoptes.rb` in
-[wallentx/homebrew-tap](https://github.com/wallentx/homebrew-tap) to the new source
-tag URL, SHA-256 checksum, and build commit. Cargo and the source tag now carry
-the same version. The tap's macOS/Linux checks validate the formula separately;
-this workflow does not write to the tap repository.
+[wallentx/homebrew-tap](https://github.com/wallentx/homebrew-tap) after all four
+release archives and `SHA256SUMS` have been uploaded. Set the formula's version
+and each OS/architecture-specific archive URL and SHA-256 checksum. Download and
+verify all four archives against `SHA256SUMS`; keep versioned asset URLs so installs
+remain reproducible. Stable Homebrew installs copy the prebuilt executable and
+packaged completions; `--HEAD` builds the development version from source.
+
+The tap's ARM64/x86-64 macOS and Linux checks validate installation and retrieval
+separately. This release workflow does not write to the tap repository, so each
+new stable release still needs a formula update before `brew upgrade` offers it.
