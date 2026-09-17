@@ -27,6 +27,7 @@ pub enum Lang {
     Go,
     Shell,
     Yaml,
+    Hcl,
 }
 
 impl Lang {
@@ -43,6 +44,7 @@ impl Lang {
             "go" => Some(Lang::Go),
             "sh" | "bash" | "bats" => Some(Lang::Shell),
             "yaml" | "yml" => Some(Lang::Yaml),
+            "hcl" | "tf" | "tfvars" | "tofu" => Some(Lang::Hcl),
             _ => None,
         }
     }
@@ -311,6 +313,10 @@ mod tests {
         assert_eq!(Lang::of_path(Path::new("test.bats")), Some(Lang::Shell));
         assert_eq!(Lang::of_path(Path::new("config.yaml")), Some(Lang::Yaml));
         assert_eq!(Lang::of_path(Path::new("config.yml")), Some(Lang::Yaml));
+        assert_eq!(Lang::of_path(Path::new("main.tf")), Some(Lang::Hcl));
+        assert_eq!(Lang::of_path(Path::new("foo.hcl")), Some(Lang::Hcl));
+        assert_eq!(Lang::of_path(Path::new("prod.tfvars")), Some(Lang::Hcl));
+        assert_eq!(Lang::of_path(Path::new("stack.tofu")), Some(Lang::Hcl));
         assert_eq!(
             Lang::of_shebang(b"#!/usr/bin/env bash\necho ready\n"),
             Some(Lang::Shell)

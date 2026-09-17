@@ -253,6 +253,27 @@ const YAML_IMPORTS: &str = r#"
   (#eq? @_key "uses"))
 "#;
 
+const HCL_DEFS: &str = r#"
+(block . (identifier) @name) @def
+(attribute (identifier) @name) @def
+(object_elem key: (_) @name) @def
+"#;
+
+const HCL_CALLS: &str = r#"
+(function_call (identifier) @callee)
+"#;
+
+const HCL_IMPORTS: &str = r#"
+(block .
+  (identifier) @_type
+  (#eq? @_type "module")
+  (body
+    (attribute
+      (identifier) @_key
+      (#eq? @_key "source")
+      (expression (literal_value (string_lit) @spec)))))
+"#;
+
 fn queries(lang: Lang) -> Queries {
     match lang {
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => Queries {
@@ -291,6 +312,12 @@ fn queries(lang: Lang) -> Queries {
             bindings: None,
             imports: Some(YAML_IMPORTS),
         },
+        Lang::Hcl => Queries {
+            defs: HCL_DEFS,
+            calls: Some(HCL_CALLS),
+            bindings: None,
+            imports: Some(HCL_IMPORTS),
+        },
     }
 }
 
@@ -303,6 +330,7 @@ fn language(lang: Lang) -> tree_sitter::Language {
         Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
         Lang::Shell => tree_sitter_bash::LANGUAGE.into(),
         Lang::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+        Lang::Hcl => tree_sitter_hcl::LANGUAGE.into(),
     }
 }
 
@@ -421,6 +449,209 @@ fn yaml_key_path(src: &str, def: Node<'_>, name: Node<'_>) -> String {
     parts.join(".")
 }
 
+fn hcl_ident_text(src: &str, node: Node<'_>) -> String {
+    src[node.byte_range()]
+        .trim()
+        .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`')
+        .to_string()
+}
+
+fn hcl_named_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+    (0..node.named_child_count()).filter_map(move |i| node.named_child(i as u32))
+}
+
+fn hcl_block_tokens(src: &str, def: Node<'_>) -> Vec<String> {
+    let mut raw = Vec::new();
+    for child in hcl_named_children(def) {
+        match child.kind() {
+            "identifier" | "string_lit" => raw.push(hcl_ident_text(src, child)),
+            "block_start" => break,
+            _ => {}
+        }
+    }
+    match raw.split_first() {
+        Some((ty, _)) if ty == "provider" => {
+            if let Some(alias) = hcl_literal_attribute(src, def, "alias") {
+                raw.push(alias);
+            }
+            raw
+        }
+        Some((ty, rest)) if ty == "resource" => rest.to_vec(),
+        Some((ty, rest)) if ty == "variable" => {
+            let mut parts = vec!["var".to_string()];
+            parts.extend(rest.iter().cloned());
+            parts
+        }
+        Some((ty, rest)) if ty == "locals" => {
+            let mut parts = vec!["local".to_string()];
+            parts.extend(rest.iter().cloned());
+            parts
+        }
+        _ => raw,
+    }
+}
+
+fn hcl_literal_attribute(src: &str, block: Node<'_>, key: &str) -> Option<String> {
+    let body = hcl_named_children(block).find(|child| child.kind() == "body")?;
+    let attribute = hcl_named_children(body).find(|child| {
+        child.kind() == "attribute"
+            && child
+                .named_child(0)
+                .is_some_and(|name| hcl_ident_text(src, name) == key)
+    })?;
+    let expression = hcl_named_children(attribute).find(|child| child.kind() == "expression")?;
+    let literal = expression.named_child(0)?;
+    let string = literal.named_child(0)?;
+    (literal.kind() == "literal_value" && string.kind() == "string_lit")
+        .then(|| hcl_ident_text(src, string))
+}
+
+fn hcl_enclosing_definition(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "block" | "attribute" | "object_elem") {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn hcl_symbol_name(src: &str, def: Node<'_>, name: Node<'_>) -> String {
+    let mut parts = match def.kind() {
+        "block" => hcl_block_tokens(src, def),
+        _ => vec![hcl_ident_text(src, name)],
+    };
+    let mut current = def.parent();
+    while let Some(node) = current {
+        match node.kind() {
+            "block" => {
+                let mut head = hcl_block_tokens(src, node);
+                head.append(&mut parts);
+                parts = head;
+            }
+            "attribute" => {
+                if let Some(ident) =
+                    hcl_named_children(node).find(|child| child.kind() == "identifier")
+                {
+                    let mut head = vec![hcl_ident_text(src, ident)];
+                    head.append(&mut parts);
+                    parts = head;
+                }
+            }
+            "object_elem" => {
+                if let Some(key) = node.child_by_field_name("key") {
+                    let mut head = vec![hcl_ident_text(src, key)];
+                    head.append(&mut parts);
+                    parts = head;
+                }
+            }
+            _ => {}
+        }
+        current = node.parent();
+    }
+    parts.join(".")
+}
+
+fn hcl_kind(def: &Node<'_>) -> &'static str {
+    match def.kind() {
+        "block" => "block",
+        _ => "attribute",
+    }
+}
+
+fn hcl_keep_body(def: &Node<'_>) -> bool {
+    matches!(def.kind(), "block" | "attribute") && !hcl_enclosing_definition(*def)
+}
+
+const HCL_META_ROOTS: &[&str] = &["each", "count", "self", "path", "terraform"];
+
+/// Provider arguments use a separate namespace from ordinary value references.
+fn hcl_provider_reference(var_expr: Node<'_>, src: &str) -> (bool, bool) {
+    let mut current = var_expr.parent();
+    let mut in_object_key = false;
+    while let Some(node) = current {
+        if node.kind() == "object_elem"
+            && let Some(key) = node.child_by_field_name("key")
+        {
+            in_object_key |=
+                key.start_byte() <= var_expr.start_byte() && var_expr.end_byte() <= key.end_byte();
+        }
+        if node.kind() == "attribute" {
+            let name = node.named_child(0).map(|name| hcl_ident_text(src, name));
+            let block_type = node
+                .parent()
+                .filter(|body| body.kind() == "body")
+                .and_then(|body| body.parent())
+                .filter(|block| block.kind() == "block")
+                .and_then(|block| block.named_child(0))
+                .map(|name| hcl_ident_text(src, name));
+            let provider = matches!(
+                (name.as_deref(), block_type.as_deref()),
+                (
+                    Some("provider"),
+                    Some("resource" | "data" | "ephemeral" | "import")
+                ) | (Some("providers"), Some("module"))
+            );
+            // A providers map's keys name configurations in the child module;
+            // only its values refer to providers in the calling module.
+            return (provider, provider && in_object_key);
+        }
+        current = node.parent();
+    }
+    (false, false)
+}
+
+fn hcl_ref_callee(var_expr: Node<'_>, src: &str) -> Option<String> {
+    let (provider, provider_key) = hcl_provider_reference(var_expr, src);
+    if provider_key {
+        return None;
+    }
+    let ident = var_expr.named_child(0)?;
+    let root = hcl_ident_text(src, ident);
+    if HCL_META_ROOTS.contains(&root.as_str()) {
+        return None;
+    }
+    let mut parts = vec![root];
+    let mut sibling = var_expr.next_named_sibling();
+    while let Some(node) = sibling {
+        match node.kind() {
+            "get_attr" => {
+                let attr = node.named_child(0)?;
+                parts.push(hcl_ident_text(src, attr));
+                sibling = node.next_named_sibling();
+            }
+            "index" | "splat" => sibling = node.next_named_sibling(),
+            _ => break,
+        }
+    }
+    if provider {
+        Some(format!("provider.{}", parts.join(".")))
+    } else {
+        (parts.len() >= 2).then(|| parts.join("."))
+    }
+}
+
+fn hcl_collect_references(
+    node: Node<'_>,
+    src: &str,
+    owner_at: &dyn Fn(usize) -> Option<usize>,
+    calls: &mut Vec<CallIntent>,
+) {
+    if node.kind() == "variable_expr"
+        && let Some(callee) = hcl_ref_callee(node, src)
+    {
+        calls.push(CallIntent {
+            from: owner_at(node.start_byte()),
+            callee,
+            receiver: None,
+        });
+    }
+    for child in hcl_named_children(node) {
+        hcl_collect_references(child, src, owner_at, calls);
+    }
+}
+
 fn type_basename(text: &str) -> String {
     let before_generics = text.trim().split('<').next().unwrap_or(text).trim();
     before_generics
@@ -537,21 +768,30 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
         };
         let name = if lang == Lang::Yaml && def_node.kind() != "anchor" {
             yaml_key_path(src, def_node, name_node)
+        } else if lang == Lang::Hcl {
+            hcl_symbol_name(src, def_node, name_node)
         } else {
             src[name_node.byte_range()].to_string()
         };
+        let kind = if rust_container.is_some() {
+            "method".to_string()
+        } else if lang == Lang::Hcl {
+            hcl_kind(&def_node).to_string()
+        } else {
+            kind_of(&def_node).to_string()
+        };
         symbols.push(Symbol {
             name,
-            kind: if rust_container.is_some() {
-                "method".to_string()
-            } else {
-                kind_of(&def_node).to_string()
-            },
+            kind,
             // tree-sitter rows are 0-based; every display surface is 1-based.
             start_line: def_node.start_position().row as i64 + 1,
             end_line: def_node.end_position().row as i64 + 1,
             signature: signature_of(src, &def_node),
-            search_text: search_text_of(src, &def_node),
+            search_text: if lang == Lang::Hcl && !hcl_keep_body(&def_node) {
+                String::new()
+            } else {
+                search_text_of(src, &def_node)
+            },
         });
         spans.push((def_node.start_byte(), def_node.end_byte()));
         recv_types.push(
@@ -659,6 +899,9 @@ fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> 
                 }),
             });
         }
+    }
+    if lang == Lang::Hcl {
+        hcl_collect_references(root, src, &owner_at, &mut calls);
     }
 
     let mut bindings = Vec::new();
@@ -1234,6 +1477,239 @@ jobs:
         assert_eq!(
             e.imports,
             ["actions/checkout@v4", "./.github/actions/setup"]
+        );
+    }
+
+    #[test]
+    fn hcl_terraform_addresses_attributes_calls_and_module_source() {
+        let src = r#"
+variable "names" {
+  type = list(string)
+}
+
+locals {
+  cidr = "10.0.0.0/16"
+}
+
+module "vpc" {
+  source = "./modules/vpc"
+}
+
+resource "aws_instance" "web" {
+  ami = "ami-123"
+  tags = {
+    Name = "web"
+  }
+  root_block_device {
+    volume_size = 20
+  }
+  user_data = length(var.names)
+}
+
+output "id" {
+  value = aws_instance.web.id
+}
+"#;
+        let e = extract(Lang::Hcl, src).unwrap();
+        let names: Vec<_> = e
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind.as_str()))
+            .collect();
+        assert!(names.contains(&("var.names", "block")), "{names:?}");
+        assert!(names.contains(&("local.cidr", "attribute")), "{names:?}");
+        assert!(names.contains(&("module.vpc", "block")), "{names:?}");
+        assert!(names.contains(&("aws_instance.web", "block")), "{names:?}");
+        assert!(
+            names.contains(&("aws_instance.web.ami", "attribute")),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&("aws_instance.web.tags", "attribute")),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&("aws_instance.web.tags.Name", "attribute")),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&("aws_instance.web.root_block_device", "block")),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&(
+                "aws_instance.web.root_block_device.volume_size",
+                "attribute"
+            )),
+            "{names:?}"
+        );
+        assert!(names.contains(&("output.id", "block")), "{names:?}");
+
+        let resource = e
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "aws_instance.web")
+            .unwrap();
+        assert!(
+            !resource.search_text.is_empty(),
+            "top-level resource keeps body"
+        );
+        let ami = e
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "aws_instance.web.ami")
+            .unwrap();
+        assert!(
+            ami.search_text.is_empty(),
+            "attribute bodies stay on the parent block"
+        );
+        assert!(ami.signature.contains("ami"));
+
+        assert!(
+            e.calls.iter().any(|call| call.callee == "length"),
+            "{:?}",
+            e.calls
+        );
+        assert!(
+            e.calls.iter().any(|call| call.callee == "var.names"),
+            "{:?}",
+            e.calls
+        );
+        assert!(
+            e.calls
+                .iter()
+                .any(|call| call.callee == "aws_instance.web.id"),
+            "{:?}",
+            e.calls
+        );
+        assert!(
+            !e.calls
+                .iter()
+                .any(|call| call.callee == "each" || call.callee.starts_with("each.")),
+            "meta roots are not graph deps: {:?}",
+            e.calls
+        );
+        assert_eq!(e.imports, ["./modules/vpc"]);
+    }
+
+    #[test]
+    fn hcl_tfvars_top_level_attributes_are_not_variable_addresses() {
+        let e = extract(Lang::Hcl, "region = \"us-east-1\"\n").unwrap();
+        let names: Vec<_> = e
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind.as_str()))
+            .collect();
+        assert!(names.contains(&("region", "attribute")), "{names:?}");
+        assert!(
+            !names.iter().any(|(name, _)| *name == "var.region"),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn hcl_unquoted_labels_define_each_block_once() {
+        let e = extract(
+            Lang::Hcl,
+            "resource aws_instance web { ami = var.image }\nvariable image {}\n",
+        )
+        .unwrap();
+        let names: Vec<_> = e.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["aws_instance.web", "aws_instance.web.ami", "var.image"]
+        );
+        assert_eq!(e.parents, [None, Some(0), None]);
+
+        let imports = extract(
+            Lang::Hcl,
+            "service module { source = \"./not-a-module\" }\nmodule child { source = \"./child\" }\n",
+        )
+        .unwrap();
+        assert_eq!(imports.imports, ["./child"]);
+    }
+
+    #[test]
+    fn hcl_top_level_attributes_keep_bodies_without_duplicate_descendant_text() {
+        let e = extract(
+            Lang::Hcl,
+            "description = <<EOF\nbodymarker\nEOF\nsettings = { nested = { value = \"leafmarker\" } }\n",
+        )
+        .unwrap();
+        for name in ["description", "settings"] {
+            let symbol = e.symbols.iter().find(|s| s.name == name).unwrap();
+            assert!(!symbol.search_text.is_empty(), "{name}");
+        }
+        for symbol in e.symbols.iter().filter(|s| s.name.starts_with("settings.")) {
+            assert!(symbol.search_text.is_empty(), "{}", symbol.name);
+        }
+        assert!(e.symbols[0].search_text.contains("bodymarker"));
+    }
+
+    #[test]
+    fn hcl_provider_aliases_and_explicit_provider_references_share_names() {
+        let e = extract(
+            Lang::Hcl,
+            r#"
+provider "aws" {}
+provider "aws" { alias = "west" }
+resource "aws_instance" "west" { provider = aws.west }
+resource "aws_instance" "default" { provider = aws }
+module "child" {
+  providers = { aws.east = aws.west }
+}
+variable "region" {}
+locals { provider = var.region }
+"#,
+        )
+        .unwrap();
+        let names: Vec<_> = e.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"provider.aws"));
+        assert!(names.contains(&"provider.aws.west"));
+        let calls: Vec<_> = e.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert_eq!(
+            calls,
+            [
+                "provider.aws.west",
+                "provider.aws",
+                "provider.aws.west",
+                "var.region"
+            ]
+        );
+    }
+
+    #[test]
+    fn hcl_skips_each_count_self_path_and_terraform_references() {
+        let src = r#"
+resource "aws_instance" "web" {
+  ami = each.value
+  subnet_id = count.index
+  private_ip = self.private_ip
+  user_data = path.module
+  tags = {
+    workspace = terraform.workspace
+  }
+}
+"#;
+        let e = extract(Lang::Hcl, src).unwrap();
+        assert!(
+            !e.calls.iter().any(|call| {
+                matches!(
+                    call.callee.as_str(),
+                    "each"
+                        | "each.value"
+                        | "count"
+                        | "count.index"
+                        | "self"
+                        | "self.private_ip"
+                        | "path"
+                        | "path.module"
+                        | "terraform"
+                        | "terraform.workspace"
+                )
+            }),
+            "{:?}",
+            e.calls
         );
     }
 }
