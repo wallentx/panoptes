@@ -195,8 +195,7 @@ fn run_cancellable(
         no_refresh,
         timeout_ms: remaining.as_millis().clamp(1, 300_000) as u64,
     })?;
-    let mut command =
-        Command::new(std::env::current_exe().context("locate MCP worker executable")?);
+    let mut command = crate::executable::command().context("locate MCP worker executable")?;
     command.arg("__mcp-worker");
     let bytes = execute(&mut command, input, deadline, cancelled)?;
     let result: std::result::Result<ToolData, String> =
@@ -272,7 +271,7 @@ mod tests {
     #[test]
     fn timeout_kills_sqlite_query_rolls_back_and_releases_write_lock() {
         let temp = TempDir::new("worker-timeout");
-        let mut command = Command::new(std::env::current_exe().unwrap());
+        let mut command = crate::executable::command().unwrap();
         command
             .args([
                 "--exact",

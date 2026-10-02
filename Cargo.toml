@@ -1,6 +1,6 @@
 [package]
 name = "panoptes"
-version = "1.0.1"
+version = "1.0.2-gad2fcfee"
 edition = "2024"
 description = "Local repository structure and retrieval CLI"
 license = "MIT"

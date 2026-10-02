@@ -10,6 +10,7 @@ mod ask;
 mod cloudformation;
 mod compose;
 mod db;
+mod executable;
 mod export;
 mod extract;
 mod github_actions;
@@ -1030,7 +1031,7 @@ fn main() -> Result<()> {
             let info = VersionInfo {
                 version: env!("CARGO_PKG_VERSION"),
                 build: option_env!("PANOPTES_GIT_SHA").unwrap_or("source-build"),
-                executable: std::env::current_exe()?.to_string_lossy().into_owned(),
+                executable: executable::current_exe()?.to_string_lossy().into_owned(),
                 schema_version: db::SCHEMA_VERSION,
                 extractor_stamp: index::EXTRACTOR_STAMP,
                 store: store.to_string_lossy().into_owned(),

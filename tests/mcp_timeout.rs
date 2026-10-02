@@ -76,7 +76,15 @@ impl Server {
     }
 
     fn with_timeout(fixture: &Fixture, timeout: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_panoptes"))
+        Self::with_command(
+            fixture,
+            timeout,
+            Command::new(env!("CARGO_BIN_EXE_panoptes")),
+        )
+    }
+
+    fn with_command(fixture: &Fixture, timeout: &str, mut command: Command) -> Self {
+        let mut child = command
             .arg("--store")
             .arg(fixture.store())
             .arg("mcp")
@@ -271,4 +279,60 @@ fn worker_has_its_own_deadline_even_without_a_supervising_mcp_parent() {
         std::thread::sleep(Duration::from_millis(10));
     }
     writer.execute_batch("rollback").unwrap();
+}
+
+#[cfg(target_os = "android")]
+fn linker_command() -> Command {
+    let linker = if cfg!(target_pointer_width = "64") {
+        "/system/bin/linker64"
+    } else {
+        "/system/bin/linker"
+    };
+    let mut command = Command::new(linker);
+    command
+        .arg(env!("CARGO_BIN_EXE_panoptes"))
+        .env_remove("LD_PRELOAD")
+        // A stale hint from the launcher must not override our actual argv[0].
+        .env("TERMUX_EXEC__PROC_SELF_EXE", "/not-the-panoptes-binary");
+    command
+}
+
+#[cfg(target_os = "android")]
+#[test]
+fn android_linker_launch_without_preload_can_index_and_reexecute_workers() {
+    let fixture = Fixture::new();
+    let mut server = Server::with_command(&fixture, "5", linker_command());
+    let init = server.request(1, "initialize", json!({}));
+    assert_eq!(init["result"]["serverInfo"]["name"], "panoptes");
+    let result = server.find(2, "original");
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    fixture.source("pub fn original() {}\npub fn refreshed() {}\n");
+    let result = server.find(3, "refreshed");
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    assert!(
+        result["result"]["structuredContent"]["repo"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["name"] == "refreshed")
+    );
+}
+
+#[cfg(target_os = "android")]
+#[test]
+fn android_linker_launch_reports_the_program_path_instead_of_the_loader() {
+    let output = linker_command()
+        .args(["version", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let version: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        PathBuf::from(version["executable"].as_str().unwrap()),
+        std::fs::canonicalize(env!("CARGO_BIN_EXE_panoptes")).unwrap()
+    );
 }

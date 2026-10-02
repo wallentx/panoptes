@@ -116,7 +116,7 @@ struct Registration {
 pub fn select_providers() -> Result<Vec<String>> {
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     let home = PathBuf::from(home);
-    let executable = std::env::current_exe()?.canonicalize()?;
+    let executable = crate::executable::current_exe()?.canonicalize()?;
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         bail!(
             "panoptes init needs a terminal for provider selection; pass one or more --provider <id> values in scripts"
@@ -164,7 +164,7 @@ pub fn select_providers() -> Result<Vec<String>> {
 pub fn reconcile(providers: &[String], dry_run: bool) -> Result<Vec<PlannedWrite>> {
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     let home = PathBuf::from(home);
-    let executable = std::env::current_exe()?.canonicalize()?;
+    let executable = crate::executable::current_exe()?.canonicalize()?;
     reconcile_at(&home, &executable, providers, dry_run)
 }
 
@@ -213,7 +213,7 @@ fn reconcile_at(
 fn change_named(providers: &[String], dry_run: bool, add: bool) -> Result<Vec<PlannedWrite>> {
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     let home = PathBuf::from(home);
-    let executable = std::env::current_exe()?.canonicalize()?;
+    let executable = crate::executable::current_exe()?.canonicalize()?;
     let mut active = HashSet::new();
     for candidate in PROVIDERS {
         if registration(&home, candidate, &executable)?.present {
