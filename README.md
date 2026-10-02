@@ -109,6 +109,17 @@ registration and usage guidance while preserving existing configuration. The
 MCP server indexes the current repository when needed and refreshes changed
 files automatically.
 
+MCP tool calls have a **30-second timeout**, including waiting for startup
+indexing, refreshing files, and SQLite queries. Startup indexing also has a
+30-second budget. On timeout, Panoptes stops the worker, releases its database
+locks, and returns an error; the MCP server stays available for the next request.
+Uncommitted index updates roll back, preserving the last committed snapshot.
+
+For a large initial index, run `panoptes build /path/to/repo` separately. To
+change the MCP budget, add `--timeout-secs 60` to the server's `mcp` arguments
+(allowed range: 1-300 seconds), then restart the client. Direct CLI builds are
+not subject to the MCP timeout.
+
 Ranked search caches per-field terms when files are indexed, so queries retrieve
 matching symbols without tokenizing the whole repository again. ASCII text uses
 a portable bulk lowercase fast path; Unicode token boundaries remain unchanged.

@@ -125,7 +125,13 @@ enum Cmd {
     Mcp {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Wall-clock limit for each tool call, including indexing (1-300 seconds).
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout_secs: u64,
     },
+    /// Internal isolated MCP worker; not a public protocol endpoint.
+    #[command(name = "__mcp-worker", hide = true)]
+    McpWorker,
     /// Configure Panoptes MCP, guidance, and skills for coding-agent providers.
     Init {
         /// Provider to configure; repeat for scripts. Omit to open the checkbox picker.
@@ -331,15 +337,18 @@ fn parse_jobs(value: &str) -> std::result::Result<usize, String> {
 }
 
 fn main() -> Result<()> {
+    let cli = Cli::parse();
     // Rust ignores SIGPIPE, so `panoptes grep x | head` panics on the first write
     // past the closed pipe instead of exiting quietly the way every other CLI
-    // does. Restoring the default disposition makes piping behave.
+    // does. MCP must retain Rust's default: a failed worker pipe must become an
+    // I/O error, not terminate the long-lived server before it can respond.
     #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    if !matches!(cli.cmd, Cmd::Mcp { .. }) {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
     }
 
-    let cli = Cli::parse();
     let no_refresh = cli.no_refresh;
     let store = match cli.store {
         Some(p) => p,
@@ -813,7 +822,13 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Mcp { path } => mcp::serve(&store, &path, refresh_disabled(no_refresh))?,
+        Cmd::Mcp { path, timeout_secs } => mcp::serve(
+            &store,
+            &path,
+            refresh_disabled(no_refresh),
+            std::time::Duration::from_secs(timeout_secs),
+        )?,
+        Cmd::McpWorker => mcp::worker_main()?,
 
         Cmd::Init {
             mut providers,

@@ -6,6 +6,10 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+mod worker;
+pub use worker::worker_main;
 
 use crate::{ask, db, index, repo};
 
@@ -20,13 +24,14 @@ struct SessionStats {
     calls_with_savings: u64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ToolData {
     value: Value,
     baseline_bytes: u64,
     baseline_files: usize,
 }
 
-pub fn serve(store: &Path, start: &Path, no_refresh: bool) -> Result<()> {
+pub fn serve(store: &Path, start: &Path, no_refresh: bool, timeout: Duration) -> Result<()> {
     let targets = repo::automatic_targets(start)?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
@@ -52,20 +57,38 @@ pub fn serve(store: &Path, start: &Path, no_refresh: bool) -> Result<()> {
         let id = id.unwrap_or(Value::Null);
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-        if method == "tools/call" {
-            finish_indexing(&mut indexing);
-        }
         let response = if !matches!(method, "initialize" | "ping" | "tools/list" | "tools/call") {
             error(id, -32601, &format!("method not found: {method}"))
         } else {
-            match dispatch(store, &targets, method, &params, no_refresh, &mut session) {
+            let result = if method == "tools/call" {
+                // Waiting for startup indexing consumes this same request budget.
+                let deadline = Instant::now() + timeout;
+                finish_indexing(&mut indexing).and_then(|()| {
+                    let output = worker::run(store, &targets, Some(params), no_refresh, deadline)?;
+                    tool_response(output, &mut session)
+                })
+            } else {
+                dispatch(store, &targets, method, &params, no_refresh, &mut session)
+            };
+            match result {
                 Ok(result) => json!({"jsonrpc":"2.0", "id":id, "result":result}),
-                Err(problem) => error(id, -32000, &problem.to_string()),
+                Err(problem) if problem.is::<worker::TimedOut>() => error(
+                    id,
+                    -32002,
+                    &format!(
+                        "Panoptes exceeded its {}s MCP deadline (including indexing and SQLite); \
+                         the worker was stopped and its database locks released. Narrow the query \
+                         or repo scope, or run `panoptes build` separately for a large initial index. \
+                         The MCP server is ready for another request.",
+                        timeout.as_secs()
+                    ),
+                ),
+                Err(problem) => error(id, -32000, &format!("{problem:#}")),
             }
         };
         write_response(&mut stdout, response)?;
         if method == "initialize" && indexing.is_none() {
-            indexing = start_indexing(store, &targets, no_refresh);
+            indexing = start_indexing(store, &targets, no_refresh, timeout);
         }
     }
     Ok(())
@@ -121,41 +144,38 @@ fn dispatch(
                 .context("missing tool name")?;
             let args = params.get("arguments").unwrap_or(&Value::Null);
             let output = call_tool_detailed(store, targets, name, args, no_refresh)?;
-            let data = add_savings(output, session)?;
-            Ok(json!({
-                "content":[{"type":"text", "text":serde_json::to_string_pretty(&data)?}],
-                "structuredContent":data,
-                "isError":false
-            }))
+            tool_response(output, session)
         }
         _ => unreachable!("method validated by serve"),
     }
+}
+
+fn tool_response(output: ToolData, session: &mut SessionStats) -> Result<Value> {
+    let data = add_savings(output, session)?;
+    Ok(json!({
+        "content":[{"type":"text", "text":serde_json::to_string_pretty(&data)?}],
+        "structuredContent":data,
+        "isError":false
+    }))
 }
 
 fn start_indexing(
     store: &Path,
     targets: &[repo::Target],
     no_refresh: bool,
-) -> Option<std::thread::JoinHandle<Result<()>>> {
+    timeout: Duration,
+) -> Option<worker::Background> {
     if no_refresh || targets.is_empty() {
         return None;
     }
-    let store = store.to_path_buf();
-    let targets = targets.to_vec();
-    Some(std::thread::spawn(move || {
-        ensure_targets(&store, &targets, false)
-    }))
+    Some(worker::Background::start(store, targets, timeout))
 }
 
-fn finish_indexing(worker: &mut Option<std::thread::JoinHandle<Result<()>>>) {
+fn finish_indexing(worker: &mut Option<worker::Background>) -> Result<()> {
     let Some(worker) = worker.take() else {
-        return;
+        return Ok(());
     };
-    match worker.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(problem)) => eprintln!("[panoptes] background indexing deferred: {problem:#}"),
-        Err(_) => eprintln!("[panoptes] background indexing worker panicked"),
-    }
+    worker.finish()
 }
 
 fn ensure_targets(store: &Path, targets: &[repo::Target], no_refresh: bool) -> Result<()> {
@@ -554,10 +574,10 @@ fn bool_arg_named(args: &Value, name: &str) -> bool {
 mod tests {
     use super::*;
 
-    struct TempDir(std::path::PathBuf);
+    pub(super) struct TempDir(pub(super) std::path::PathBuf);
 
     impl TempDir {
-        fn new(name: &str) -> Self {
+        pub(super) fn new(name: &str) -> Self {
             use std::sync::atomic::{AtomicU32, Ordering};
             static NEXT: AtomicU32 = AtomicU32::new(0);
             let path = std::env::temp_dir().join(format!(
@@ -649,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_responds_before_background_indexing_builds_and_refreshes() {
+    fn initialize_responds_before_indexing_builds_and_refreshes() {
         let (_temp, store, target) = fixture("initialize-index");
         let targets = [target.clone()];
 
@@ -665,8 +685,7 @@ mod tests {
         assert_eq!(response["serverInfo"]["name"], "panoptes");
         assert!(!store.exists(), "the handshake must not wait for SQLite");
 
-        let mut worker = start_indexing(&store, &targets, false);
-        finish_indexing(&mut worker);
+        ensure_targets(&store, &targets, false).unwrap();
         let conn = db::open(&store).unwrap();
         assert!(index::freshness(&conn, &target.root).unwrap().is_clean());
         drop(conn);
@@ -676,8 +695,7 @@ mod tests {
             "pub fn original() {}\npub fn refreshed() {}\n",
         )
         .unwrap();
-        let mut worker = start_indexing(&store, &targets, false);
-        finish_indexing(&mut worker);
+        ensure_targets(&store, &targets, false).unwrap();
         let conn = db::open(&store).unwrap();
         assert!(index::freshness(&conn, &target.root).unwrap().is_clean());
         let repo_id = index::repo_id_of(&conn, &target.root).unwrap().unwrap();

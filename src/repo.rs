@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Target {
     pub label: String,
     pub root: PathBuf,
