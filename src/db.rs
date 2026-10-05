@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever the DDL below changes in a way an existing store cannot serve.
 /// Read from and written to `pragma user_version`.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 const DDL: &str = r#"
 create table if not exists repos (
@@ -146,7 +146,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 
     let found: i64 = db.query_row("pragma user_version", [], |r| r.get(0))?;
     anyhow::ensure!(
-        matches!(found, 0 | 1 | 2 | 3 | SCHEMA_VERSION),
+        matches!(found, 0 | 1 | 2 | 3 | 4 | SCHEMA_VERSION),
         "store at {} is schema v{found}; expected v{SCHEMA_VERSION}",
         path.display()
     );
@@ -174,7 +174,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         // Another process may have migrated between opening and taking the lock.
         let version: i64 = tx.query_row("pragma user_version", [], |r| r.get(0))?;
         anyhow::ensure!(
-            matches!(version, 0 | 1 | 2 | 3 | SCHEMA_VERSION),
+            matches!(version, 0 | 1 | 2 | 3 | 4 | SCHEMA_VERSION),
             "unsupported store schema v{version}"
         );
         if version == 0 {
@@ -208,6 +208,10 @@ pub fn open(path: &Path) -> Result<Connection> {
                 crate::identity::register(&tx, Path::new(&root), Some(id))?;
             }
         }
+        if version < 5 {
+            tx.execute_batch(crate::content::DDL)
+                .context("create shared source and extraction cache")?;
+        }
         if version < SCHEMA_VERSION {
             tx.execute_batch(crate::search::DDL)
                 .context("create search term index")?;
@@ -232,6 +236,8 @@ pub fn clear(db: &Connection) -> Result<i64> {
     db.execute("delete from checkouts", [])?;
     db.execute("delete from git_instances", [])?;
     db.execute("delete from lineages", [])?;
+    db.execute("delete from content_objects", [])?;
+    db.execute("delete from extraction_profiles", [])?;
     db.execute_batch("pragma wal_checkpoint(truncate); vacuum;")?;
     Ok(repositories)
 }

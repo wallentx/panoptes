@@ -160,6 +160,20 @@ pub enum Lang {
 }
 
 impl Lang {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::TypeScript => "typescript",
+            Self::Tsx => "tsx",
+            Self::JavaScript => "javascript",
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::Shell => "shell",
+            Self::Yaml => "yaml",
+            Self::Hcl => "hcl",
+        }
+    }
+
     pub fn of_path(p: &Path) -> Option<Lang> {
         if p.file_name().is_some_and(|name| name == "Kustomization") {
             return Some(Lang::Yaml);
@@ -334,16 +348,9 @@ pub struct SourceFile {
     pub hash: String,
 }
 
-/// FNV-1a. Deliberately not `DefaultHasher`: SipHash's output is explicitly not
-/// stable across Rust releases, so a compiler upgrade would silently invalidate
-/// every cached file hash and force a full cold reparse of every indexed repo.
-fn fnv1a(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
+/// Algorithm-tagged strong identity for exact bytes, stable across platforms.
+pub fn content_hash(bytes: &[u8]) -> String {
+    format!("blake3-256:{}", blake3::hash(bytes).to_hex())
 }
 
 /// Walk `root` for source files Panoptes can extract, honouring .gitignore.
@@ -410,7 +417,7 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
         out.push(SourceFile {
             rel,
             lang,
-            hash: fnv1a(text.as_bytes()),
+            hash: content_hash(text.as_bytes()),
             size: text.len() as i64,
             mtime,
             text,
@@ -496,23 +503,14 @@ mod tests {
     }
 
     #[test]
-    fn fnv_is_stable_and_distinguishes_content() {
-        // Pinned literals, computed independently rather than recorded from this
-        // implementation's own output. If they ever change, every stored file hash
-        // is invalidated and every indexed repo cold-reparses — that should be a
-        // deliberate schema bump, not an accident.
+    fn content_hash_is_strong_stable_and_algorithm_tagged() {
+        // Published BLAKE3 empty-input test vector.
         assert_eq!(
-            fnv1a(b""),
-            "cbf29ce484222325",
-            "the FNV-1a 64-bit offset basis"
+            content_hash(b""),
+            "blake3-256:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         );
-        assert_eq!(fnv1a(b"panoptes"), "db05d32df7ddaad1");
-        assert_ne!(fnv1a(b"panoptes"), fnv1a(b"panoptesx"));
-        assert_eq!(
-            fnv1a(b"panoptes").len(),
-            16,
-            "zero-padded, so hashes sort as text"
-        );
+        assert_ne!(content_hash(b"panoptes"), content_hash(b"panoptesx"));
+        assert_eq!(content_hash(b"panoptes").len(), 75);
     }
 
     #[test]

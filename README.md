@@ -262,3 +262,22 @@ Schema v4 adds identity metadata without rewriting existing graphs. Cache reset
 removes graph data while retaining registered checkout IDs; global cache clear
 also clears identity metadata. Keep a pre-migration SQLite backup when an older
 binary must remain a rollback option.
+
+### Shared source and extraction objects
+
+Schema v5 stores exact source bytes once under an algorithm-tagged BLAKE3-256
+identity. The official Rust implementation selects its supported SIMD backend
+automatically (NEON on little-endian AArch64). Hashes are independent of CPU,
+checkout path, Git instance, branch, and ancestry.
+
+Base extraction profiles include language, full relative path, extractor stamp,
+payload schema, and base mode. Keeping the path prevents identical YAML bytes in
+workflow and ordinary directories from sharing incompatible results. Ansible and
+GitLab include context is still recomputed per checkout; contextual payloads and
+legacy `file_extracts` rows are never promoted into the shared base cache.
+
+A second checkout reuses matching base extractions, but this layer still writes
+its own graph and search postings. Exact-byte capture and the additional base
+cache can increase store size until graph snapshots are shared. Old FNV file
+hashes invalidate on the next refresh; migration itself preserves legacy graphs.
+`cache clear` removes the shared objects too.

@@ -9,6 +9,7 @@ mod ansible;
 mod ask;
 mod cloudformation;
 mod compose;
+mod content;
 mod db;
 mod executable;
 mod export;

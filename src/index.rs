@@ -283,15 +283,37 @@ fn build_internal(
     // Parsing is CPU-bound and owns no database state. Each bounded worker gets
     // its own Tree-sitter parsers/queries; rows are still inserted serially in
     // sorted file order so IDs and exported graph output remain deterministic.
-    let parsed_files = extract_changed(&files, &changed, requested_jobs)?;
-    for (index, extracted) in parsed_files {
+    let mut needing_parse = Vec::new();
+    let mut extracted_files = Vec::new();
+    for &index in &changed {
+        crate::progress::report(
+            "Looking up shared extractions",
+            extracted_files.len(),
+            Some(changed.len()),
+            &files[index].rel,
+        );
+        if let Some(extracted) = crate::content::load_base(&tx, &files[index])? {
+            extracted_files.push((index, extracted));
+            reused += 1;
+        } else {
+            needing_parse.push(index);
+        }
+    }
+    for (index, extracted) in extract_changed(&files, &needing_parse, requested_jobs)? {
+        // Store only the immutable base result, before contextualize mutates it.
+        crate::content::store_base(&tx, &files[index], &extracted)?;
+        extracted_files.push((index, extracted));
+    }
+    // Hit/miss mixtures preserve the same insertion order as a cold serial build.
+    extracted_files.sort_by_key(|(index, _)| *index);
+    for (index, extracted) in extracted_files {
         pending[index] = Some(index_extracted(&tx, repo_id, &files[index], extracted)?);
     }
     let mut pending: Vec<Pending> = pending
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .context("missing extraction after parallel parse")?;
-    let mut parsed = changed.len();
+    let mut parsed = needing_parse.len();
     crate::progress::report("Resolving file context", 0, None, "");
     let mut context_changed = crate::ansible::contextualize(&mut pending, &files)?;
     context_changed.extend(crate::gitlab_ci::contextualize(&mut pending, &files)?);
@@ -306,7 +328,7 @@ fn build_internal(
             &files[index],
             pending[index].extracted.clone(),
         )?;
-        if changed.binary_search(&index).is_err() {
+        if needing_parse.binary_search(&index).is_err() {
             parsed += 1;
             reused -= 1;
         }
@@ -722,6 +744,7 @@ fn index_extracted(
     extracted: extract::Extracted,
 ) -> Result<Pending> {
     let file_id = insert_file(tx, repo_id, source)?;
+    crate::content::attach_file(tx, file_id, source)?;
     let lines = source.text.lines().count().max(1) as i64;
     tx.execute(
         "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature, summary)
@@ -4021,6 +4044,99 @@ module "child" {
         assert_eq!(edges(&serial), edges(&parallel));
         drop((serial, parallel));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shared_base_extractions_reuse_identical_files_across_checkouts() {
+        let source = "export function shared() { return 7; }\n";
+        let (mut db, root) = fixture(&[("src/a.ts", source)]);
+        let second = root.with_extension("second");
+        std::fs::create_dir_all(second.join("src")).unwrap();
+        std::fs::write(second.join("src/a.ts"), source).unwrap();
+        let stats = build(&mut db, &second).unwrap();
+        assert_eq!((stats.parsed, stats.reused), (0, 1));
+        for table in ["content_objects", "extractions"] {
+            assert_eq!(
+                db.query_row(&format!("select count(*) from {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        assert_eq!(
+            db.query_row("select count(*) from file_objects", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        crate::db::reset_repo(&db, &root).unwrap();
+        let id = repo_id_of(&db, &second).unwrap().unwrap();
+        assert_eq!(grep(&db, id, &second, "shared").unwrap().total_hits, 1);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(second);
+    }
+
+    #[test]
+    fn shared_yaml_profiles_separate_paths_and_keep_context_out_of_base_cache() {
+        let workflow = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        let template = ".base: {image: alpine}\n";
+        let (db, root) = fixture(&[
+            (".github/workflows/ci.yml", workflow),
+            ("ordinary/ci.yml", workflow),
+            (
+                ".gitlab-ci.yml",
+                "include: templates/base.yml\njob:\n  extends: .base\n  script: echo hi\n",
+            ),
+            ("templates/base.yml", template),
+        ]);
+        let files = repo::walk(&root).unwrap();
+        let first = files
+            .iter()
+            .find(|file| file.rel == ".github/workflows/ci.yml")
+            .unwrap();
+        let ordinary = files
+            .iter()
+            .find(|file| file.rel == "ordinary/ci.yml")
+            .unwrap();
+        let a = crate::content::load_base(&db, first).unwrap().unwrap();
+        let b = crate::content::load_base(&db, ordinary).unwrap().unwrap();
+        assert_ne!(
+            serde_json::to_value(a).unwrap(),
+            serde_json::to_value(b).unwrap()
+        );
+        let file = files
+            .iter()
+            .find(|file| file.rel == "templates/base.yml")
+            .unwrap();
+        let raw =
+            serde_json::to_value(crate::content::load_base(&db, file).unwrap().unwrap()).unwrap();
+        let expected = extract::Extractor::new()
+            .extract_file(file.lang, &file.text, &file.rel)
+            .unwrap();
+        assert_eq!(raw, serde_json::to_value(expected).unwrap());
+        let contextual: String = db.query_row("select e.payload from file_extracts e join files f on f.id=e.file_id where f.path='templates/base.yml'", [], |row| row.get(0)).unwrap();
+        assert_ne!(
+            raw,
+            serde_json::from_str::<serde_json::Value>(&contextual).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shared_profiles_isolate_languages_and_extractor_versions() {
+        let (db, root) = fixture(&[("src/a.ts", "export function shared() {}\n")]);
+        let mut file = repo::walk(&root).unwrap().remove(0);
+        assert!(crate::content::load_base(&db, &file).unwrap().is_some());
+        file.lang = Lang::Rust;
+        assert!(crate::content::load_base(&db, &file).unwrap().is_none());
+        file.lang = Lang::TypeScript;
+        db.execute(
+            "update extraction_profiles set extractor_stamp='previous-version'",
+            [],
+        )
+        .unwrap();
+        assert!(crate::content::load_base(&db, &file).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
