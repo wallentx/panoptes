@@ -24,6 +24,7 @@ mod kustomize;
 mod mcp;
 mod progress;
 mod repo;
+mod scopes;
 mod search;
 mod snapshot;
 mod viz;
@@ -84,6 +85,11 @@ enum Cmd {
         full: bool,
         #[arg(long = "in")]
         scope: Option<String>,
+        /// Search registered checkouts; expanded scopes emit JSON with provenance.
+        #[arg(long, default_value="checkout", value_parser=["checkout", "repository", "lineage"])]
+        view_scope: String,
+        #[arg(long)]
+        lineage_root: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -220,6 +226,11 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum CacheCmd {
+    /// Reclaim source objects and extraction profiles with no surviving snapshot.
+    Gc {
+        #[arg(long)]
+        yes: bool,
+    },
     /// Remove every indexed repository and reclaim the database space.
     Clear {
         /// Confirm this destructive operation.
@@ -432,8 +443,23 @@ fn main() -> Result<()> {
             source,
             full,
             scope,
+            view_scope,
+            lineage_root,
             json,
         } => {
+            if view_scope != "checkout" || lineage_root.is_some() {
+                let mut args = serde_json::json!({"query":query,"limit":limit,"source":source,"full":full,"scope":view_scope});
+                if let Some(scope) = scope {
+                    args["in"] = scope.into();
+                }
+                if let Some(root) = lineage_root {
+                    args["lineageRoot"] = root.into();
+                }
+                let value =
+                    mcp::call_tool(&store, &repo::targets(&path)?, "find", &args, no_refresh)?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
             let Some(ready) = ready_targets(&store, &path, no_refresh)? else {
                 std::process::exit(2);
             };
@@ -1021,8 +1047,15 @@ fn main() -> Result<()> {
                 println!("created clean store at {}", store.display());
                 return Ok(());
             }
-            let conn = db::open(&store)?;
+            let mut conn = db::open(&store)?;
             match command {
+                CacheCmd::Gc { yes } => {
+                    anyhow::ensure!(
+                        yes,
+                        "rerun cache gc with --yes to reclaim unused cached objects"
+                    );
+                    println!("{}", snapshot::gc(&mut conn)?);
+                }
                 CacheCmd::Clear { yes } => {
                     if !yes {
                         anyhow::bail!("refusing to clear the whole store; rerun with --yes");

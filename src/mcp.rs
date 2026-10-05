@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, anyhow};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
@@ -148,7 +148,7 @@ fn tool_schemas() -> Vec<Value> {
 }
 
 fn schema(name: &str, description: &str, required: &[&str]) -> Value {
-    let properties = match name {
+    let mut properties = match name {
         "find" => {
             json!({
                 "query":{"type":"string", "description":"Natural-language or structural code question."},
@@ -185,6 +185,10 @@ fn schema(name: &str, description: &str, required: &[&str]) -> Value {
             json!({"repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}})
         }
     };
+    if !matches!(name, "freshness" | "worktrees") {
+        properties["scope"] = json!({"type":"string","enum":["checkout","repository","lineage"],"default":"checkout","description":"Expand to registered live checkouts in one Git instance or one explicitly verified ancestry root."});
+        properties["lineageRoot"] = json!({"type":"string","description":"Required for lineage scope: sha1:<root-oid> or sha256:<root-oid>. Observe ancestry first with panoptes identity PATH --lineage."});
+    }
     json!({
         "name":name,
         "description":description,
@@ -200,8 +204,7 @@ fn schema(name: &str, description: &str, required: &[&str]) -> Value {
     })
 }
 
-#[cfg(test)]
-fn call_tool(
+pub(crate) fn call_tool(
     store: &Path,
     targets: &[repo::Target],
     name: &str,
@@ -234,7 +237,42 @@ fn call_tool_detailed(
         "map" | "status" | "freshness" | "worktrees" => {}
         _ => return Err(anyhow!("unknown tool: {name}")),
     }
-    let selected = select_targets(targets, args.get("repo").and_then(Value::as_str))?;
+    let scope = args
+        .get("scope")
+        .map(|v| v.as_str().context("scope must be a string"))
+        .transpose()?
+        .unwrap_or("checkout");
+    let lineage = args
+        .get("lineageRoot")
+        .map(|v| v.as_str().context("lineageRoot must be a string"))
+        .transpose()?;
+    crate::scopes::validate(scope, lineage, name)?;
+    let mut selected = select_targets(targets, args.get("repo").and_then(Value::as_str))?;
+    let mut unknown = 0usize;
+    let mut scope_identities = HashMap::new();
+    let mut selected_instances = HashSet::new();
+    if scope != "checkout" {
+        let mut conn = open_with_contention_retry(store)?;
+        for target in &selected {
+            if !no_refresh {
+                refresh_with_contention_retry(&mut conn, &target.root)?;
+            }
+            if let Some(uid) =
+                crate::identity::metadata(&conn, &target.root)?["gitInstanceId"].as_str()
+            {
+                selected_instances.insert(uid.to_string());
+            }
+        }
+        let expanded = crate::scopes::expand(&conn, &selected, scope, lineage)?;
+        selected = expanded.targets;
+        unknown = expanded.unknown;
+        scope_identities = expanded.identities;
+    }
+    let mut labels = HashMap::new();
+    for target in &selected {
+        *labels.entry(target.label.clone()).or_insert(0usize) += 1;
+    }
+    let mut queried: HashMap<(i64, String), Value> = HashMap::new();
     if name == "worktrees" {
         return Ok(ToolData {
             value: json!({"worktrees":repo::related_worktrees(&selected).iter().map(repo::checkout_identity).collect::<Vec<_>>()}),
@@ -253,6 +291,17 @@ fn call_tool_detailed(
             target.root.display()
         );
         let identity = repo::checkout_identity(&target);
+        if let Some(expected) = scope_identities.get(&target.root) {
+            anyhow::ensure!(
+                expected == &identity,
+                "scope membership changed during request; retry"
+            );
+        }
+        let result_key = if labels[&target.label] > 1 {
+            target.root.to_string_lossy().into_owned()
+        } else {
+            target.label.clone()
+        };
         checkouts.push(identity.clone());
         crate::progress::report("Opening index", 0, None, &target.root.to_string_lossy());
         let mut conn = open_with_contention_retry(store)?;
@@ -268,7 +317,7 @@ fn call_tool_detailed(
             index::freshness(&conn, &target.root)?
         };
         if name == "freshness" {
-            results.insert(target.label.clone(), serde_json::to_value(state)?);
+            results.insert(result_key, serde_json::to_value(state)?);
             continue;
         }
         if !state.indexed {
@@ -302,56 +351,81 @@ fn call_tool_detailed(
             );
         }
         let repo_id = index::repo_id_of(conn, &target.root)?.context("current index missing")?;
-        let value = match name {
-            "find" => serde_json::to_value(ask::ask(
-                conn,
-                repo_id,
-                &target.root,
-                string_arg(args, "query")?,
-                ask::AskOptions {
-                    limit: usize_arg(args, "limit", 8),
-                    scope: args.get("in").and_then(Value::as_str),
-                    source: bool_arg_default(args, "source", true),
-                    full: bool_arg(args, "full"),
-                },
-            )?)?,
-            "grep" => serde_json::to_value(index::grep_with_options(
-                conn,
-                repo_id,
-                &target.root,
-                string_arg(args, "pattern")?,
-                index::GrepOptions {
-                    ignore_case: bool_arg_named(args, "ignoreCase"),
-                    fixed: bool_arg(args, "fixed"),
-                    scope: args.get("in").and_then(Value::as_str),
-                },
-            )?)?,
-            "callers" => {
-                let (seeds, reached) = index::callers_scoped(
+        if scope != "checkout" {
+            anyhow::ensure!(
+                crate::scopes::still_member(conn, &target, scope, lineage, &selected_instances)?,
+                "scope membership changed during request; retry"
+            );
+        }
+        let storage_key: String = conn.query_row(
+            "select storage_key from snapshots where id=?1",
+            [repo_id],
+            |row| row.get(0),
+        )?;
+        let query_key = (repo_id, storage_key);
+        let cached = if name == "status" {
+            None
+        } else {
+            queried.get(&query_key).cloned()
+        };
+        let cache_hit = cached.is_some();
+        let value = if let Some(cached) = cached {
+            cached
+        } else {
+            match name {
+                "find" => serde_json::to_value(ask::ask(
                     conn,
                     repo_id,
-                    string_arg(args, "symbol")?,
-                    args.get("direction").and_then(Value::as_str) == Some("out"),
-                    usize_arg(args, "depth", 1).min(32),
-                    args.get("in").and_then(Value::as_str),
-                )?;
-                json!({"seeds":seeds, "reached":reached})
+                    &target.root,
+                    string_arg(args, "query")?,
+                    ask::AskOptions {
+                        limit: usize_arg(args, "limit", 8),
+                        scope: args.get("in").and_then(Value::as_str),
+                        source: bool_arg_default(args, "source", true),
+                        full: bool_arg(args, "full"),
+                    },
+                )?)?,
+                "grep" => serde_json::to_value(index::grep_with_options(
+                    conn,
+                    repo_id,
+                    &target.root,
+                    string_arg(args, "pattern")?,
+                    index::GrepOptions {
+                        ignore_case: bool_arg_named(args, "ignoreCase"),
+                        fixed: bool_arg(args, "fixed"),
+                        scope: args.get("in").and_then(Value::as_str),
+                    },
+                )?)?,
+                "callers" => {
+                    let (seeds, reached) = index::callers_scoped(
+                        conn,
+                        repo_id,
+                        string_arg(args, "symbol")?,
+                        args.get("direction").and_then(Value::as_str) == Some("out"),
+                        usize_arg(args, "depth", 1).min(32),
+                        args.get("in").and_then(Value::as_str),
+                    )?;
+                    json!({"seeds":seeds, "reached":reached})
+                }
+                "skeleton" => {
+                    let requested = string_arg(args, "file")?;
+                    let rel =
+                        index::skeleton_path(conn, repo_id, requested)?.with_context(|| {
+                            format!("no unique indexed file matching {requested:?}")
+                        })?;
+                    json!({"path":rel, "symbols":index::skeleton(conn, repo_id, &rel)?})
+                }
+                "map" => serde_json::to_value(index::repo_map(conn, repo_id, 12)?)?,
+                "status" => json!({
+                    "root":target.root,
+                    "store":index::repo_status(conn, repo_id)?,
+                    "freshness":state,
+                }),
+                _ => unreachable!("tool name validated before indexing"),
             }
-            "skeleton" => {
-                let requested = string_arg(args, "file")?;
-                let rel = index::skeleton_path(conn, repo_id, requested)?
-                    .with_context(|| format!("no unique indexed file matching {requested:?}"))?;
-                json!({"path":rel, "symbols":index::skeleton(conn, repo_id, &rel)?})
-            }
-            "map" => serde_json::to_value(index::repo_map(conn, repo_id, 12)?)?,
-            "status" => json!({
-                "root":target.root,
-                "store":index::repo_status(conn, repo_id)?,
-                "freshness":state,
-            }),
-            _ => unreachable!("tool name validated before indexing"),
         };
-        if matches!(name, "find" | "grep" | "callers" | "skeleton" | "map") {
+        queried.insert(query_key, value.clone());
+        if !cache_hit && matches!(name, "find" | "grep" | "callers" | "skeleton" | "map") {
             let mut paths = HashSet::new();
             collect_result_paths(&value, &mut paths);
             for path in paths {
@@ -372,10 +446,14 @@ fn call_tool_detailed(
             identity == repo::checkout_identity(&target),
             "checkout changed during request; retry with a stable worktree"
         );
-        results.insert(target.label.clone(), value);
+        results.insert(result_key, value);
+    }
+    let mut value = json!({"repositories":results, "panoptesCheckouts":checkouts});
+    if scope != "checkout" {
+        value["panoptesScope"] = json!({"scope":scope,"lineageRoot":lineage,"snapshotsSearched":queried.len(),"unverifiedRegisteredCheckouts":unknown,"ranking":"per-snapshot"});
     }
     Ok(ToolData {
-        value: json!({"repositories":results, "panoptesCheckouts":checkouts}),
+        value,
         baseline_bytes,
         baseline_files,
     })
@@ -640,6 +718,58 @@ mod tests {
             select_targets(&targets, targets[1].root.to_str()).unwrap()[0].root,
             targets[1].root.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn repository_scope_queries_shared_snapshot_once_with_all_provenance() {
+        let temp = TempDir::new("repository-scope");
+        let a = temp.0.join("first/repo");
+        let b = temp.0.join("second/repo");
+        std::fs::create_dir_all(a.join(".git/worktrees/second")).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            a.join(".git/worktrees/second/HEAD"),
+            "ref: refs/heads/second\n",
+        )
+        .unwrap();
+        std::fs::write(a.join(".git/worktrees/second/commondir"), "../..\n").unwrap();
+        std::fs::write(
+            b.join(".git"),
+            format!("gitdir: {}\n", a.join(".git/worktrees/second").display()),
+        )
+        .unwrap();
+        for root in [&a, &b] {
+            std::fs::write(root.join("a.rs"), "pub fn original() {}\n").unwrap();
+        }
+        let a = a.canonicalize().unwrap();
+        let b = b.canonicalize().unwrap();
+        let store = temp.0.join("store.db");
+        let mut db = db::open(&store).unwrap();
+        index::build(&mut db, &a).unwrap();
+        index::build(&mut db, &b).unwrap();
+        let args = json!({"query":"original","repo":a,"scope":"repository"});
+        let output = call_tool_detailed(&store, &[], "find", &args, true).unwrap();
+        assert_eq!(output.value["panoptesScope"]["snapshotsSearched"], 1);
+        assert_eq!(
+            output.value["panoptesCheckouts"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(output.value["repositories"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            output.value["repositories"][a.to_str().unwrap()]["hits"][0]["name"],
+            "original"
+        );
+        assert_eq!(
+            output.value["repositories"][b.to_str().unwrap()]["hits"][0]["name"],
+            "original"
+        );
+        assert_eq!(output.baseline_files, 1);
+        std::fs::write(b.join("a.rs"), "pub fn different() {}\n").unwrap();
+        let output = call_tool(&store, &[], "find", &args, false).unwrap();
+        assert_eq!(output["panoptesScope"]["snapshotsSearched"], 2);
+        let unsupported = call_tool(&store, &[], "freshness", &args, false).unwrap_err();
+        assert!(unsupported.to_string().contains("only supports checkout"));
     }
 
     #[test]

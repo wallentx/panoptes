@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever the DDL below changes in a way an existing store cannot serve.
 /// Read from and written to `pragma user_version`.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 // Historical v1 schema: migrations preserve its row IDs while evolving ownership.
 const DDL: &str = r#"
@@ -228,6 +228,9 @@ pub fn open(path: &Path) -> Result<Connection> {
                     crate::identity::register(&tx, Path::new(&root), snapshot)?;
                 }
             }
+        }
+        if version < 7 {
+            crate::snapshot::enable_reuse(&tx)?;
         }
         if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;

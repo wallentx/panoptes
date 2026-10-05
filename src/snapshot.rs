@@ -151,3 +151,154 @@ pub fn reused_stats(db: &Connection, id: i64) -> Result<index::BuildStats> {
     stats.deleted = 0;
     Ok(stats)
 }
+
+/// Migrate verified v6 duplicates before enforcing one ready graph per input.
+pub fn enable_reuse(db: &Connection) -> Result<()> {
+    let conflicts: i64 = db.query_row("select count(*) from snapshot_manifests a join snapshot_manifests b on a.input_key=b.input_key and a.snapshot_id<b.snapshot_id where a.ready=1 and a.source_complete=1 and b.ready=1 and b.source_complete=1 and a.manifest is not b.manifest", [], |r| r.get(0))?;
+    ensure!(
+        conflicts == 0,
+        "conflicting snapshot manifests share an input key"
+    );
+    db.execute_batch("update checkouts set snapshot_id=(select min(b.snapshot_id) from snapshot_manifests a join snapshot_manifests b on b.input_key=a.input_key where a.snapshot_id=checkouts.snapshot_id and b.ready=1 and b.source_complete=1), generation=generation+1, attached_at=unixepoch() where snapshot_id in (select a.snapshot_id from snapshot_manifests a where a.ready=1 and a.source_complete=1 and exists(select 1 from snapshot_manifests b where b.input_key=a.input_key and b.ready=1 and b.source_complete=1 and b.snapshot_id<a.snapshot_id));")?;
+    collect_unreferenced(db)?;
+    db.execute_batch("drop index snapshots_by_input; create unique index snapshots_by_input on snapshot_manifests(input_key) where ready=1 and source_complete=1;")?;
+    Ok(())
+}
+
+pub fn lookup(db: &Connection, manifest: &Manifest) -> Result<Option<i64>> {
+    let found: Option<(i64, String)> = db.query_row("select snapshot_id,manifest from snapshot_manifests m join snapshots s on s.id=m.snapshot_id where input_key=?1 and ready=1 and source_complete=1 and extractor_stamp=?2", params![manifest.key,index::EXTRACTOR_STAMP], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((id, stored)) = found {
+        ensure!(
+            stored == manifest.json,
+            "snapshot digest collision or corrupt manifest"
+        );
+        Ok(Some(id))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Transactional, explicit reclamation. Attached snapshots retain their sources.
+pub fn gc(db: &mut Connection) -> Result<serde_json::Value> {
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let snapshots = collect_unreferenced(&tx)?;
+    let objects = tx.execute("delete from content_objects where not exists(select 1 from file_objects where object_id=content_objects.id)", [])?;
+    let profiles = tx.execute("delete from extraction_profiles where not exists(select 1 from extractions where profile_id=extraction_profiles.id)", [])?;
+    tx.commit()?;
+    Ok(
+        serde_json::json!({"snapshots":snapshots,"sourceObjects":objects,"extractionProfiles":profiles}),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{db, identity, index};
+    use std::path::PathBuf;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "panoptes-sharing-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn root(&self, name: &str, source: &str) -> PathBuf {
+            let root = self.0.join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            if !source.is_empty() {
+                std::fs::write(root.join("a.rs"), source).unwrap();
+            }
+            root
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn shared_graphs_diverge_reset_and_gc_without_damaging_other_checkouts() {
+        let f = Fixture::new();
+        let a = f.root("first", "pub fn original() {}\n");
+        let b = f.root("second", "pub fn original() {}\n");
+        let mut db = db::open(&f.0.join("store.db")).unwrap();
+        index::build(&mut db, &a).unwrap();
+        let counts = |db: &Connection| -> (i64, i64, i64) {
+            db.query_row("select (select count(*) from symbols),(select count(*) from search_terms),(select count(*) from extractions)", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap()
+        };
+        let before = counts(&db);
+        let stats = index::build(&mut db, &b).unwrap();
+        assert_eq!(stats.parsed, 0);
+        assert_eq!(stats.reused, 1);
+        assert_eq!(counts(&db), before);
+        let old = index::repo_id_of(&db, &a).unwrap().unwrap();
+        assert_eq!(Some(old), index::repo_id_of(&db, &b).unwrap());
+        let a_uid = identity::metadata(&db, &a).unwrap()["checkoutId"].clone();
+        assert_ne!(a_uid, identity::metadata(&db, &b).unwrap()["checkoutId"]);
+        std::fs::write(a.join("a.rs"), "pub fn changed() {}\n").unwrap();
+        index::build(&mut db, &a).unwrap();
+        assert_ne!(Some(old), index::repo_id_of(&db, &a).unwrap());
+        assert_eq!(Some(old), index::repo_id_of(&db, &b).unwrap());
+        assert!(
+            crate::content::source(&db, old, "a.rs")
+                .unwrap()
+                .unwrap()
+                .contains("original")
+        );
+        db::reset_repo(&db, &a).unwrap();
+        assert_eq!(a_uid, identity::metadata(&db, &a).unwrap()["checkoutId"]);
+        assert_eq!(gc(&mut db).unwrap()["sourceObjects"], 1);
+        assert_eq!(Some(old), index::repo_id_of(&db, &b).unwrap());
+        assert_eq!(counts(&db), before);
+        std::fs::remove_dir_all(&a).unwrap();
+        db::prune_missing(&db).unwrap();
+        assert_eq!(Some(old), index::repo_id_of(&db, &b).unwrap());
+        assert_eq!(db::integrity(&db).unwrap(), "ok");
+    }
+
+    #[test]
+    fn v6_duplicate_ready_snapshots_consolidate_preserving_checkout_ids() {
+        let f = Fixture::new();
+        let a = f.root("a", "");
+        let b = f.root("b", "");
+        let path = f.0.join("store.db");
+        let mut db = db::open(&path).unwrap();
+        let stats = index::build(&mut db, &a).unwrap();
+        let first = index::repo_id_of(&db, &a).unwrap().unwrap();
+        db.execute_batch("drop index snapshots_by_input; create index snapshots_by_input on snapshot_manifests(input_key) where ready=1 and source_complete=1;").unwrap();
+        let tx = db.transaction().unwrap();
+        let manifest = manifest(&[], None).unwrap();
+        let second = begin(&tx, &manifest, None, 0).unwrap();
+        finish(&tx, second, &b, &stats).unwrap();
+        tx.commit().unwrap();
+        let uid = identity::metadata(&db, &b).unwrap()["checkoutId"].clone();
+        db.pragma_update(None, "user_version", 6).unwrap();
+        drop(db);
+        let db = db::open(&path).unwrap();
+        assert_eq!(index::repo_id_of(&db, &a).unwrap(), Some(first));
+        assert_eq!(index::repo_id_of(&db, &b).unwrap(), Some(first));
+        assert_eq!(identity::metadata(&db, &b).unwrap()["checkoutId"], uid);
+        assert_eq!(
+            db.query_row("select count(*) from snapshots", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(db::integrity(&db).unwrap(), "ok");
+        assert!(
+            db.prepare("pragma foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+    }
+}

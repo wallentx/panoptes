@@ -276,10 +276,9 @@ workflow and ordinary directories from sharing incompatible results. Ansible and
 GitLab include context is still recomputed per checkout; contextual payloads and
 legacy `file_extracts` rows are never promoted into the shared base cache.
 
-A second checkout reuses matching base extractions, but this layer still writes
-its own graph and search postings. Exact-byte capture and the additional base
-cache can increase store size until graph snapshots are shared. Old FNV file
-hashes invalidate on the next refresh; migration itself preserves legacy graphs.
+A second checkout reuses matching base extractions; an identical complete input
+manifest also shares the graph and search postings. Old FNV file hashes invalidate
+on the next refresh; migration itself preserves legacy graphs.
 `cache clear` removes the shared objects too.
 
 ### Immutable graph snapshots
@@ -312,5 +311,51 @@ stability check, not an operating-system-level atomic filesystem snapshot.
 Old unreferenced graphs are reclaimed after attachment changes. Attached graphs
 survive another checkout's reset, and SQLite readers retain their prior view
 until their read transaction ends. Base source/extraction objects remain cached
-until explicit cache cleanup. This intermediate layer still builds separate
-graphs for different checkouts; cross-checkout snapshot attachment follows next.
+until explicit cache cleanup. `panoptes cache gc --yes` reclaims unused source
+objects and extraction profiles without removing any attached snapshot.
+
+
+### Shared snapshots and explicit query scopes
+
+Schema v7 attaches checkouts with identical complete input manifests to one ready
+snapshot, even across unrelated Git instances. A second identical checkout does
+not parse, resolve, or write graph/search rows again. Editing one checkout creates
+or selects a different snapshot without changing other checkouts. Migration
+consolidates verified schema-v6 duplicates while preserving checkout IDs; legacy
+unverified graphs remain private until refreshed.
+
+MCP `find`, `grep`, `callers`, `skeleton`, `map`, and `status` accept:
+
+| `scope` | Membership |
+| --- | --- |
+| `checkout` (default) | Selected checkout(s), preserving current behavior |
+| `repository` | Registered live checkouts with the selected store-local Git instance ID |
+| `lineage` | Registered live checkouts with a current complete observation containing exactly `lineageRoot` |
+
+Use `panoptes identity /absolute/checkout --lineage` to record bounded physical
+ancestry first. Lineage scope requires `lineageRoot: "sha1:<root-oid>"` (or
+`sha256:<root-oid>`). Missing/stale observations, shallow history, and grafts do not
+establish membership. MCP does not start ancestry subprocesses; a changed HEAD
+requires an explicit new observation. A merge containing roots A and B belongs
+to either explicitly selected root; selecting A never includes B-only histories.
+New worktrees must be registered/indexed before expanded scopes include them.
+
+Expanded queries execute once per distinct snapshot, retain per-snapshot ranking,
+and return every checkout's provenance in `panoptesCheckouts`. Duplicate basename
+labels use absolute paths as result keys. `panoptesScope` reports scope, number
+of snapshots searched, and skipped checkouts with unverified membership. No
+cross-snapshot symbol-ID deduplication or blended-corpus ranking is implied.
+`freshness` and `worktrees` remain observational checkout-scope tools.
+
+CLI examples (expanded scopes always print JSON with provenance):
+
+```sh
+panoptes ask 'resolve imports' /absolute/checkout --view-scope repository
+panoptes identity /absolute/checkout --lineage
+panoptes ask 'resolve imports' /absolute/checkout --view-scope lineage --lineage-root sha1:<root-oid>
+```
+
+Snapshot sharing optimizes identical trees. A changed manifest still materializes
+a complete graph using cached base extractions; fine-grained incremental graph
+sharing is deferred. Two-pass input verification adds source reads. Benchmark
+changed-checkout latency separately from identical-checkout attachment.

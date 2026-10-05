@@ -262,6 +262,26 @@ fn build_internal(
         .iter()
         .filter(|path| !current_paths.contains(path.as_str()))
         .count();
+    if let Some(id) = crate::snapshot::lookup(&tx, &manifest)? {
+        let verified =
+            crate::snapshot::manifest(&repo::walk(root)?, resolver_input(root)?.as_deref())?;
+        anyhow::ensure!(
+            verified.json == manifest.json,
+            "checkout changed during snapshot attachment; retry"
+        );
+        let mut stats = crate::snapshot::reused_stats(&tx, id)?;
+        stats.deleted = deleted;
+        crate::identity::register(&tx, root, Some(id))?;
+        crate::snapshot::collect_unreferenced(&tx)?;
+        tx.commit()?;
+        crate::progress::report(
+            "Reusing ready snapshot",
+            files.len(),
+            Some(files.len()),
+            &root.to_string_lossy(),
+        );
+        return Ok(Some(stats));
+    }
     let repo_id = crate::snapshot::begin(&tx, &manifest, go_mod.as_deref(), unix_now())?;
     let mut pending: Vec<Option<Pending>> = (0..files.len()).map(|_| None).collect();
     let changed: Vec<usize> = (0..files.len()).collect();
@@ -4153,7 +4173,7 @@ module "child" {
             db.query_row("select count(*) from file_objects", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            2
+            1
         );
         crate::db::reset_repo(&db, &root).unwrap();
         let id = repo_id_of(&db, &second).unwrap().unwrap();
