@@ -27,7 +27,7 @@ impl Fixture {
             .output()
             .unwrap();
         assert!(init.status.success());
-        let fixture = Self(root);
+        let fixture = Self(root.canonicalize().unwrap());
         fixture.source("pub fn original() {}\n");
         fixture
     }
