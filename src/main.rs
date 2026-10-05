@@ -20,6 +20,7 @@ mod init;
 mod kubernetes;
 mod kustomize;
 mod mcp;
+mod progress;
 mod repo;
 mod search;
 mod viz;
@@ -126,7 +127,7 @@ enum Cmd {
     Mcp {
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Wall-clock limit for each tool call, including indexing (1-300 seconds).
+        /// Stop after this many seconds without meaningful progress (1-300 seconds).
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
         timeout_secs: u64,
     },
@@ -358,6 +359,10 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Build { path, jobs } => {
+            use std::io::IsTerminal;
+            if std::io::stderr().is_terminal() {
+                progress::install(|update| eprintln!("{}", update.message()));
+            }
             let mut conn = db::open(&store)?;
             for target in repo::targets(&path)? {
                 let t0 = std::time::Instant::now();

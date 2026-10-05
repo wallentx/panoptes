@@ -132,6 +132,17 @@ pub fn open(path: &Path) -> Result<Connection> {
     }
     let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
+    if crate::progress::enabled() {
+        let mut steps = 0u64;
+        db.progress_handler(
+            50_000,
+            Some(move || {
+                steps = steps.saturating_add(50_000);
+                crate::progress::database_steps(steps);
+                false
+            }),
+        )?;
+    }
 
     let found: i64 = db.query_row("pragma user_version", [], |r| r.get(0))?;
     anyhow::ensure!(

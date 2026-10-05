@@ -109,16 +109,55 @@ registration and usage guidance while preserving existing configuration. The
 MCP server indexes the current repository when needed and refreshes changed
 files automatically.
 
-MCP tool calls have a **30-second timeout**, including waiting for startup
-indexing, refreshing files, and SQLite queries. Startup indexing also has a
-30-second budget. On timeout, Panoptes stops the worker, releases its database
-locks, and returns an error; the MCP server stays available for the next request.
-Uncommitted index updates roll back, preserving the last committed snapshot.
+MCP tool calls have a **30-second inactivity timeout**. Real progress in file
+scanning, parsing, symbol writing, graph resolution, and SQLite execution resets
+that timer, so a
+productive build can run longer than 30 seconds. Repeated waiting messages do
+not reset it. A queued request also expires after 30 seconds without starting.
+On inactivity, Panoptes stops the worker, releases database locks, and rolls back
+uncommitted index changes; the MCP connection remains usable.
 
-For a large initial index, run `panoptes build /path/to/repo` separately. To
-change the MCP budget, add `--timeout-secs 60` to the server's `mcp` arguments
-(allowed range: 1-300 seconds), then restart the client. Direct CLI builds are
-not subject to the MCP timeout.
+Progress is streamed while work runs. Clients that provide
+`_meta.progressToken` receive `notifications/progress` with an increasing update
+count and a stage message. Other clients receive structured
+`notifications/message` logs at `info` level; `logging/setLevel` controls those
+logs. Stage messages include file/symbol counts where available; database updates
+count approximate SQLite VM instructions, not rows or percent complete. A busy
+lock wait does not produce database progress. Interactive
+`panoptes build` also prints progress to stderr. The client controls how MCP
+notifications appear in its interface.
+
+To change the inactivity window, add `--timeout-secs 60` to the server's `mcp`
+arguments (allowed range: 1-300 seconds), then restart the client. Direct CLI
+builds have no MCP inactivity limit. A stalled indexing transaction is rolled
+back; retrying starts another attempt rather than resuming its partial writes.
+
+For concurrent PR reviews, pass the absolute worktree path in `repo` on each
+MCP call, for example:
+
+```json
+{"name":"find","arguments":{"query":"authentication","repo":"/src/project-pr-42"}}
+```
+
+Use `worktrees` to discover related checkouts, including ones created after the
+MCP connection started. Discovery retains the common Git directory when the
+startup worktree is removed, and omits missing checkouts. Unique checkout labels
+also work; absolute paths avoid label collisions. Omitting `repo` continues to select the startup repositories.
+Changing a shell's working directory does not retarget an existing connection.
+Repository results are under `repositories[checkout_label]`, separate from
+metadata even when the checkout name matches a metadata key. Results include
+`panoptesCheckouts` with the canonical root, common Git directory,
+branch, and observed HEAD. These describe live working files, including edits;
+they are not immutable branch snapshots.
+
+Each connection runs at most two isolated query workers, with up to 32 outstanding
+operations and 128 callers. Identical parameters arriving while an operation is
+queued or running share that operation, its progress, and its inactivity timer; completed
+results are not cached. `panoptesExecution` identifies shared operations. Ping and
+tool listing remain responsive during indexing. Cancellation removes only that
+caller's interest; a worker stops when no callers remain. SQLite WAL permits
+concurrent readers; builders serialize and recheck freshness after obtaining the
+write lock. Separate checkouts retain separate graphs and parse caches.
 
 Ranked search caches per-field terms when files are indexed, so queries retrieve
 matching symbols without tokenizing the whole repository again. ASCII text uses

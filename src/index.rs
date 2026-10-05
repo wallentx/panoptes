@@ -161,11 +161,32 @@ pub fn build_with_jobs(
     root: &Path,
     requested_jobs: usize,
 ) -> Result<BuildStats> {
+    build_internal(db, root, requested_jobs, false)?.context("explicit build was skipped")
+}
+
+/// Serialize builders across processes, then recheck after acquiring the writer
+/// lock: another request may already have refreshed this checkout while we waited.
+pub fn build_if_stale(db: &mut Connection, root: &Path) -> Result<bool> {
+    Ok(build_internal(db, root, default_jobs(), true)?.is_some())
+}
+
+fn build_internal(
+    db: &mut Connection,
+    root: &Path,
+    requested_jobs: usize,
+    only_stale: bool,
+) -> Result<Option<BuildStats>> {
+    crate::progress::report("Waiting for index writer", 0, None, &root.to_string_lossy());
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .context("begin build transaction")?;
+    crate::progress::report("Index writer acquired", 0, None, &root.to_string_lossy());
+    if only_stale && freshness(&tx, root)?.is_clean() {
+        return Ok(None);
+    }
     let files = repo::walk(root).context("walk the work tree")?;
     let common = repo::git_common_dir(root);
     let now = unix_now();
-
-    let tx = db.transaction().context("begin build transaction")?;
     tx.execute(
         "insert into repos(root, git_common_dir, indexed_at, extractor_stamp)
          values (?1, ?2, ?3, ?4)
@@ -192,6 +213,7 @@ pub fn build_with_jobs(
     // Every relationship is cheap to reconstruct from extraction payloads and
     // may depend on a changed definition elsewhere. Module nodes are derived from
     // unresolved imports and are recreated with those relationships.
+    crate::progress::report("Removing outdated graph", 0, None, &root.to_string_lossy());
     tx.execute("delete from edges where repo_id=?1", [repo_id])?;
     tx.execute(
         "delete from symbols where repo_id=?1 and kind='module'",
@@ -207,6 +229,7 @@ pub fn build_with_jobs(
     let mut changed = Vec::new();
     let mut reused = 0usize;
     for (index, file) in files.iter().enumerate() {
+        crate::progress::report("Loading cached files", index, Some(files.len()), &file.rel);
         let cached = existing
             .get(&file.rel)
             .filter(|old| old.hash == file.hash)
@@ -246,6 +269,7 @@ pub fn build_with_jobs(
         .collect::<Option<Vec<_>>>()
         .context("missing extraction after parallel parse")?;
     let mut parsed = changed.len();
+    crate::progress::report("Resolving file context", 0, None, "");
     let mut context_changed = crate::ansible::contextualize(&mut pending, &files)?;
     context_changed.extend(crate::gitlab_ci::contextualize(&mut pending, &files)?);
     context_changed.sort_unstable();
@@ -271,7 +295,13 @@ pub fn build_with_jobs(
     let mut file_symbol: HashMap<String, i64> = HashMap::new();
     let mut file_rows: HashMap<String, i64> = HashMap::new();
     let mut n_symbols = 0usize;
-    for file in &pending {
+    for (file_index, file) in pending.iter().enumerate() {
+        crate::progress::report(
+            "Collecting definitions",
+            file_index,
+            Some(pending.len()),
+            &file.rel,
+        );
         file_symbol.insert(file.rel.clone(), file.file_symbol);
         file_rows.insert(file.rel.clone(), file.file_id);
         n_symbols += 1 + file.symbol_ids.len();
@@ -303,7 +333,13 @@ pub fn build_with_jobs(
         "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
          values (?1, ?2, ?3, ?4)",
     )?;
-    for file in &pending {
+    for (file_index, file) in pending.iter().enumerate() {
+        crate::progress::report(
+            "Linking definitions",
+            file_index,
+            Some(pending.len()),
+            &file.rel,
+        );
         for (index, &id) in file.symbol_ids.iter().enumerate() {
             let parent = file
                 .extracted
@@ -320,7 +356,13 @@ pub fn build_with_jobs(
     let mut external: HashMap<String, i64> = HashMap::new();
     let go_module = go_module_path(root);
     let active_gitlab = crate::gitlab_ci::active_paths(&pending);
-    for file in &pending {
+    for (file_index, file) in pending.iter().enumerate() {
+        crate::progress::report(
+            "Resolving imports",
+            file_index,
+            Some(pending.len()),
+            &file.rel,
+        );
         if file.extracted.automation.dialect == crate::yaml::Dialect::GitLab
             && !active_gitlab.contains(file.rel.as_str())
         {
@@ -365,7 +407,13 @@ pub fn build_with_jobs(
     }
 
     let mut unresolved = 0usize;
-    for file in &pending {
+    for (file_index, file) in pending.iter().enumerate() {
+        crate::progress::report(
+            "Resolving calls",
+            file_index,
+            Some(pending.len()),
+            &file.rel,
+        );
         let mut bindings: HashMap<(Option<usize>, &str), &str> = HashMap::new();
         for binding in &file.extracted.bindings {
             bindings.insert((binding.owner, binding.name.as_str()), binding.ty.as_str());
@@ -423,22 +471,29 @@ pub fn build_with_jobs(
         }
     }
 
+    crate::progress::report("Resolving automation", 0, Some(7), "ansible");
     let mut automation = crate::ansible::resolve(&pending, &file_symbol);
+    crate::progress::report("Resolving automation", 1, Some(7), "github_actions");
     let actions = crate::github_actions::resolve(&pending, &file_symbol, &external);
     automation.edges.extend(actions.edges);
     automation.unresolved += actions.unresolved;
+    crate::progress::report("Resolving automation", 2, Some(7), "compose");
     let compose = crate::compose::resolve(&pending, &file_symbol);
     automation.edges.extend(compose.edges);
     automation.unresolved += compose.unresolved;
+    crate::progress::report("Resolving automation", 3, Some(7), "kubernetes");
     let kube = crate::kubernetes::resolve(&pending);
     automation.edges.extend(kube.edges);
     automation.unresolved += kube.unresolved;
+    crate::progress::report("Resolving automation", 4, Some(7), "kustomize");
     let kustomize = crate::kustomize::resolve(&pending, &file_symbol);
     automation.edges.extend(kustomize.edges);
     automation.unresolved += kustomize.unresolved;
+    crate::progress::report("Resolving automation", 5, Some(7), "gitlab_ci");
     let gitlab = crate::gitlab_ci::resolve(&pending, &file_symbol, &external);
     automation.edges.extend(gitlab.edges);
     automation.unresolved += gitlab.unresolved;
+    crate::progress::report("Resolving automation", 6, Some(7), "cloudformation");
     let cloudformation = crate::cloudformation::resolve(&pending);
     automation.edges.extend(cloudformation.edges);
     automation.unresolved += cloudformation.unresolved;
@@ -448,8 +503,20 @@ pub fn build_with_jobs(
     }
 
     drop(insert_edge);
+    crate::progress::report(
+        "Committing index",
+        files.len(),
+        Some(files.len()),
+        &root.to_string_lossy(),
+    );
     tx.commit().context("commit build")?;
-    Ok(BuildStats {
+    crate::progress::report(
+        "Index committed",
+        files.len(),
+        Some(files.len()),
+        &root.to_string_lossy(),
+    );
+    Ok(Some(BuildStats {
         files: files.len(),
         symbols: n_symbols,
         edges: n_edges,
@@ -457,7 +524,7 @@ pub fn build_with_jobs(
         parsed,
         reused,
         deleted,
-    })
+    }))
 }
 
 fn unix_now() -> i64 {
@@ -555,6 +622,8 @@ fn extract_changed(
     let jobs = requested_jobs.clamp(1, 32).min(useful_workers);
     let chunk_size = indexes.len().div_ceil(jobs);
 
+    let completed = std::sync::atomic::AtomicUsize::new(0);
+    crate::progress::report("Parsing files", 0, Some(indexes.len()), "");
     if jobs == 1 {
         let mut extractor = extract::Extractor::new();
         return indexes
@@ -563,7 +632,16 @@ fn extract_changed(
                 extractor
                     .extract_file(files[index].lang, &files[index].text, &files[index].rel)
                     .with_context(|| format!("extract {}", files[index].rel))
-                    .map(|extracted| (index, extracted))
+                    .map(|extracted| {
+                        let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        crate::progress::report(
+                            "Parsing files",
+                            done,
+                            Some(indexes.len()),
+                            &files[index].rel,
+                        );
+                        (index, extracted)
+                    })
             })
             .collect();
     }
@@ -571,6 +649,7 @@ fn extract_changed(
     std::thread::scope(|scope| {
         let mut workers = Vec::with_capacity(jobs);
         for chunk in indexes.chunks(chunk_size) {
+            let completed = &completed;
             workers.push(
                 scope.spawn(move || -> Result<Vec<(usize, extract::Extracted)>> {
                     let mut extractor = extract::Extractor::new();
@@ -584,7 +663,18 @@ fn extract_changed(
                                     &files[index].rel,
                                 )
                                 .with_context(|| format!("extract {}", files[index].rel))
-                                .map(|extracted| (index, extracted))
+                                .map(|extracted| {
+                                    let done = completed
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        + 1;
+                                    crate::progress::report(
+                                        "Parsing files",
+                                        done,
+                                        Some(indexes.len()),
+                                        &files[index].rel,
+                                    );
+                                    (index, extracted)
+                                })
                         })
                         .collect()
                 }),
@@ -618,6 +708,12 @@ fn index_extracted(
     let file_symbol = tx.last_insert_rowid();
     crate::search::index_symbol(tx, file_symbol)?;
     let mut symbol_ids = Vec::with_capacity(extracted.symbols.len());
+    crate::progress::report(
+        "Writing symbols",
+        0,
+        Some(extracted.symbols.len()),
+        &source.rel,
+    );
     for (index, symbol) in extracted.symbols.iter().enumerate() {
         let container = extracted.containers.get(index).cloned().flatten();
         tx.execute(
@@ -638,6 +734,12 @@ fn index_extracted(
         let id = tx.last_insert_rowid();
         crate::search::index_symbol(tx, id)?;
         symbol_ids.push(id);
+        crate::progress::report(
+            "Writing symbols",
+            index + 1,
+            Some(extracted.symbols.len()),
+            &source.rel,
+        );
     }
     let payload = serde_json::to_string(&extracted).context("serialize extraction cache")?;
     tx.execute(

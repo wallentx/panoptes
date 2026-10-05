@@ -68,6 +68,7 @@ struct Server {
     child: Child,
     input: Option<ChildStdin>,
     replies: Receiver<Value>,
+    notifications: Receiver<Value>,
 }
 
 impl Server {
@@ -83,12 +84,16 @@ impl Server {
         )
     }
 
-    fn with_command(fixture: &Fixture, timeout: &str, mut command: Command) -> Self {
+    fn with_command(fixture: &Fixture, timeout: &str, command: Command) -> Self {
+        Self::with_path(fixture, timeout, command, fixture.0.join("repo"))
+    }
+
+    fn with_path(fixture: &Fixture, timeout: &str, mut command: Command, root: PathBuf) -> Self {
         let mut child = command
             .arg("--store")
             .arg(fixture.store())
             .arg("mcp")
-            .arg(fixture.0.join("repo"))
+            .arg(root)
             .args(["--timeout-secs", timeout])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -98,13 +103,20 @@ impl Server {
         let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
         let (send, replies) = mpsc::channel();
+        let (notify, notifications) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(output).lines() {
                 let Ok(line) = line else { break };
                 let Ok(value) = serde_json::from_str(&line) else {
                     break;
                 };
-                if send.send(value).is_err() {
+                let value: Value = value;
+                let destination = if value.get("id").is_some() {
+                    &send
+                } else {
+                    &notify
+                };
+                if destination.send(value).is_err() {
                     break;
                 }
             }
@@ -113,10 +125,11 @@ impl Server {
             child,
             input: Some(input),
             replies,
+            notifications,
         }
     }
 
-    fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
+    fn send(&mut self, id: u64, method: &str, params: Value) {
         let input = self.input.as_mut().unwrap();
         writeln!(
             input,
@@ -125,6 +138,10 @@ impl Server {
         )
         .unwrap();
         input.flush().unwrap();
+    }
+
+    fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
+        self.send(id, method, params);
         let reply = self
             .replies
             .recv_timeout(Duration::from_secs(8))
@@ -164,7 +181,7 @@ fn assert_timeout(reply: &Value, started: Instant) {
 }
 
 #[test]
-fn startup_indexing_times_out_and_the_same_server_recovers() {
+fn demand_indexing_times_out_and_the_same_server_recovers() {
     let fixture = Fixture::new();
     fixture.build();
     let writer = Connection::open(fixture.store()).unwrap();
@@ -181,7 +198,7 @@ fn startup_indexing_times_out_and_the_same_server_recovers() {
     let reply = server.find(4, "refreshed");
     assert_eq!(reply["result"]["isError"], false, "{reply}");
     assert!(
-        reply["result"]["structuredContent"]["repo"]["hits"]
+        reply["result"]["structuredContent"]["repositories"]["repo"]["hits"]
             .as_array()
             .unwrap()
             .iter()
@@ -215,7 +232,7 @@ fn request_refresh_times_out_and_preserves_session_savings() {
 }
 
 #[test]
-fn disconnect_cancels_background_indexing_without_waiting_for_its_deadline() {
+fn initialize_does_not_start_indexing_and_idle_disconnect_is_prompt() {
     let fixture = Fixture::new();
     fixture.build();
     let writer = Connection::open(fixture.store()).unwrap();
@@ -232,7 +249,7 @@ fn disconnect_cancels_background_indexing_without_waiting_for_its_deadline() {
         }
         assert!(
             started.elapsed() < Duration::from_secs(3),
-            "disconnect must cancel background indexing promptly"
+            "idle disconnect must exit promptly"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -310,7 +327,7 @@ fn android_linker_launch_without_preload_can_index_and_reexecute_workers() {
     let result = server.find(3, "refreshed");
     assert_eq!(result["result"]["isError"], false, "{result}");
     assert!(
-        result["result"]["structuredContent"]["repo"]["hits"]
+        result["result"]["structuredContent"]["repositories"]["repo"]["hits"]
             .as_array()
             .unwrap()
             .iter()
@@ -335,4 +352,400 @@ fn android_linker_launch_reports_the_program_path_instead_of_the_loader() {
         PathBuf::from(version["executable"].as_str().unwrap()),
         std::fs::canonicalize(env!("CARGO_BIN_EXE_panoptes")).unwrap()
     );
+}
+
+fn receive(server: &Server) -> Value {
+    server
+        .replies
+        .recv_timeout(Duration::from_secs(8))
+        .expect("request must finish")
+}
+
+#[test]
+fn in_flight_duplicates_share_work_while_ping_remains_responsive() {
+    let fixture = Fixture::new();
+    fixture.build();
+    let writer = Connection::open(fixture.store()).unwrap();
+    writer.execute_batch("begin immediate").unwrap();
+    fixture.source("pub fn changed() {}\n");
+    let mut server = Server::with_timeout(&fixture, "5");
+    let params = json!({"name":"find", "arguments":{"query":"changed"}});
+    server.send(1, "tools/call", params.clone());
+    let mut duplicate = params.clone();
+    duplicate["_meta"] = json!({"progressToken":"second-caller"});
+    server.send(2, "tools/call", duplicate);
+    let ping = server.request(3, "ping", json!({}));
+    assert_eq!(ping["result"], json!({}));
+    writer.execute_batch("rollback").unwrap();
+    let first = receive(&server);
+    let second = receive(&server);
+    let a = &first["result"]["structuredContent"];
+    let b = &second["result"]["structuredContent"];
+    assert_eq!(first["id"], 1, "{first}");
+    assert_eq!(second["id"], 2, "{second}");
+    assert_eq!(a["repositories"]["repo"], b["repositories"]["repo"]);
+    assert_eq!(
+        a["panoptesExecution"]["operationId"],
+        b["panoptesExecution"]["operationId"]
+    );
+    assert_eq!(a["panoptesExecution"]["coalesced"], false);
+    assert_eq!(b["panoptesExecution"]["coalesced"], true);
+    fixture.source("pub fn changed() { let updated = 7; }\n");
+    let later = server.request(4, "tools/call", params);
+    assert_ne!(
+        later["result"]["structuredContent"]["panoptesExecution"]["operationId"],
+        a["panoptesExecution"]["operationId"]
+    );
+    assert!(later.to_string().contains("updated"), "{later}");
+}
+
+#[test]
+fn cancelling_one_duplicate_preserves_the_other_waiter() {
+    let fixture = Fixture::new();
+    fixture.build();
+    let writer = Connection::open(fixture.store()).unwrap();
+    writer.execute_batch("begin immediate").unwrap();
+    fixture.source("pub fn changed() {}\n");
+    let mut server = Server::with_timeout(&fixture, "5");
+    let params = json!({"name":"find", "arguments":{"query":"changed"}});
+    server.send(1, "tools/call", params.clone());
+    server.send(2, "tools/call", params);
+    writeln!(
+        server.input.as_mut().unwrap(),
+        "{}",
+        json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":1}})
+    )
+    .unwrap();
+    server.request(3, "ping", json!({}));
+    writer.execute_batch("rollback").unwrap();
+    let reply = receive(&server);
+    assert_eq!(reply["id"], 2, "{reply}");
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+}
+
+#[test]
+fn concurrent_distinct_queries_reuse_one_checkout_refresh() {
+    let fixture = Fixture::new();
+    fixture.build();
+    let writer = Connection::open(fixture.store()).unwrap();
+    writer.execute_batch("create table refreshes(n integer); create trigger refreshed after update on repos begin insert into refreshes values(1); end; begin immediate;").unwrap();
+    fixture.source("pub fn changed() {}\npub fn other() {}\n");
+    let mut server = Server::with_timeout(&fixture, "5");
+    server.send(
+        1,
+        "tools/call",
+        json!({"name":"find", "arguments":{"query":"changed"}}),
+    );
+    server.send(
+        2,
+        "tools/call",
+        json!({"name":"find", "arguments":{"query":"other"}}),
+    );
+    server.request(3, "ping", json!({}));
+    writer.execute_batch("rollback").unwrap();
+    for _ in 0..2 {
+        let reply = receive(&server);
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+    }
+    let builds: i64 = writer
+        .query_row("select count(*) from refreshes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(builds, 1, "waiting workers must reuse the first refresh");
+}
+
+#[test]
+fn discovers_new_worktree_and_keeps_concurrent_checkout_queries_separate() {
+    let fixture = Fixture::new();
+    let mut server = Server::with_timeout(&fixture, "5");
+    server.request(1, "initialize", json!({}));
+    assert!(
+        !fixture.store().exists(),
+        "initialization must not build a store"
+    );
+    let worktree = fixture.0.join("review");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(fixture.0.join("repo"))
+        .args(["worktree", "add", "--orphan", "-b", "pr-review"])
+        .arg(&worktree)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::write(worktree.join("lib.rs"), "pub fn review_only() {}\n").unwrap();
+    let discovered = server.request(2, "tools/call", json!({"name":"worktrees", "arguments":{}}));
+    let trees = discovered["result"]["structuredContent"]["worktrees"]
+        .as_array()
+        .unwrap();
+    assert_eq!(trees.len(), 2);
+    assert!(trees.iter().any(|tree| tree["root"] == worktree.to_str().unwrap() && tree["branch"] == "pr-review"));
+    assert!(
+        !fixture.store().exists(),
+        "discovery must not open an index"
+    );
+    server.send(
+        3,
+        "tools/call",
+        json!({"name":"grep", "arguments":{"pattern":"pub fn", "repo":worktree}}),
+    );
+    server.send(
+        4,
+        "tools/call",
+        json!({"name":"grep", "arguments":{"pattern":"pub fn"}}),
+    );
+    let mut replies = [receive(&server), receive(&server)];
+    replies.sort_by_key(|reply| reply["id"].as_u64());
+    assert_eq!(replies[0]["result"]["isError"], false, "{}", replies[0]);
+    assert_eq!(replies[1]["result"]["isError"], false, "{}", replies[1]);
+    assert!(replies[0].to_string().contains("review_only"));
+    assert!(!replies[0].to_string().contains("original()"));
+    assert!(replies[1].to_string().contains("original()"));
+    assert!(!replies[1].to_string().contains("review_only"));
+    assert_ne!(
+        replies[0]["result"]["structuredContent"]["panoptesExecution"]["operationId"],
+        replies[1]["result"]["structuredContent"]["panoptesExecution"]["operationId"]
+    );
+    let by_label = server.request(
+        5,
+        "tools/call",
+        json!({"name":"find", "arguments":{"query":"review_only", "repo":"review"}}),
+    );
+    assert_eq!(
+        by_label["result"]["structuredContent"]["panoptesCheckouts"][0]["branch"],
+        "pr-review"
+    );
+}
+
+#[test]
+fn bounded_queue_rejects_overload_and_recovers_after_cancellation() {
+    let fixture = Fixture::new();
+    fixture.build();
+    let writer = Connection::open(fixture.store()).unwrap();
+    writer.execute_batch("begin immediate").unwrap();
+    fixture.source("pub fn changed() {}\n");
+    let mut server = Server::with_timeout(&fixture, "10");
+    for id in 1..=33 {
+        server.send(
+            id,
+            "tools/call",
+            json!({"name":"find", "arguments":{"query":format!("changed {id}")}}),
+        );
+    }
+    let reply = receive(&server);
+    assert_eq!(reply["id"], 33, "{reply}");
+    assert_eq!(reply["error"]["code"], -32003, "{reply}");
+    for id in 1..=32 {
+        writeln!(
+            server.input.as_mut().unwrap(),
+            "{}",
+            json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":id}})
+        )
+        .unwrap();
+    }
+    server.request(34, "ping", json!({}));
+    writer.execute_batch("rollback").unwrap();
+    // The cancelled jobs must release queue capacity as well as their workers.
+    let reply = server.find(35, "changed");
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+}
+
+#[test]
+fn review_metadata_names_preserve_checkout_hits() {
+    let fixture = Fixture::new();
+    let mut server = Server::with_timeout(&fixture, "5");
+    server.request(1, "initialize", json!({}));
+    for (offset, label) in [
+        "panoptesCheckouts",
+        "panoptesExecution",
+        "panoptesSavings",
+        "repositories",
+        "worktrees",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let root = fixture.0.join(label);
+        let output = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        std::fs::copy(fixture.0.join("repo/lib.rs"), root.join("lib.rs")).unwrap();
+        let response = server.request(
+            offset as u64 + 2,
+            "tools/call",
+            json!({"name":"find", "arguments":{"query":"original", "repo":root}}),
+        );
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let data = &response["result"]["structuredContent"];
+        assert_eq!(
+            data["repositories"][*label]["hits"][0]["name"], "original",
+            "{response}"
+        );
+        assert_eq!(data["panoptesCheckouts"][0]["label"], *label);
+        assert!(data["panoptesExecution"]["operationId"].is_number());
+        assert!(data["panoptesSavings"]["sessionSavingsDisplay"].is_string());
+    }
+}
+
+fn add_orphan_worktree(fixture: &Fixture, name: &str) -> PathBuf {
+    let root = fixture.0.join(name);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(fixture.0.join("repo"))
+        .args(["worktree", "add", "--orphan", "-b", name])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    root
+}
+
+#[test]
+fn review_removed_startup_worktree_discovers_survivors() {
+    let fixture = Fixture::new();
+    let review = add_orphan_worktree(&fixture, "review-start");
+    let mut server = Server::with_path(
+        &fixture,
+        "5",
+        Command::new(env!("CARGO_BIN_EXE_panoptes")),
+        review.clone(),
+    );
+    server.request(1, "initialize", json!({}));
+    let removed = Command::new("git")
+        .arg("-C")
+        .arg(fixture.0.join("repo"))
+        .args(["worktree", "remove"])
+        .arg(&review)
+        .output()
+        .unwrap();
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!review.exists());
+    let sibling = add_orphan_worktree(&fixture, "review-sibling");
+    let response = server.request(2, "tools/call", json!({"name":"worktrees", "arguments":{}}));
+    let trees = response["result"]["structuredContent"]["worktrees"]
+        .as_array()
+        .unwrap();
+    assert_eq!(trees.len(), 2, "{response}");
+    assert!(
+        trees
+            .iter()
+            .all(|tree| PathBuf::from(tree["root"].as_str().unwrap()).is_dir())
+    );
+    assert!(
+        trees
+            .iter()
+            .any(|tree| tree["root"] == sibling.to_str().unwrap())
+    );
+    assert!(
+        trees
+            .iter()
+            .any(|tree| tree["root"] == fixture.0.join("repo").to_str().unwrap())
+    );
+    assert!(
+        !fixture.store().exists(),
+        "discovery must remain observational"
+    );
+    let missing = server.find(3, "original");
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no longer exists"),
+        "{missing}"
+    );
+    assert!(
+        !fixture.store().exists(),
+        "missing checkout must not create an index"
+    );
+    let result = server.request(
+        4,
+        "tools/call",
+        json!({"name":"find", "arguments":{"query":"original", "repo":"repo"}}),
+    );
+    assert_eq!(
+        result["result"]["structuredContent"]["repositories"]["repo"]["hits"][0]["name"],
+        "original",
+        "{result}"
+    );
+}
+
+#[test]
+fn progress_notifications_stream_stages_and_keep_request_tokens() {
+    let fixture = Fixture::new();
+    let mut server = Server::with_timeout(&fixture, "5");
+    server.request(1, "initialize", json!({}));
+    server.send(2, "tools/call", json!({"name":"find", "arguments":{"query":"original"}, "_meta":{"progressToken":"index-progress"}}));
+    let first = server
+        .notifications
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(first["method"], "notifications/progress");
+    assert_eq!(first["params"]["progressToken"], "index-progress");
+    assert_eq!(first["params"]["message"], "Queued");
+    let response = receive(&server);
+    assert_eq!(response["id"], 2);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let updates: Vec<_> = std::iter::once(first)
+        .chain(server.notifications.try_iter())
+        .collect();
+    assert!(
+        updates
+            .iter()
+            .all(|update| update["params"]["progressToken"] == "index-progress")
+    );
+    assert!(
+        updates
+            .windows(2)
+            .all(|pair| pair[0]["params"]["progress"].as_u64().unwrap()
+                < pair[1]["params"]["progress"].as_u64().unwrap())
+    );
+    assert!(updates.iter().any(|update| {
+        update["params"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Parsing files")
+    }));
+    assert!(updates.iter().any(|update| {
+        update["params"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Index committed")
+    }));
+    server.request(3, "ping", json!({}));
+    assert!(
+        server.notifications.try_recv().is_err(),
+        "progress stops when the operation completes"
+    );
+}
+
+#[test]
+fn progress_logs_work_without_tokens_and_respect_log_level() {
+    let fixture = Fixture::new();
+    let mut server = Server::with_timeout(&fixture, "5");
+    server.find(1, "original");
+    let updates: Vec<_> = server.notifications.try_iter().collect();
+    assert!(
+        updates
+            .iter()
+            .any(|update| update["method"] == "notifications/message"
+                && update["params"]["data"]["stage"] == "Index committed")
+    );
+    server.request(2, "logging/setLevel", json!({"level":"warning"}));
+    server.find(3, "original");
+    assert!(server.notifications.try_recv().is_err());
+    let invalid = server.request(4, "logging/setLevel", json!({"level":"verbose"}));
+    assert_eq!(invalid["error"]["code"], -32602);
 }

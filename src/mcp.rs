@@ -4,10 +4,11 @@ use anyhow::{Context, Result, anyhow};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+mod server;
 mod worker;
 pub use worker::worker_main;
 
@@ -24,7 +25,7 @@ struct SessionStats {
     calls_with_savings: u64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ToolData {
     value: Value,
     baseline_bytes: u64,
@@ -33,65 +34,7 @@ struct ToolData {
 
 pub fn serve(store: &Path, start: &Path, no_refresh: bool, timeout: Duration) -> Result<()> {
     let targets = repo::automatic_targets(start)?;
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    let mut session = SessionStats::default();
-    let mut indexing = None;
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.len() > MAX_MESSAGE {
-            write_response(&mut stdout, error(Value::Null, -32600, "request too large"))?;
-            continue;
-        }
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => {
-                write_response(&mut stdout, error(Value::Null, -32700, "parse error"))?;
-                continue;
-            }
-        };
-        let id = request.get("id").cloned();
-        if id.is_none() {
-            continue;
-        }
-        let id = id.unwrap_or(Value::Null);
-        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-        let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-        let response = if !matches!(method, "initialize" | "ping" | "tools/list" | "tools/call") {
-            error(id, -32601, &format!("method not found: {method}"))
-        } else {
-            let result = if method == "tools/call" {
-                // Waiting for startup indexing consumes this same request budget.
-                let deadline = Instant::now() + timeout;
-                finish_indexing(&mut indexing).and_then(|()| {
-                    let output = worker::run(store, &targets, Some(params), no_refresh, deadline)?;
-                    tool_response(output, &mut session)
-                })
-            } else {
-                dispatch(store, &targets, method, &params, no_refresh, &mut session)
-            };
-            match result {
-                Ok(result) => json!({"jsonrpc":"2.0", "id":id, "result":result}),
-                Err(problem) if problem.is::<worker::TimedOut>() => error(
-                    id,
-                    -32002,
-                    &format!(
-                        "Panoptes exceeded its {}s MCP deadline (including indexing and SQLite); \
-                         the worker was stopped and its database locks released. Narrow the query \
-                         or repo scope, or run `panoptes build` separately for a large initial index. \
-                         The MCP server is ready for another request.",
-                        timeout.as_secs()
-                    ),
-                ),
-                Err(problem) => error(id, -32000, &format!("{problem:#}")),
-            }
-        };
-        write_response(&mut stdout, response)?;
-        if method == "initialize" && indexing.is_none() {
-            indexing = start_indexing(store, &targets, no_refresh, timeout);
-        }
-    }
-    Ok(())
+    server::serve(store, &targets, no_refresh, timeout)
 }
 
 fn write_response(output: &mut impl Write, response: Value) -> Result<()> {
@@ -124,13 +67,13 @@ fn dispatch(
     match method {
         "initialize" => {
             let instructions = if targets.is_empty() {
-                "Panoptes started without indexing because the current directory is not a Git repository or a workspace containing at least two immediate Git repositories. Start the coding agent inside a repository to enable Panoptes source navigation."
+                "Panoptes started without indexing because the current directory is not a Git repository or a workspace containing at least two immediate Git repositories. Pass an absolute Git checkout path as repo on tool calls, or start the coding agent inside a repository to enable Panoptes source navigation."
             } else {
-                "Prefer Panoptes before built-in grep, search, or whole-file reads for indexed source; one focused call usually replaces several reads. Use find for where/how questions (bounded source is included by default), grep when every occurrence matters, callers for incoming/outgoing dependency and blast-radius tracing, skeleton for a file API, and map for orientation. For a scoped question, start with one find or grep rather than map, and treat three Panoptes calls as the normal task budget. Work from returned paths and spans; do not repeat find to reconstruct individual files, and fall back only when indexed context is insufficient. Retrieval results include an honest four-characters-per-token estimate versus reading matched files whole plus an MCP-session total. When Panoptes was used, end the response with the provided session savings display in the form `ꙮ Estimated tokens saved for this session: 1,231,578`; treat it as an estimate, never as billing. Panoptes indexes on connection and refreshes changed source before answers; freshness is observational."
+                "Prefer Panoptes before built-in grep, search, or whole-file reads for indexed source; one focused call usually replaces several reads. Use find for where/how questions (bounded source is included by default), grep when every occurrence matters, callers for incoming/outgoing dependency and blast-radius tracing, skeleton for a file API, and map for orientation. For a scoped question, start with one find or grep rather than map, and treat three Panoptes calls as the normal task budget. Work from returned paths and spans; do not repeat find to reconstruct individual files, and fall back only when indexed context is insufficient. Retrieval results include an honest four-characters-per-token estimate versus reading matched files whole plus an MCP-session total. When Panoptes was used, end the response with the provided session savings display in the form `ꙮ Estimated tokens saved for this session: 1,231,578`; treat it as an estimate, never as billing. Panoptes indexes the selected checkout on demand and refreshes changed source before answers. For a PR worktree, pass its absolute path as repo on every call; changing a shell cwd does not retarget this connection. Use worktrees to discover checkouts created after connection. Identical requests already in flight share one operation and progress stream; wait for completion rather than issuing duplicates. The timeout measures 30 seconds without meaningful progress, not total elapsed time. Freshness and worktrees are observational."
             };
             Ok(json!({
                 "protocolVersion":"2024-11-05",
-                "capabilities":{"tools":{"listChanged":false}},
+                "capabilities":{"tools":{"listChanged":false},"logging":{}},
                 "serverInfo":{"name":"panoptes", "version":env!("CARGO_PKG_VERSION")},
                 "instructions":instructions
             }))
@@ -157,38 +100,6 @@ fn tool_response(output: ToolData, session: &mut SessionStats) -> Result<Value> 
         "structuredContent":data,
         "isError":false
     }))
-}
-
-fn start_indexing(
-    store: &Path,
-    targets: &[repo::Target],
-    no_refresh: bool,
-    timeout: Duration,
-) -> Option<worker::Background> {
-    if no_refresh || targets.is_empty() {
-        return None;
-    }
-    Some(worker::Background::start(store, targets, timeout))
-}
-
-fn finish_indexing(worker: &mut Option<worker::Background>) -> Result<()> {
-    let Some(worker) = worker.take() else {
-        return Ok(());
-    };
-    worker.finish()
-}
-
-fn ensure_targets(store: &Path, targets: &[repo::Target], no_refresh: bool) -> Result<()> {
-    if no_refresh {
-        return Ok(());
-    }
-    for target in targets {
-        let mut conn = db::open(store)?;
-        if !index::freshness(&conn, &target.root)?.is_clean() {
-            index::build(&mut conn, &target.root)?;
-        }
-    }
-    Ok(())
 }
 
 fn tool_schemas() -> Vec<Value> {
@@ -224,6 +135,11 @@ fn tool_schemas() -> Vec<Value> {
             &[],
         ),
         schema(
+            "worktrees",
+            "Discover live Git checkouts and their branch/HEAD identity without indexing; includes worktrees created after connection.",
+            &[],
+        ),
+        schema(
             "freshness",
             "Observe differences between indexed and live source without triggering a rebuild.",
             &[],
@@ -240,7 +156,7 @@ fn schema(name: &str, description: &str, required: &[&str]) -> Value {
                 "in":{"type":"string", "description":"Optional repository-relative path scope."},
                 "source":{"type":"boolean", "default":true, "description":"Include bounded source excerpts; defaults to true."},
                 "full":{"type":"boolean", "default":false, "description":"Return each complete matched definition instead of the bounded excerpt."},
-                "repo":{"type":"string", "description":"Workspace repository label; omit to search every repository."}
+                "repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}
             })
         }
         "grep" => {
@@ -249,7 +165,7 @@ fn schema(name: &str, description: &str, required: &[&str]) -> Value {
                 "fixed":{"type":"boolean", "default":false, "description":"Treat pattern as literal text."},
                 "ignoreCase":{"type":"boolean", "default":false, "description":"Match without case sensitivity."},
                 "in":{"type":"string", "description":"Optional repository-relative path scope."},
-                "repo":{"type":"string", "description":"Workspace repository label; omit to search every repository."}
+                "repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}
             })
         }
         "callers" => {
@@ -258,15 +174,15 @@ fn schema(name: &str, description: &str, required: &[&str]) -> Value {
                 "direction":{"enum":["in","out"], "default":"in", "description":"in finds callers; out finds dependencies called by the symbol."},
                 "depth":{"type":"integer", "minimum":1, "maximum":32, "default":1, "description":"Maximum graph traversal depth."},
                 "in":{"type":"string", "description":"Optional repository-relative path scope."},
-                "repo":{"type":"string", "description":"Workspace repository label; omit to search every repository."}
+                "repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}
             })
         }
         "skeleton" => json!({
             "file":{"type":"string", "description":"Repository-relative file path or unique filename."},
-            "repo":{"type":"string", "description":"Workspace repository label; omit to query every repository."}
+            "repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}
         }),
         _ => {
-            json!({"repo":{"type":"string", "description":"Workspace repository label; omit to query every repository."}})
+            json!({"repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}})
         }
     };
     json!({
@@ -315,15 +231,37 @@ fn call_tool_detailed(
         "skeleton" => {
             string_arg(args, "file")?;
         }
-        "map" | "status" | "freshness" => {}
+        "map" | "status" | "freshness" | "worktrees" => {}
         _ => return Err(anyhow!("unknown tool: {name}")),
     }
     let selected = select_targets(targets, args.get("repo").and_then(Value::as_str))?;
+    if name == "worktrees" {
+        return Ok(ToolData {
+            value: json!({"worktrees":repo::related_worktrees(&selected).iter().map(repo::checkout_identity).collect::<Vec<_>>()}),
+            baseline_bytes: 0,
+            baseline_files: 0,
+        });
+    }
     let mut results = serde_json::Map::new();
+    let mut checkouts = Vec::new();
     let mut baseline_bytes = 0u64;
     let mut baseline_files = 0usize;
     for target in selected {
-        let mut conn = db::open(store)?;
+        anyhow::ensure!(
+            target.root.is_dir(),
+            "checkout {} no longer exists; use worktrees to select a surviving checkout",
+            target.root.display()
+        );
+        let identity = repo::checkout_identity(&target);
+        checkouts.push(identity.clone());
+        crate::progress::report("Opening index", 0, None, &target.root.to_string_lossy());
+        let mut conn = open_with_contention_retry(store)?;
+        crate::progress::report(
+            "Checking freshness",
+            0,
+            None,
+            &target.root.to_string_lossy(),
+        );
         let mut state = index::freshness(&conn, &target.root)?;
         if name == "freshness" {
             results.insert(target.label.clone(), serde_json::to_value(state)?);
@@ -336,20 +274,25 @@ fn call_tool_detailed(
                     target.root.display()
                 ));
             }
-            index::build(&mut conn, &target.root)?;
+            refresh_with_contention_retry(&mut conn, &target.root)?;
             if name == "status" {
                 state = index::freshness(&conn, &target.root)?;
             }
         } else if !state.is_clean() && !no_refresh {
-            index::build(&mut conn, &target.root)?;
+            refresh_with_contention_retry(&mut conn, &target.root)?;
             if name == "status" {
                 state = index::freshness(&conn, &target.root)?;
             }
         }
-        let repo_id = index::repo_id_of(&conn, &target.root)?.context("current index missing")?;
+        // Keep graph queries and baseline accounting on one committed snapshot
+        // while another checkout or MCP process updates the shared WAL store.
+        crate::progress::report("Querying index", 0, None, &target.root.to_string_lossy());
+        let snapshot = conn.transaction()?;
+        let conn = &snapshot;
+        let repo_id = index::repo_id_of(conn, &target.root)?.context("current index missing")?;
         let value = match name {
             "find" => serde_json::to_value(ask::ask(
-                &conn,
+                conn,
                 repo_id,
                 &target.root,
                 string_arg(args, "query")?,
@@ -361,7 +304,7 @@ fn call_tool_detailed(
                 },
             )?)?,
             "grep" => serde_json::to_value(index::grep_with_options(
-                &conn,
+                conn,
                 repo_id,
                 &target.root,
                 string_arg(args, "pattern")?,
@@ -373,7 +316,7 @@ fn call_tool_detailed(
             )?)?,
             "callers" => {
                 let (seeds, reached) = index::callers_scoped(
-                    &conn,
+                    conn,
                     repo_id,
                     string_arg(args, "symbol")?,
                     args.get("direction").and_then(Value::as_str) == Some("out"),
@@ -384,14 +327,14 @@ fn call_tool_detailed(
             }
             "skeleton" => {
                 let requested = string_arg(args, "file")?;
-                let rel = index::skeleton_path(&conn, repo_id, requested)?
+                let rel = index::skeleton_path(conn, repo_id, requested)?
                     .with_context(|| format!("no unique indexed file matching {requested:?}"))?;
-                json!({"path":rel, "symbols":index::skeleton(&conn, repo_id, &rel)?})
+                json!({"path":rel, "symbols":index::skeleton(conn, repo_id, &rel)?})
             }
-            "map" => serde_json::to_value(index::repo_map(&conn, repo_id, 12)?)?,
+            "map" => serde_json::to_value(index::repo_map(conn, repo_id, 12)?)?,
             "status" => json!({
                 "root":target.root,
-                "store":index::repo_status(&conn, repo_id)?,
+                "store":index::repo_status(conn, repo_id)?,
                 "freshness":state,
             }),
             _ => unreachable!("tool name validated before indexing"),
@@ -413,10 +356,14 @@ fn call_tool_detailed(
                 }
             }
         }
+        anyhow::ensure!(
+            identity == repo::checkout_identity(&target),
+            "checkout changed during request; retry with a stable worktree"
+        );
         results.insert(target.label.clone(), value);
     }
     Ok(ToolData {
-        value: Value::Object(results),
+        value: json!({"repositories":results, "panoptesCheckouts":checkouts}),
         baseline_bytes,
         baseline_files,
     })
@@ -526,23 +473,49 @@ fn add_savings(mut output: ToolData, session: &mut SessionStats) -> Result<Value
     Ok(output.value)
 }
 
-fn select_targets<'a>(
-    targets: &'a [repo::Target],
-    label: Option<&str>,
-) -> Result<Vec<&'a repo::Target>> {
-    if targets.is_empty() {
-        return Err(anyhow!(
-            "current directory is not a Git repository or a workspace containing at least two immediate Git repositories"
-        ));
+fn select_targets(targets: &[repo::Target], label: Option<&str>) -> Result<Vec<repo::Target>> {
+    if let Some(label) = label {
+        if Path::new(label).is_absolute() {
+            return Ok(vec![repo::checkout_target(Path::new(label))?]);
+        }
+        let matches: Vec<_> = repo::related_worktrees(targets)
+            .into_iter()
+            .filter(|target| target.label == label)
+            .collect();
+        anyhow::ensure!(
+            !matches.is_empty(),
+            "unknown workspace repo {label:?}; use an absolute Git checkout path or worktrees to discover labels"
+        );
+        anyhow::ensure!(
+            matches.len() == 1,
+            "ambiguous repo label {label:?}; use an absolute Git checkout path"
+        );
+        return Ok(matches);
     }
-    match label {
-        None => Ok(targets.iter().collect()),
-        Some(label) => targets
-            .iter()
-            .find(|target| target.label == label)
-            .map(|target| vec![target])
-            .with_context(|| format!("unknown workspace repo {label:?}")),
+    anyhow::ensure!(
+        !targets.is_empty(),
+        "current directory is not a Git repository or a workspace containing at least two immediate Git repositories; pass an absolute Git checkout path as repo"
+    );
+    Ok(targets.to_vec())
+}
+
+fn retry_contention<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    // This code runs inside the killable worker; its outer deadline bounds all
+    // waits, including SQLite's own busy timeout and repeated lock contention.
+    loop {
+        match operation() {
+            Err(problem) if problem.chain().any(|cause| matches!(cause.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(error, _)) if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))) => std::thread::sleep(Duration::from_millis(25)),
+            result => return result,
+        }
     }
+}
+
+fn open_with_contention_retry(store: &Path) -> Result<rusqlite::Connection> {
+    retry_contention(|| db::open(store))
+}
+
+fn refresh_with_contention_retry(conn: &mut rusqlite::Connection, root: &Path) -> Result<bool> {
+    retry_contention(|| index::build_if_stale(conn, root))
 }
 
 fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
@@ -604,9 +577,57 @@ mod tests {
         let store = temp.0.join("panoptes.db");
         let target = repo::Target {
             label: "repo".to_string(),
+            common_dir: None,
             root,
         };
         (temp, store, target)
+    }
+
+    #[test]
+    fn explicit_checkout_is_available_without_startup_targets() {
+        let (_temp, store, target) = fixture("explicit-checkout");
+        std::fs::create_dir(target.root.join(".git")).unwrap();
+        std::fs::write(target.root.join(".git/HEAD"), "ref: refs/heads/review\n").unwrap();
+        let result = call_tool(
+            &store,
+            &[],
+            "find",
+            &json!({"query":"original", "repo":target.root}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            result["repositories"]["repo"]["hits"][0]["name"],
+            "original"
+        );
+        assert_eq!(result["panoptesCheckouts"][0]["branch"], "review");
+        assert_eq!(result["panoptesCheckouts"][0]["head"], Value::Null);
+    }
+
+    #[test]
+    fn duplicate_checkout_labels_require_an_absolute_path() {
+        let temp = TempDir::new("ambiguous-labels");
+        let mut targets = Vec::new();
+        for parent in ["first", "second"] {
+            let root = temp.0.join(parent).join("repo");
+            std::fs::create_dir_all(root.join(".git")).unwrap();
+            std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+            targets.push(repo::Target {
+                label: "repo".into(),
+                common_dir: None,
+                root,
+            });
+        }
+        assert!(
+            select_targets(&targets, Some("repo"))
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert_eq!(
+            select_targets(&targets, targets[1].root.to_str()).unwrap()[0].root,
+            targets[1].root
+        );
     }
 
     #[test]
@@ -636,12 +657,12 @@ mod tests {
         let targets = [target.clone()];
 
         let first = call_tool(&store, &targets, "freshness", &json!({}), false).unwrap();
-        assert_eq!(first["repo"]["indexed"], false);
+        assert_eq!(first["repositories"]["repo"]["indexed"], false);
 
         let status = call_tool(&store, &targets, "status", &json!({}), false).unwrap();
-        assert_eq!(status["repo"]["freshness"]["indexed"], true);
+        assert_eq!(status["repositories"]["repo"]["freshness"]["indexed"], true);
         assert!(
-            status["repo"]["freshness"]["added"]
+            status["repositories"]["repo"]["freshness"]["added"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -653,11 +674,11 @@ mod tests {
         )
         .unwrap();
         let stale = call_tool(&store, &targets, "freshness", &json!({}), false).unwrap();
-        assert_eq!(stale["repo"]["modified"], json!(["lib.rs"]));
+        assert_eq!(stale["repositories"]["repo"]["modified"], json!(["lib.rs"]));
 
         let refreshed = call_tool(&store, &targets, "status", &json!({}), false).unwrap();
         assert!(
-            refreshed["repo"]["freshness"]["modified"]
+            refreshed["repositories"]["repo"]["freshness"]["modified"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -685,7 +706,7 @@ mod tests {
         assert_eq!(response["serverInfo"]["name"], "panoptes");
         assert!(!store.exists(), "the handshake must not wait for SQLite");
 
-        ensure_targets(&store, &targets, false).unwrap();
+        call_tool(&store, &targets, "status", &json!({}), false).unwrap();
         let conn = db::open(&store).unwrap();
         assert!(index::freshness(&conn, &target.root).unwrap().is_clean());
         drop(conn);
@@ -695,7 +716,7 @@ mod tests {
             "pub fn original() {}\npub fn refreshed() {}\n",
         )
         .unwrap();
-        ensure_targets(&store, &targets, false).unwrap();
+        call_tool(&store, &targets, "status", &json!({}), false).unwrap();
         let conn = db::open(&store).unwrap();
         assert!(index::freshness(&conn, &target.root).unwrap().is_clean());
         let repo_id = index::repo_id_of(&conn, &target.root).unwrap().unwrap();
@@ -803,7 +824,10 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(result["repo"]["hits"][0]["source"], "pub fn original() {}");
+        assert_eq!(
+            result["repositories"]["repo"]["hits"][0]["source"],
+            "pub fn original() {}"
+        );
     }
 
     #[test]

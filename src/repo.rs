@@ -14,6 +14,135 @@ use std::path::{Path, PathBuf};
 pub struct Target {
     pub label: String,
     pub root: PathBuf,
+    /// Captured when the target is selected, so discovery survives removal of
+    /// that checkout. Serialized into workers instead of rediscovered there.
+    #[serde(default)]
+    pub common_dir: Option<String>,
+}
+
+/// Explicit MCP checkout selection must never fall back to a broad plain directory.
+pub fn checkout_target(path: &Path) -> Result<Target> {
+    anyhow::ensure!(path.is_absolute(), "repo paths must be absolute");
+    let root = git_toplevel(path).context("repo path is not inside a Git checkout")?;
+    Ok(Target {
+        label: root
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        common_dir: git_common_dir(&root),
+        root,
+    })
+}
+
+/// Re-read Git's worktree registry on every discovery request; stale/pruned
+/// entries are ignored, and each entry must belong to the same common directory.
+pub fn related_worktrees(targets: &[Target]) -> Vec<Target> {
+    let mut roots = std::collections::BTreeSet::new();
+    let mut common_dirs = std::collections::BTreeSet::new();
+    for target in targets {
+        let live_common = git_common_dir(&target.root);
+        let Some(common) = target.common_dir.clone().or_else(|| live_common.clone()) else {
+            continue;
+        };
+        if live_common.as_ref() == Some(&common) {
+            roots.insert(target.root.clone());
+        }
+        common_dirs.insert(common);
+    }
+    for common in common_dirs {
+        let common_path = Path::new(&common);
+        if common_path.file_name().is_some_and(|name| name == ".git")
+            && let Some(main) = common_path.parent()
+            && git_common_dir(main).as_deref() == Some(common.as_str())
+        {
+            roots.insert(main.to_path_buf());
+        }
+        let Ok(entries) = std::fs::read_dir(common_path.join("worktrees")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(pointer) = std::fs::read_to_string(entry.path().join("gitdir")) else {
+                continue;
+            };
+            let marker = PathBuf::from(pointer.trim());
+            let marker = if marker.is_absolute() {
+                marker
+            } else {
+                entry.path().join(marker)
+            };
+            let Some(root) = marker
+                .parent()
+                .and_then(|root| std::fs::canonicalize(root).ok())
+            else {
+                continue;
+            };
+            if git_common_dir(&root).as_deref() == Some(common.as_str()) {
+                roots.insert(root);
+            }
+        }
+    }
+    roots
+        .into_iter()
+        .map(|root| Target {
+            label: root
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            common_dir: git_common_dir(&root),
+            root,
+        })
+        .collect()
+}
+
+/// Observed checkout identity, not an immutable branch snapshot. Unborn heads
+/// and unsupported ref storage have a null commit rather than an invented SHA.
+pub fn checkout_identity(target: &Target) -> serde_json::Value {
+    let common = git_common_dir(&target.root);
+    let directory = git_dir(&target.root);
+    let head = directory
+        .as_ref()
+        .and_then(|dir| std::fs::read_to_string(dir.join("HEAD")).ok());
+    let head = head.as_deref().unwrap_or("").trim();
+    let reference = head.strip_prefix("ref: ");
+    let valid_ref = reference.filter(|name| {
+        name.starts_with("refs/")
+            && Path::new(name)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+    });
+    let commit = if let Some(reference) = valid_ref {
+        directory
+            .as_ref()
+            .and_then(|dir| std::fs::read_to_string(dir.join(reference)).ok())
+            .or_else(|| {
+                common
+                    .as_ref()
+                    .and_then(|dir| std::fs::read_to_string(Path::new(dir).join(reference)).ok())
+            })
+            .or_else(|| {
+                common
+                    .as_ref()
+                    .and_then(|dir| {
+                        std::fs::read_to_string(Path::new(dir).join("packed-refs")).ok()
+                    })
+                    .and_then(|text| {
+                        text.lines().find_map(|line| {
+                            let (sha, name) = line.split_once(' ')?;
+                            (name == reference).then(|| sha.to_string())
+                        })
+                    })
+            })
+    } else if reference.is_none() {
+        Some(head.to_string())
+    } else {
+        None
+    };
+    let commit = commit.map(|value| value.trim().to_string()).filter(|sha| {
+        matches!(sha.len(), 40 | 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    serde_json::json!({"label":target.label, "root":target.root, "gitCommonDir":common, "branch":valid_ref.and_then(|name| name.strip_prefix("refs/heads/")), "head":commit})
 }
 
 /// Languages the extractor understands, chosen by file extension.
@@ -130,6 +259,7 @@ pub fn automatic_targets(start: &Path) -> Result<Vec<Target>> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
+            common_dir: git_common_dir(&root),
             root,
         }]);
     }
@@ -144,6 +274,7 @@ pub fn automatic_targets(start: &Path) -> Result<Vec<Target>> {
         if git_toplevel(&child).as_deref() == Some(child.as_path()) {
             children.push(Target {
                 label: entry.file_name().to_string_lossy().into_owned(),
+                common_dir: git_common_dir(&child),
                 root: child,
             });
         }
@@ -168,6 +299,7 @@ pub fn targets(start: &Path) -> Result<Vec<Target>> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
+            common_dir: git_common_dir(&root),
             root,
         });
     }
@@ -221,6 +353,7 @@ fn fnv1a(bytes: &[u8]) -> String {
 /// `.git` itself is always excluded.
 pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
     let mut out = Vec::new();
+    crate::progress::report("Scanning files", 0, None, &root.to_string_lossy());
     let walker = ignore::WalkBuilder::new(root)
         // Tracked configuration commonly lives under .github, .gitlab, or
         // .circleci. Include hidden paths but never descend into Git's database.
@@ -231,7 +364,8 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
         .filter_entry(|entry| entry.file_name() != ".git")
         .build();
 
-    for dent in walker {
+    for (visited, dent) in walker.enumerate() {
+        crate::progress::report("Scanning files", visited, None, &root.to_string_lossy());
         let dent = match dent {
             Ok(d) => d,
             Err(_) => continue, // unreadable entry: skip, never abort the build
@@ -284,6 +418,12 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
     }
     // Stable order so two builds of an unchanged tree produce identical rowids,
     // which is what lets the differential harness diff output byte for byte.
+    crate::progress::report(
+        "Source files read",
+        out.len(),
+        Some(out.len()),
+        &root.to_string_lossy(),
+    );
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(out)
 }
@@ -373,6 +513,37 @@ mod tests {
             16,
             "zero-padded, so hashes sort as text"
         );
+    }
+
+    #[test]
+    fn checkout_identity_handles_loose_packed_detached_and_unsafe_refs() {
+        let root = std::env::temp_dir().join(format!("panoptes-head-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        let target = Target {
+            label: "test".into(),
+            common_dir: None,
+            root: root.clone(),
+        };
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/review\n").unwrap();
+        std::fs::write(root.join(".git/refs/heads/review"), format!("{sha}\n")).unwrap();
+        let identity = checkout_identity(&target);
+        assert_eq!(identity["branch"], "review");
+        assert_eq!(identity["head"], sha);
+        std::fs::remove_file(root.join(".git/refs/heads/review")).unwrap();
+        std::fs::write(
+            root.join(".git/packed-refs"),
+            format!("# pack-refs with: peeled\n{sha} refs/heads/review\n"),
+        )
+        .unwrap();
+        assert_eq!(checkout_identity(&target)["head"], sha);
+        std::fs::write(root.join(".git/HEAD"), format!("{sha}\n")).unwrap();
+        assert!(checkout_identity(&target)["branch"].is_null());
+        assert_eq!(checkout_identity(&target)["head"], sha);
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/../../secret\n").unwrap();
+        assert!(checkout_identity(&target)["head"].is_null());
+        assert!(checkout_identity(&target)["branch"].is_null());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -478,6 +649,28 @@ mod tests {
         assert_eq!(
             git_common_dir(&worktree).unwrap(),
             std::fs::canonicalize(&common).unwrap().to_string_lossy()
+        );
+        let other = base.join("other");
+        let admin = common.join("worktrees/other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/review\n").unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        std::fs::write(admin.join("gitdir"), "../../../other/.git\n").unwrap();
+        std::fs::write(other.join(".git"), "gitdir: ../common/worktrees/other\n").unwrap();
+        let targets = [checkout_target(&worktree).unwrap()];
+        let found = related_worktrees(&targets);
+        assert_eq!(found.len(), 2);
+        assert!(
+            found
+                .iter()
+                .any(|target| target.root == std::fs::canonicalize(&other).unwrap())
+        );
+        std::fs::remove_file(other.join(".git")).unwrap();
+        assert_eq!(
+            related_worktrees(&targets).len(),
+            1,
+            "pruned entries are ignored"
         );
         let _ = std::fs::remove_dir_all(base);
     }
