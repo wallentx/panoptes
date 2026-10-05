@@ -97,6 +97,22 @@ pub fn freshness(db: &Connection, root: &Path) -> Result<Freshness> {
         .filter(|path| !live.contains_key(path.as_str()))
         .cloned()
         .collect();
+    let go_mod = resolver_input(root)?;
+    let prior: Option<Option<Vec<u8>>> = db
+        .query_row(
+            "select content from repo_inputs where repo_id=?1 and path='go.mod'",
+            [repo_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // A missing row is an unverified legacy graph, not proof of an absent file.
+    if prior.as_ref() != Some(&go_mod) {
+        match (prior, go_mod.as_ref()) {
+            (Some(None), Some(_)) => added.push("go.mod".into()),
+            (Some(Some(_)), None) => deleted.push("go.mod".into()),
+            _ => modified.push("go.mod".into()),
+        }
+    }
     added.sort();
     modified.sort();
     deleted.sort();
@@ -184,6 +200,7 @@ fn build_internal(
     if only_stale && freshness(&tx, root)?.is_clean() {
         return Ok(None);
     }
+    let go_mod = resolver_input(root)?;
     let files = repo::walk(root).context("walk the work tree")?;
     let common = repo::git_common_dir(root);
     let now = unix_now();
@@ -202,6 +219,11 @@ fn build_internal(
         |r| r.get(0),
     )?;
 
+    tx.execute(
+        "insert into repo_inputs(repo_id,path,content) values (?1,'go.mod',?2)
+         on conflict(repo_id,path) do update set content=excluded.content",
+        rusqlite::params![repo_id, go_mod],
+    )?;
     let existing = load_existing_files(&tx, repo_id)?;
     let current_paths: std::collections::HashSet<&str> =
         files.iter().map(|f| f.rel.as_str()).collect();
@@ -354,7 +376,7 @@ fn build_internal(
     }
 
     let mut external: HashMap<String, i64> = HashMap::new();
-    let go_module = go_module_path(root);
+    let go_module = go_mod.as_deref().and_then(go_module_path);
     let active_gitlab = crate::gitlab_ci::active_paths(&pending);
     for (file_index, file) in pending.iter().enumerate() {
         crate::progress::report(
@@ -1018,8 +1040,16 @@ fn resolve_rust_import(from_rel: &str, spec: &str, files: &HashMap<String, i64>)
     Vec::new()
 }
 
-fn go_module_path(root: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(root.join("go.mod")).ok()?;
+fn resolver_input(root: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(root.join("go.mod")) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("read resolver input go.mod"),
+    }
+}
+
+fn go_module_path(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
     text.lines().find_map(|line| {
         line.trim()
             .strip_prefix("module ")
@@ -3989,6 +4019,46 @@ module "child" {
         assert_eq!(symbols(&serial), symbols(&parallel));
         assert_eq!(edges(&serial), edges(&parallel));
         drop((serial, parallel));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn go_module_changes_invalidate_and_relink_cached_source() {
+        let (mut db, root) = fixture(&[
+            ("go.mod", "module example.test/a\n"),
+            (
+                "main.go",
+                "package main\nimport \"example.test/a/lib\"\nfunc main() { lib.Helper() }\n",
+            ),
+            ("lib/helper.go", "package lib\nfunc Helper() {}\n"),
+        ]);
+        assert!(freshness(&db, &root).unwrap().is_clean());
+        std::fs::write(root.join("go.mod"), "module example.test/b\n").unwrap();
+        assert_eq!(freshness(&db, &root).unwrap().modified, ["go.mod"]);
+        assert!(build_if_stale(&mut db, &root).unwrap());
+        let external: i64 = db
+            .query_row(
+                "select count(*) from symbols where kind='module' and name='example.test/a/lib'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(external, 1);
+        assert!(freshness(&db, &root).unwrap().is_clean());
+        std::fs::remove_file(root.join("go.mod")).unwrap();
+        assert_eq!(freshness(&db, &root).unwrap().deleted, ["go.mod"]);
+        build(&mut db, &root).unwrap();
+        std::fs::write(root.join("go.mod"), "module example.test/a\n").unwrap();
+        assert_eq!(freshness(&db, &root).unwrap().added, ["go.mod"]);
+        build(&mut db, &root).unwrap();
+        let external: i64 = db
+            .query_row(
+                "select count(*) from symbols where kind='module'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(external, 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -263,6 +263,7 @@ mod tests {
                     completed: if changing { step } else { 0 },
                     total: Some(8),
                     detail: "fixture".into(),
+                    timing: None,
                 },
             };
             let mut output = std::io::stdout().lock();

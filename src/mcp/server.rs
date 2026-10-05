@@ -58,7 +58,7 @@ fn notify_progress(
             write_response(
                 output,
                 json!({"jsonrpc":"2.0", "method":"notifications/progress", "params":{
-                    "progressToken":token, "progress":sequence, "message":update.message()
+                    "progressToken":token, "progress":sequence, "message":update.message(), "_meta":{"panoptesTiming":update.timing}
                 }}),
             )?;
         }
@@ -67,7 +67,7 @@ fn notify_progress(
         write_response(
             output,
             json!({"jsonrpc":"2.0", "method":"notifications/message", "params":{
-                "level":"info", "logger":"panoptes", "data":{"operationId":operation, "progress":sequence, "stage":update.stage, "completed":update.completed, "total":update.total, "message":update.message()}
+                "level":"info", "logger":"panoptes", "data":{"operationId":operation, "progress":sequence, "stage":update.stage, "completed":update.completed, "total":update.total, "message":update.message(), "timing":update.timing}
             }}),
         )?;
     }
@@ -393,6 +393,7 @@ pub(super) fn serve(
                                     completed: 0,
                                     total: None,
                                     detail: String::new(),
+                                    timing: None,
                                 },
                             },
                         );

@@ -22,7 +22,7 @@ from contextlib import closing
 
 REPO = Path(__file__).resolve().parent.parent
 CASES = ("empty-index", "populated-index", "changed-files", "unchanged")
-FORMAT = 1
+FORMAT = 2
 
 
 def digest(path):
@@ -57,14 +57,22 @@ def graph_state(store):
                 ).fetchone()[0]
             queries = (
                 "select path from files where repo_id=? order by path",
-                "select f.path,s.name,s.kind,s.start_line,s.end_line,s.signature "
+                "select f.path,s.name,s.kind,s.start_line,s.end_line,s.signature,s.crux,s.summary,s.container "
                 "from symbols s join files f on f.id=s.file_id where s.repo_id=? "
-                "order by f.path,s.start_line,s.end_line,s.kind,s.name,s.signature",
+                "order by f.path,s.start_line,s.end_line,s.kind,s.name,s.signature,s.crux,s.summary,s.container",
                 "select af.path,a.name,a.kind,a.start_line,bf.path,b.name,b.kind,b.start_line,e.kind "
                 "from edges e join symbols a on a.id=e.src_symbol_id "
                 "join symbols b on b.id=e.dst_symbol_id join files af on af.id=a.file_id "
                 "join files bf on bf.id=b.file_id where e.repo_id=? "
                 "order by af.path,a.name,a.kind,a.start_line,bf.path,b.name,b.kind,b.start_line,e.kind",
+            )
+            queries += (
+                "select f.path,s.name,s.kind,s.start_line,s.end_line,t.term,"
+                "t.name_count,t.path_count,t.signature_count,t.body_count "
+                "from search_terms t join symbols s on s.id=t.symbol_id "
+                "join files f on f.id=s.file_id where t.repo_id=? "
+                "order by f.path,s.name,s.kind,s.start_line,s.end_line,t.term,"
+                "t.name_count,t.path_count,t.signature_count,t.body_count",
             )
             for query in queries:
                 for row in conn.execute(query, (repo_id,)):
@@ -167,11 +175,15 @@ def measure(binary, meter, store, root, env, output, label, idle_seconds, max_se
             send(2, "tools/call", {"name": "find", "arguments": {"query": query, "limit": 5, "repo": str(root)},
                                    "_meta": {"progressToken": label}})
             previous, first, updates, max_gap = requested, None, 0, 0.0
+            worker_stages = []
             while True:
                 observed, event = receive()
                 if event.get("method") == "notifications/progress":
                     if event["params"]["progressToken"] != label:
                         raise RuntimeError("progress token does not match this trial")
+                    timing = event["params"].get("_meta", {}).get("panoptesTiming")
+                    if timing is not None:
+                        worker_stages.append(timing)
                     updates += 1
                     first = first or observed
                     max_gap = max(max_gap, observed - previous)
@@ -204,7 +216,7 @@ def measure(binary, meter, store, root, env, output, label, idle_seconds, max_se
     if sys.platform == "darwin":
         peak_rss //= 1024
     return {"wall_ms": wall_ms, "request_ms": round(request_ms, 3), "peak_rss_kb": peak_rss,
-            "progress_updates": updates, "first_progress_ms": round((first - requested) * 1000, 3) if first else None,
+            "worker_stages": worker_stages, "progress_updates": updates, "first_progress_ms": round((first - requested) * 1000, 3) if first else None,
             "max_progress_gap_ms": round(max_gap * 1000, 3), "db_bytes": store.stat().st_size}
 
 

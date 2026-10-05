@@ -9,6 +9,17 @@ pub struct Progress {
     pub completed: u64,
     pub total: Option<u64>,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<StageTiming>,
+}
+
+/// Worker-side wall time, including SQL within the named phase. VM steps are
+/// approximate work counts, never a substitute for SQL elapsed time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageTiming {
+    pub stage: String,
+    pub elapsed_micros: u64,
+    pub sqlite_vm_steps: u64,
 }
 
 impl Progress {
@@ -31,6 +42,8 @@ struct Reporter {
     sink: Box<dyn FnMut(Progress) + Send>,
     last_seen: Option<Progress>,
     last_sent: Instant,
+    phase: Option<(String, Instant, u64)>,
+    sqlite_steps: u64,
 }
 static REPORTER: OnceLock<Mutex<Reporter>> = OnceLock::new();
 
@@ -40,6 +53,8 @@ pub fn install(sink: impl FnMut(Progress) + Send + 'static) {
         sink: Box::new(sink),
         last_seen: None,
         last_sent: Instant::now(),
+        phase: None,
+        sqlite_steps: 0,
     }));
 }
 
@@ -56,6 +71,7 @@ pub fn report(stage: &str, completed: usize, total: Option<usize>, detail: &str)
         completed: completed as u64,
         total: total.map(|n| n as u64),
         detail: detail.into(),
+        timing: None,
     });
 }
 
@@ -67,10 +83,11 @@ pub fn database_steps(completed: u64) {
         completed,
         total: None,
         detail: "approximate SQLite VM steps".into(),
+        timing: None,
     });
 }
 
-fn emit(progress: Progress) {
+fn emit(mut progress: Progress) {
     let Some(reporter) = REPORTER.get() else {
         return;
     };
@@ -85,6 +102,26 @@ fn emit(progress: Progress) {
         .as_ref()
         .is_none_or(|previous| previous.stage != progress.stage);
     reporter.last_seen = Some(progress.clone());
+    if progress.stage == "Processing database" {
+        reporter.sqlite_steps = progress.completed;
+    } else if reporter
+        .phase
+        .as_ref()
+        .is_none_or(|(stage, _, _)| stage != &progress.stage)
+    {
+        let steps = reporter.sqlite_steps;
+        if let Some((stage, started, prior_steps)) =
+            reporter
+                .phase
+                .replace((progress.stage.clone(), Instant::now(), steps))
+        {
+            progress.timing = Some(StageTiming {
+                stage,
+                elapsed_micros: started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                sqlite_vm_steps: steps.saturating_sub(prior_steps),
+            });
+        }
+    }
     // Stage transitions and completion are useful immediately; rate-limit counts
     // within a stage. Repeating a waiting status never constitutes progress.
     if !stage_changed

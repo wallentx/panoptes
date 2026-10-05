@@ -802,6 +802,9 @@ fn progress_notifications_stream_stages_and_keep_request_tokens() {
             .unwrap()
             .starts_with("Index committed")
     }));
+    assert!(updates.iter().any(
+        |update| update["params"]["_meta"]["panoptesTiming"]["stage"] == "Waiting for index writer"
+    ));
     server.request(3, "ping", json!({}));
     assert!(
         server.notifications.try_recv().is_err(),

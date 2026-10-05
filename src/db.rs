@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever the DDL below changes in a way an existing store cannot serve.
 /// Read from and written to `pragma user_version`.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const DDL: &str = r#"
 create table if not exists repos (
@@ -146,7 +146,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 
     let found: i64 = db.query_row("pragma user_version", [], |r| r.get(0))?;
     anyhow::ensure!(
-        matches!(found, 0 | 1 | SCHEMA_VERSION),
+        matches!(found, 0 | 1 | 2 | SCHEMA_VERSION),
         "store at {} is schema v{found}; expected v{SCHEMA_VERSION}",
         path.display()
     );
@@ -174,11 +174,24 @@ pub fn open(path: &Path) -> Result<Connection> {
         // Another process may have migrated between opening and taking the lock.
         let version: i64 = tx.query_row("pragma user_version", [], |r| r.get(0))?;
         anyhow::ensure!(
-            matches!(version, 0 | 1 | SCHEMA_VERSION),
+            matches!(version, 0 | 1 | 2 | SCHEMA_VERSION),
             "unsupported store schema v{version}"
         );
         if version == 0 {
             tx.execute_batch(DDL).context("apply schema")?;
+        }
+        if version < 3 {
+            tx.execute_batch(
+                "create index if not exists edges_fk_src on edges(src_symbol_id);
+                 create index if not exists edges_fk_dst on edges(dst_symbol_id);
+                 create table if not exists repo_inputs (
+                   repo_id integer not null references repos(id) on delete cascade,
+                   path text not null,
+                   content blob,
+                   primary key(repo_id, path)
+                 ) without rowid;",
+            )
+            .context("index edge foreign keys and track resolver inputs")?;
         }
         if version < SCHEMA_VERSION {
             tx.execute_batch(crate::search::DDL)
@@ -369,6 +382,48 @@ mod tests {
     }
 
     #[test]
+    fn migration_indexes_each_edge_foreign_key_without_rewriting_graph() {
+        let g = tempdir::Guard::new();
+        let path = g.path().join("v2.db");
+        let db = open(&path).unwrap();
+        let repo = seed_repo(&db);
+        db.execute_batch("drop index edges_fk_src; drop index edges_fk_dst; drop table repo_inputs; pragma user_version=2;").unwrap();
+        drop(db);
+        let db = open(&path).unwrap();
+        for (column, index) in [
+            ("src_symbol_id", "edges_fk_src"),
+            ("dst_symbol_id", "edges_fk_dst"),
+        ] {
+            let plan: String = db
+                .query_row(
+                    &format!("explain query plan select rowid from edges where {column}=?1"),
+                    [1],
+                    |row| row.get(3),
+                )
+                .unwrap();
+            assert!(plan.contains("SEARCH") && plan.contains(index), "{plan}");
+        }
+        let count: i64 = db
+            .query_row(
+                "select count(*) from symbols where repo_id=?1",
+                [repo],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(integrity(&db).unwrap(), "ok");
+        assert!(
+            db.prepare("pragma foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn rejects_unrecognized_schema_versions() {
         let g = tempdir::Guard::new();
         let p = g.path().join("panoptes.db");
@@ -377,7 +432,10 @@ mod tests {
         drop(db);
 
         let error = open(&p).unwrap_err().to_string();
-        assert!(error.contains("schema v99; expected v2"), "{error}");
+        assert!(
+            error.contains(&format!("schema v99; expected v{SCHEMA_VERSION}")),
+            "{error}"
+        );
     }
 
     #[test]

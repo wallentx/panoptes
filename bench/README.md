@@ -164,3 +164,24 @@ The first three-task pilot is recorded in
 It showed lower aggregate cost, tokens, tool calls, and wall time, but did not
 match baseline rubric coverage. The product README presents those measured
 results with the pilot size and correctness result visible.
+
+### Worker stage timing and schema-v3 comparisons
+
+MCP benchmark format 2 fingerprints symbol signatures, crux, summaries,
+containers, and all search field counts as well as graph edges. Older format-1
+reports are rejected as comparison baselines; rerun the old executable using
+this runner to make a format-2 baseline.
+
+Each trial records `worker_stages` from worker-side monotonic clocks, including
+writer-lock wait separately. `elapsed_micros` includes SQL within the named
+phase; `sqlite_vm_steps` is an approximate instruction count, not SQL duration.
+These measurements remove IPC delivery latency from phase boundaries. They do
+not claim an exclusive CPU or nested SQL-time profile.
+
+Schema v3 adds indexes for both edge foreign keys and records the exact
+`go.mod` bytes (including absence) used for import resolution. Opening an old
+store migrates it atomically without rewriting graph rows. Legacy graphs lack
+verified resolver inputs and refresh once on demand. Older binaries reject v3;
+use a SQLite backup taken before migration if binary rollback is required.
+The installed executable and its store are not upgraded by running fixture
+benchmarks, which always use explicit disposable stores.
