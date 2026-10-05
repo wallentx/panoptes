@@ -16,3 +16,6 @@ transcripts/
 # user-level host configuration; never commit generated local host wiring.
 /.claude/
 /.codegraph/
+
+# Machine-local benchmark reports and diagnostics.
+/.local/
