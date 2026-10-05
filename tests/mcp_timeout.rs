@@ -506,7 +506,7 @@ fn concurrent_distinct_queries_reuse_one_checkout_refresh() {
     let fixture = Fixture::new();
     fixture.build();
     let writer = Connection::open(fixture.store()).unwrap();
-    writer.execute_batch("create table refreshes(n integer); create trigger refreshed after update on repos begin insert into refreshes values(1); end; begin immediate;").unwrap();
+    writer.execute_batch("create table refreshes(n integer); create trigger refreshed after update of snapshot_id on checkouts when new.snapshot_id is not old.snapshot_id begin insert into refreshes values(1); end; begin immediate;").unwrap();
     fixture.source("pub fn changed() {}\npub fn other() {}\n");
     let mut server = Server::with_timeout(&fixture, "5");
     server.send(
@@ -829,4 +829,27 @@ fn progress_logs_work_without_tokens_and_respect_log_level() {
     assert!(server.notifications.try_recv().is_err());
     let invalid = server.request(4, "logging/setLevel", json!({"level":"verbose"}));
     assert_eq!(invalid["error"]["code"], -32602);
+}
+
+#[test]
+fn no_refresh_uses_captured_source_when_the_live_file_is_unreadable_as_text() {
+    let fixture = Fixture::new();
+    fixture.build();
+    std::fs::write(fixture.0.join("repo/lib.rs"), [255u8]).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_panoptes"));
+    command.arg("--no-refresh");
+    let mut server = Server::with_command(&fixture, "5", command);
+    let result = server.find(1, "original");
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    let data = &result["result"]["structuredContent"];
+    assert_eq!(data["panoptesCheckouts"][0]["sourceComplete"], true);
+    assert!(
+        data["repositories"]["repo"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["source"]
+                .as_str()
+                .is_some_and(|source| source.contains("pub fn original")))
+    );
 }

@@ -281,3 +281,36 @@ its own graph and search postings. Exact-byte capture and the additional base
 cache can increase store size until graph snapshots are shared. Old FNV file
 hashes invalidate on the next refresh; migration itself preserves legacy graphs.
 `cache clear` removes the shared objects too.
+
+### Immutable graph snapshots
+
+Schema v6 separates canonical checkout locations from graph ownership. Each
+snapshot records a complete input manifest: exact source-byte identities and
+relative paths, language selection, exact `go.mod` bytes or absence, scan policy,
+and extractor/graph/search versions. A separate source-tree key excludes resolver
+context and language interpretation. Neither key depends on Git ancestry.
+
+A changed build creates a new graph, captures its source, verifies the inputs a
+second time, marks it ready, and atomically advances the checkout attachment.
+Failed scans or writes leave the previous attachment intact. Unchanged explicit
+builds keep their current snapshot. Graph IDs and symbol IDs belong to snapshots;
+a changed snapshot does not promise to retain the old numeric symbol IDs.
+
+`find` excerpts and `grep` read captured bytes belonging to the selected graph.
+CLI and MCP readers pin their attachment and graph in one SQLite read view.
+`--no-refresh` can therefore answer from the last captured graph after live edits;
+MCP reports `live_checked: false` when it deliberately skips the live scan. Legacy
+snapshots remain queryable but have `sourceComplete: false` and no captured source
+excerpts until refreshed. They are never treated as verified reusable snapshots.
+
+The scan rejects unreadable/non-UTF-8 supported source and lossy path conversion,
+rather than publishing an incomplete reusable graph. Literal backslashes in Unix
+filenames stay distinct from directory separators. Symlinks and unsupported
+languages remain excluded by the recorded scan policy. Two matching scans are a
+stability check, not an operating-system-level atomic filesystem snapshot.
+
+Old unreferenced graphs are reclaimed after attachment changes. Attached graphs
+survive another checkout's reset, and SQLite readers retain their prior view
+until their read transaction ends. Base source/extraction objects remain cached
+until explicit cache cleanup. This intermediate layer still builds separate
+graphs for different checkouts; cross-checkout snapshot attachment follows next.

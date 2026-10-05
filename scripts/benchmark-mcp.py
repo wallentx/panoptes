@@ -48,7 +48,9 @@ def graph_state(store):
         if integrity != "ok":
             raise RuntimeError(f"fixture store integrity: {integrity}")
         state = {}
-        for repo_id, root in conn.execute("select id,root from repos order by root"):
+        modern = conn.execute("select 1 from sqlite_master where type='table' and name='snapshot_manifests'").fetchone()
+        checkout_query = "select snapshot_id,root from checkouts where snapshot_id is not null order by root" if modern else "select id,root from repos order by root"
+        for repo_id, root in conn.execute(checkout_query):
             fingerprint = hashlib.sha256()
             counts = {}
             for table in ("files", "symbols", "edges"):

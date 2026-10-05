@@ -262,7 +262,11 @@ fn call_tool_detailed(
             None,
             &target.root.to_string_lossy(),
         );
-        let mut state = index::freshness(&conn, &target.root)?;
+        let mut state = if no_refresh && name != "freshness" {
+            index::stored_freshness(&conn, &target.root)?
+        } else {
+            index::freshness(&conn, &target.root)?
+        };
         if name == "freshness" {
             results.insert(target.label.clone(), serde_json::to_value(state)?);
             continue;

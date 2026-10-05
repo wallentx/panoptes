@@ -105,16 +105,18 @@ pub fn register(db: &Connection, root: &Path, graph: Option<i64>) -> Result<()> 
     let root_text = root.to_str().context("checkout path is not UTF-8")?;
     let instance = instance(db, root)?;
     db.execute(
-        "insert into checkouts(root,instance_id,graph_repo_id) values (?1,?2,?3)
+        "insert into checkouts(root,instance_id,snapshot_id) values (?1,?2,?3)
          on conflict(root) do update set instance_id=excluded.instance_id,
-           graph_repo_id=coalesce(excluded.graph_repo_id,checkouts.graph_repo_id)",
+           snapshot_id=coalesce(excluded.snapshot_id,checkouts.snapshot_id),
+           generation=checkouts.generation+case when excluded.snapshot_id is not null and excluded.snapshot_id is not checkouts.snapshot_id then 1 else 0 end,
+           attached_at=case when excluded.snapshot_id is not null and excluded.snapshot_id is not checkouts.snapshot_id then unixepoch() else checkouts.attached_at end",
         params![root_text, instance, graph],
     )?;
     Ok(())
 }
 
 pub fn metadata(db: &Connection, root: &Path) -> Result<Value> {
-    let mut statement = db.prepare("select c.uid,i.uid,l.common_dir,l.filesystem_key from checkouts c left join git_instances i on i.id=c.instance_id left join git_instance_locations l on l.instance_id=i.id where c.root=?1")?;
+    let mut statement = db.prepare("select c.uid,i.uid,l.common_dir,l.filesystem_key,c.snapshot_id,m.input_key,m.source_complete,c.generation from checkouts c left join git_instances i on i.id=c.instance_id left join git_instance_locations l on l.instance_id=i.id left join snapshot_manifests m on m.snapshot_id=c.snapshot_id where c.root=?1")?;
     let mut rows = statement.query([root.to_string_lossy()])?;
     let Some(row) = rows.next()? else {
         return Ok(json!({"checkoutId":null,"gitInstanceId":null}));
@@ -123,6 +125,10 @@ pub fn metadata(db: &Connection, root: &Path) -> Result<Value> {
     let mut instance: Option<String> = row.get(1)?;
     let common: Option<String> = row.get(2)?;
     let key: Option<String> = row.get(3)?;
+    let snapshot: Option<i64> = row.get(4)?;
+    let snapshot_key: Option<String> = row.get(5)?;
+    let source_complete: Option<bool> = row.get(6)?;
+    let generation: i64 = row.get(7)?;
     let live = crate::repo::git_common_dir(root);
     if common != live
         || common
@@ -133,7 +139,9 @@ pub fn metadata(db: &Connection, root: &Path) -> Result<Value> {
         // replacement, nor acquire a writer lock just to repair metadata.
         instance = None;
     }
-    Ok(json!({"checkoutId":checkout,"gitInstanceId":instance}))
+    Ok(
+        json!({"checkoutId":checkout,"gitInstanceId":instance,"snapshotId":snapshot,"snapshotKey":snapshot_key,"sourceComplete":source_complete,"generation":generation}),
+    )
 }
 
 pub fn inspect(db: &mut Connection, root: &Path, lineage: bool) -> Result<Value> {
@@ -341,11 +349,11 @@ pub fn relocate(db: &mut Connection, from: &Path, to: &Path) -> Result<Value> {
     );
     let target = crate::repo::checkout_target(to)?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let (checkout, instance, graph): (i64, Option<i64>, Option<i64>) = tx
+    let (checkout, instance): (i64, Option<i64>) = tx
         .query_row(
-            "select id,instance_id,graph_repo_id from checkouts where root=?1",
+            "select id,instance_id from checkouts where root=?1",
             [from.to_string_lossy()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .context("old checkout is not registered; use its stored absolute root")?;
     ensure!(
@@ -382,12 +390,6 @@ pub fn relocate(db: &mut Connection, from: &Path, to: &Path) -> Result<Value> {
         "update checkouts set root=?1 where id=?2",
         params![target.root.to_string_lossy(), checkout],
     )?;
-    if let Some(graph) = graph {
-        tx.execute(
-            "update repos set root=?1,git_common_dir=?2 where id=?3",
-            params![target.root.to_string_lossy(), target.common_dir, graph],
-        )?;
-    }
     let result = metadata(&tx, &target.root)?;
     tx.commit()?;
     Ok(result)
@@ -489,7 +491,7 @@ mod tests {
         let again = inspect(&mut db, &fixture.repo(), false).unwrap();
         assert_eq!(a["checkoutId"], again["checkoutId"]);
         assert_eq!(
-            db.query_row("select count(*) from repos", [], |r| r.get::<_, i64>(0))
+            db.query_row("select count(*) from snapshots", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             0
         );

@@ -96,3 +96,14 @@ pub fn attach_file(db: &Connection, file_id: i64, file: &SourceFile) -> Result<(
     )?;
     Ok(())
 }
+
+/// Read the bytes owned by the selected graph, never a later filesystem edit.
+pub fn source(db: &Connection, snapshot: i64, path: &str) -> Result<Option<String>> {
+    let bytes: Option<Vec<u8>> = db.query_row(
+        "select c.source_bytes from files f join file_objects o on o.file_id=f.id join content_objects c on c.id=o.object_id join snapshot_manifests m on m.snapshot_id=f.repo_id where f.repo_id=?1 and f.path=?2 and m.ready=1 and m.source_complete=1",
+        params![snapshot,path], |row| row.get(0),
+    ).optional()?;
+    bytes
+        .map(|bytes| String::from_utf8(bytes).context("stored source is not UTF-8"))
+        .transpose()
+}

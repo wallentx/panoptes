@@ -1,10 +1,7 @@
 //! Repo identity and the source-file walk.
 //!
-//! A repo is identified by the realpath of its git toplevel. That is the key in
-//! `repos.root`, and it is what the MCP server resolves the working directory to
-//! before deciding whether it can answer or has to report "not indexed". Using
-//! the toplevel rather than the caller's cwd means `panoptes grep` from a
-//! subdirectory hits the same store entry as one run from the root.
+//! Canonical roots select checkout records. Stable checkout/instance identities
+//! live in the store; complete captured inputs identify immutable graph snapshots.
 
 use anyhow::{Context, Result};
 use std::io::Read;
@@ -373,10 +370,7 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
 
     for (visited, dent) in walker.enumerate() {
         crate::progress::report("Scanning files", visited, None, &root.to_string_lossy());
-        let dent = match dent {
-            Ok(d) => d,
-            Err(_) => continue, // unreadable entry: skip, never abort the build
-        };
+        let dent = dent.context("source scan is incomplete")?;
         if !dent.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -385,12 +379,11 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
             lang
         } else if abs.extension().is_none() {
             let mut prefix = [0u8; 256];
-            let Ok(mut file) = std::fs::File::open(abs) else {
-                continue;
-            };
-            let Ok(read) = file.read(&mut prefix) else {
-                continue;
-            };
+            let mut file = std::fs::File::open(abs)
+                .with_context(|| format!("inspect source candidate {}", abs.display()))?;
+            let read = file
+                .read(&mut prefix)
+                .with_context(|| format!("read source candidate {}", abs.display()))?;
             let Some(lang) = Lang::of_shebang(&prefix[..read]) else {
                 continue;
             };
@@ -398,10 +391,9 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
         } else {
             continue;
         };
-        // Non-UTF8 files are not source we can parse; skipping beats failing.
-        let Ok(text) = std::fs::read_to_string(abs) else {
-            continue;
-        };
+        // Fail closed rather than publishing a reusable graph with omitted source.
+        let text = std::fs::read_to_string(abs)
+            .with_context(|| format!("capture UTF-8 source {}", abs.display()))?;
         let meta = dent.metadata().ok();
         let mtime = meta
             .as_ref()
@@ -409,11 +401,19 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let rel = abs
+        let relative = abs
             .strip_prefix(root)
-            .unwrap_or(abs)
-            .to_string_lossy()
-            .replace('\\', "/");
+            .context("source path escaped checkout")?;
+        let rel = relative
+            .components()
+            .map(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .context("source path is not UTF-8")
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join("/");
         out.push(SourceFile {
             rel,
             lang,

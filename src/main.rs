@@ -1,8 +1,8 @@
 //! `panoptes` — local repository structure and retrieval.
 //!
 //! Nothing is written into an indexed repository. The graph lives in one SQLite
-//! store outside every work tree; a repo is identified by the realpath of its git
-//! toplevel. MCP creates missing indexes when a provider connects; direct CLI reads report a
+//! store outside every work tree. Canonical roots select checkouts and their
+//! immutable graph snapshots. MCP creates missing indexes on demand; direct CLI reads report a
 //! directory that has never been indexed rather than answering from an empty graph.
 
 mod ansible;
@@ -25,6 +25,7 @@ mod mcp;
 mod progress;
 mod repo;
 mod search;
+mod snapshot;
 mod viz;
 mod yaml;
 
@@ -260,6 +261,9 @@ fn ready_repo(
     root: &std::path::Path,
     no_refresh: bool,
 ) -> Result<Option<i64>> {
+    if refresh_disabled(no_refresh) {
+        return index::repo_id_of(conn, root);
+    }
     let state = index::freshness(conn, root)?;
     if !state.indexed {
         return Ok(None);
@@ -302,10 +306,15 @@ fn ready_targets(
     let mut ready = Vec::new();
     for target in repo::targets(path)? {
         let mut conn = db::open(store)?;
-        let Some(repo_id) = ready_repo(&mut conn, &target.root, no_refresh)? else {
+        let Some(_) = ready_repo(&mut conn, &target.root, no_refresh)? else {
             eprintln!("{}", not_indexed(&target.root));
             return Ok(None);
         };
+        // Pin both the attachment and its rows before another writer can retire
+        // this graph. Connection drop ends this read transaction.
+        conn.execute_batch("begin deferred")?;
+        let repo_id = index::repo_id_of(&conn, &target.root)?
+            .ok_or_else(|| anyhow::anyhow!("checkout index was reset before the read"))?;
         ready.push(ReadyTarget {
             target,
             conn,
@@ -1111,6 +1120,7 @@ fn main() -> Result<()> {
 
         Cmd::Status { path, json } => {
             let conn = db::open(&store)?;
+            conn.execute_batch("begin deferred")?;
             let mut outputs = Vec::new();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
