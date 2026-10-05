@@ -15,6 +15,7 @@ mod export;
 mod extract;
 mod github_actions;
 mod gitlab_ci;
+mod identity;
 mod index;
 mod init;
 mod kubernetes;
@@ -51,6 +52,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Inspect persistent checkout/instance IDs; optionally inspect bounded local ancestry.
+    Identity {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        lineage: bool,
+    },
+    /// Rebind a registered checkout after an explicit move (old location must be absent).
+    Relocate { from: PathBuf, to: PathBuf },
     /// Index a repo into the store.
     Build {
         #[arg(default_value = ".")]
@@ -280,6 +290,7 @@ struct StatusOutput {
     age_seconds: i64,
     store: String,
     freshness: index::Freshness,
+    identity: serde_json::Value,
 }
 
 fn ready_targets(
@@ -358,6 +369,22 @@ fn main() -> Result<()> {
     };
 
     match cli.cmd {
+        Cmd::Identity { path, lineage } => {
+            let root = repo::root_of(&path)?;
+            let mut conn = db::open(&store)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&identity::inspect(&mut conn, &root, lineage)?)?
+            );
+        }
+        Cmd::Relocate { from, to } => {
+            let mut conn = db::open(&store)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&identity::relocate(&mut conn, &from, &to)?)?
+            );
+        }
+
         Cmd::Build { path, jobs } => {
             use std::io::IsTerminal;
             if std::io::stderr().is_terminal() {
@@ -1102,6 +1129,7 @@ fn main() -> Result<()> {
                     age_seconds,
                     store: store.to_string_lossy().into_owned(),
                     freshness: index::freshness(&conn, &target.root)?,
+                    identity: identity::metadata(&conn, &target.root)?,
                 });
             }
             if json {

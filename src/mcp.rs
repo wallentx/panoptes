@@ -289,6 +289,14 @@ fn call_tool_detailed(
         crate::progress::report("Querying index", 0, None, &target.root.to_string_lossy());
         let snapshot = conn.transaction()?;
         let conn = &snapshot;
+        if let Some(checkout) = checkouts.last_mut() {
+            checkout.as_object_mut().unwrap().extend(
+                crate::identity::metadata(conn, &target.root)?
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        }
         let repo_id = index::repo_id_of(conn, &target.root)?.context("current index missing")?;
         let value = match name {
             "find" => serde_json::to_value(ask::ask(

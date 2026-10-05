@@ -224,6 +224,7 @@ fn build_internal(
          on conflict(repo_id,path) do update set content=excluded.content",
         rusqlite::params![repo_id, go_mod],
     )?;
+    crate::identity::register(&tx, root, Some(repo_id))?;
     let existing = load_existing_files(&tx, repo_id)?;
     let current_paths: std::collections::HashSet<&str> =
         files.iter().map(|f| f.rel.as_str()).collect();

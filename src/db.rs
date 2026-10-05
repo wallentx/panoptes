@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever the DDL below changes in a way an existing store cannot serve.
 /// Read from and written to `pragma user_version`.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const DDL: &str = r#"
 create table if not exists repos (
@@ -146,7 +146,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 
     let found: i64 = db.query_row("pragma user_version", [], |r| r.get(0))?;
     anyhow::ensure!(
-        matches!(found, 0 | 1 | 2 | SCHEMA_VERSION),
+        matches!(found, 0 | 1 | 2 | 3 | SCHEMA_VERSION),
         "store at {} is schema v{found}; expected v{SCHEMA_VERSION}",
         path.display()
     );
@@ -174,7 +174,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         // Another process may have migrated between opening and taking the lock.
         let version: i64 = tx.query_row("pragma user_version", [], |r| r.get(0))?;
         anyhow::ensure!(
-            matches!(version, 0 | 1 | 2 | SCHEMA_VERSION),
+            matches!(version, 0 | 1 | 2 | 3 | SCHEMA_VERSION),
             "unsupported store schema v{version}"
         );
         if version == 0 {
@@ -192,6 +192,21 @@ pub fn open(path: &Path) -> Result<Connection> {
                  ) without rowid;",
             )
             .context("index edge foreign keys and track resolver inputs")?;
+        }
+        if version < 4 {
+            tx.execute_batch(crate::identity::DDL)
+                .context("create repository identities")?;
+            let roots = {
+                let mut statement = tx.prepare("select id,root from repos order by id")?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (id, root) in roots {
+                crate::identity::register(&tx, Path::new(&root), Some(id))?;
+            }
         }
         if version < SCHEMA_VERSION {
             tx.execute_batch(crate::search::DDL)
@@ -214,6 +229,9 @@ pub fn reset_repo(db: &Connection, root: &Path) -> Result<bool> {
 pub fn clear(db: &Connection) -> Result<i64> {
     let repositories: i64 = db.query_row("select count(*) from repos", [], |row| row.get(0))?;
     db.execute("delete from repos", [])?;
+    db.execute("delete from checkouts", [])?;
+    db.execute("delete from git_instances", [])?;
+    db.execute("delete from lineages", [])?;
     db.execute_batch("pragma wal_checkpoint(truncate); vacuum;")?;
     Ok(repositories)
 }

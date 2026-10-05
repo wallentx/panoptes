@@ -235,3 +235,30 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 See [SECURITY.md](SECURITY.md) for security policy. Panoptes is available under
 the [MIT license](LICENSE).
+
+### Checkout identity and lineage
+
+`panoptes identity /absolute/checkout` registers/prints a store-local checkout ID
+and Git-instance ID without indexing source. Linked worktrees share an instance;
+independent clones retain distinct instances even when they share object storage.
+MCP indexed results include these IDs in `panoptesCheckouts`, and CLI status JSON
+includes `identity`. Discovery alone remains observational and does not create a
+store. A replaced `.git` directory invalidates the observed instance locator.
+
+After moving a checkout, use `panoptes relocate /old/absolute/root /new/root` to
+preserve its ID. The old path must be absent and the destination unregistered.
+Panoptes never infers relocation from matching contents, HEAD, or remote URLs.
+
+Add `--lineage` to `identity` for optional local ancestry inspection. Each of two
+Git commands has a two-second limit and a 128 KiB output cap. Git must support
+`--no-lazy-fetch`; missing objects, unavailable Git, shallow boundaries, or grafts
+produce an incomplete status rather than invented roots. Replacement refs are
+ignored deliberately: lineage records physical commit ancestry. Each verified
+root is keyed by object format and full OID; unrelated-history merges retain all
+roots independently. Observations are tied to HEAD and refreshed on request;
+lineage is relationship metadata, never an extraction or graph cache key.
+
+Schema v4 adds identity metadata without rewriting existing graphs. Cache reset
+removes graph data while retaining registered checkout IDs; global cache clear
+also clears identity metadata. Keep a pre-migration SQLite backup when an older
+binary must remain a rollback option.
