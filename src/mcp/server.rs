@@ -128,7 +128,6 @@ pub(super) fn serve(
     let mut queue = VecDeque::new();
     let mut next = 0u64;
     let mut active = 0usize;
-    let mut closed = false;
     let mut logs_enabled = true;
     loop {
         // Productive workers can run longer than one idle window. Queued calls
@@ -185,9 +184,6 @@ pub(super) fn serve(
                 let _ = send.send(Event::Done(operation, result));
             }));
         }
-        if closed && jobs.is_empty() {
-            return Ok(());
-        }
         let event = if let Some(deadline) = jobs
             .values()
             .filter(|job| job.thread.is_none())
@@ -203,7 +199,15 @@ pub(super) fn serve(
             events.recv()?
         };
         match event {
-            Event::Closed => closed = true,
+            // EOF is a disconnected client, not a request to drain the queue.
+            // Drop the receiver before joining supervisors so blocked sends wake.
+            Event::Closed => {
+                for job in jobs.values() {
+                    job.cancelled.store(true, Ordering::Relaxed);
+                }
+                drop(events);
+                return Ok(());
+            }
             Event::Progress(operation, update) => {
                 if let Some(job) = jobs.get_mut(&operation) {
                     job.progress += 1;
@@ -313,7 +317,7 @@ pub(super) fn serve(
                     let progress_token = params
                         .get("_meta")
                         .and_then(|meta| meta.get("progressToken"))
-                        .filter(|token| token.is_string() || token.is_i64() || token.is_u64())
+                        .filter(|token| token.is_string() || token.is_number())
                         .cloned();
                     if jobs
                         .values()

@@ -257,6 +257,60 @@ fn initialize_does_not_start_indexing_and_idle_disconnect_is_prompt() {
 }
 
 #[test]
+fn disconnect_cancels_active_and_queued_requests() {
+    let fixture = Fixture::new();
+    fixture.build();
+    let writer = Connection::open(fixture.store()).unwrap();
+    writer.execute_batch("begin immediate").unwrap();
+    fixture.source("pub fn changed() {}\n");
+    let mut server = Server::with_timeout(&fixture, "30");
+    for id in 1..=4 {
+        server.send(
+            id,
+            "tools/call",
+            json!({"name":"find", "arguments":{"query":format!("changed {id}")}}),
+        );
+    }
+    server.request(5, "ping", json!({}));
+    drop(server.input.take());
+    let started = Instant::now();
+    loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "disconnect must cancel workers and queued calls"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    writer.execute_batch("rollback").unwrap();
+    let mut recovered = Server::with_timeout(&fixture, "5");
+    assert_eq!(recovered.find(1, "changed")["result"]["isError"], false);
+}
+
+#[test]
+fn fractional_progress_tokens_are_preserved() {
+    let fixture = Fixture::new();
+    let mut server = Server::with_timeout(&fixture, "5");
+    server.send(
+        1,
+        "tools/call",
+        json!({"name":"find", "arguments":{"query":"original"}, "_meta":{"progressToken":1.5}}),
+    );
+    assert_eq!(receive(&server)["result"]["isError"], false);
+    let updates: Vec<_> = server.notifications.try_iter().collect();
+    assert!(!updates.is_empty());
+    assert!(
+        updates
+            .iter()
+            .all(|update| update["method"] == "notifications/progress"
+                && update["params"]["progressToken"] == 1.5)
+    );
+}
+
+#[test]
 fn worker_has_its_own_deadline_even_without_a_supervising_mcp_parent() {
     let fixture = Fixture::new();
     fixture.build();
@@ -299,7 +353,7 @@ fn worker_has_its_own_deadline_even_without_a_supervising_mcp_parent() {
 }
 
 #[cfg(target_os = "android")]
-fn linker_command() -> Command {
+fn linker_command() -> Option<Command> {
     let linker = if cfg!(target_pointer_width = "64") {
         "/system/bin/linker64"
     } else {
@@ -311,14 +365,33 @@ fn linker_command() -> Command {
         .env_remove("LD_PRELOAD")
         // A stale hint from the launcher must not override our actual argv[0].
         .env("TERMUX_EXEC__PROC_SELF_EXE", "/not-the-panoptes-binary");
+    // Android 9's linker (also used by termux-docker) prints this exact
+    // informational line instead of supporting an explicit executable argument.
+    // Skip only that known capability gap; all other failures remain failures.
+    let probe = command.args(["version", "--json"]).output().unwrap();
+    if probe.status.success()
+        && probe.stdout
+            == format!("This is {linker}, the helper program for dynamic executables.\n").as_bytes()
+    {
+        eprintln!("explicit linker launch unsupported by this Android linker");
+        return None;
+    }
+    let mut command = Command::new(linker);
     command
+        .arg(env!("CARGO_BIN_EXE_panoptes"))
+        .env_remove("LD_PRELOAD")
+        .env("TERMUX_EXEC__PROC_SELF_EXE", "/not-the-panoptes-binary");
+    Some(command)
 }
 
 #[cfg(target_os = "android")]
 #[test]
 fn android_linker_launch_without_preload_can_index_and_reexecute_workers() {
     let fixture = Fixture::new();
-    let mut server = Server::with_command(&fixture, "5", linker_command());
+    let Some(command) = linker_command() else {
+        return;
+    };
+    let mut server = Server::with_command(&fixture, "5", command);
     let init = server.request(1, "initialize", json!({}));
     assert_eq!(init["result"]["serverInfo"]["name"], "panoptes");
     let result = server.find(2, "original");
@@ -338,16 +411,21 @@ fn android_linker_launch_without_preload_can_index_and_reexecute_workers() {
 #[cfg(target_os = "android")]
 #[test]
 fn android_linker_launch_reports_the_program_path_instead_of_the_loader() {
-    let output = linker_command()
-        .args(["version", "--json"])
-        .output()
-        .unwrap();
+    let Some(mut command) = linker_command() else {
+        return;
+    };
+    let output = command.args(["version", "--json"]).output().unwrap();
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let version: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let version: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "invalid version JSON: {error}; stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
     assert_eq!(
         PathBuf::from(version["executable"].as_str().unwrap()),
         std::fs::canonicalize(env!("CARGO_BIN_EXE_panoptes")).unwrap()

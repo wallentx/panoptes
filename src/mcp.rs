@@ -626,7 +626,7 @@ mod tests {
         );
         assert_eq!(
             select_targets(&targets, targets[1].root.to_str()).unwrap()[0].root,
-            targets[1].root
+            targets[1].root.canonicalize().unwrap()
         );
     }
 
