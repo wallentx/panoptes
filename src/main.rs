@@ -1,27 +1,32 @@
 //! `panoptes` — local repository structure and retrieval.
 //!
 //! Nothing is written into an indexed repository. The graph lives in one SQLite
-//! store outside every work tree; a repo is identified by the realpath of its git
-//! toplevel. MCP creates missing indexes when a provider connects; direct CLI reads report a
+//! store outside every work tree. Canonical roots select checkouts and their
+//! immutable graph snapshots. MCP creates missing indexes on demand; direct CLI reads report a
 //! directory that has never been indexed rather than answering from an empty graph.
 
 mod ansible;
 mod ask;
 mod cloudformation;
 mod compose;
+mod content;
 mod db;
 mod executable;
 mod export;
 mod extract;
 mod github_actions;
 mod gitlab_ci;
+mod identity;
 mod index;
 mod init;
 mod kubernetes;
 mod kustomize;
 mod mcp;
+mod progress;
 mod repo;
+mod scopes;
 mod search;
+mod snapshot;
 mod viz;
 mod yaml;
 
@@ -50,6 +55,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Inspect persistent checkout/instance IDs; optionally inspect bounded local ancestry.
+    Identity {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        lineage: bool,
+    },
+    /// Rebind a registered checkout after an explicit move (old location must be absent).
+    Relocate { from: PathBuf, to: PathBuf },
     /// Index a repo into the store.
     Build {
         #[arg(default_value = ".")]
@@ -71,6 +85,11 @@ enum Cmd {
         full: bool,
         #[arg(long = "in")]
         scope: Option<String>,
+        /// Search registered checkouts; expanded scopes emit JSON with provenance.
+        #[arg(long, default_value="checkout", value_parser=["checkout", "repository", "lineage"])]
+        view_scope: String,
+        #[arg(long)]
+        lineage_root: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -126,7 +145,7 @@ enum Cmd {
     Mcp {
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Wall-clock limit for each tool call, including indexing (1-300 seconds).
+        /// Stop after this many seconds without meaningful progress (1-300 seconds).
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
         timeout_secs: u64,
     },
@@ -207,6 +226,11 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum CacheCmd {
+    /// Reclaim source objects and extraction profiles with no surviving snapshot.
+    Gc {
+        #[arg(long)]
+        yes: bool,
+    },
     /// Remove every indexed repository and reclaim the database space.
     Clear {
         /// Confirm this destructive operation.
@@ -248,6 +272,9 @@ fn ready_repo(
     root: &std::path::Path,
     no_refresh: bool,
 ) -> Result<Option<i64>> {
+    if refresh_disabled(no_refresh) {
+        return index::repo_id_of(conn, root);
+    }
     let state = index::freshness(conn, root)?;
     if !state.indexed {
         return Ok(None);
@@ -279,6 +306,7 @@ struct StatusOutput {
     age_seconds: i64,
     store: String,
     freshness: index::Freshness,
+    identity: serde_json::Value,
 }
 
 fn ready_targets(
@@ -289,10 +317,15 @@ fn ready_targets(
     let mut ready = Vec::new();
     for target in repo::targets(path)? {
         let mut conn = db::open(store)?;
-        let Some(repo_id) = ready_repo(&mut conn, &target.root, no_refresh)? else {
+        let Some(_) = ready_repo(&mut conn, &target.root, no_refresh)? else {
             eprintln!("{}", not_indexed(&target.root));
             return Ok(None);
         };
+        // Pin both the attachment and its rows before another writer can retire
+        // this graph. Connection drop ends this read transaction.
+        conn.execute_batch("begin deferred")?;
+        let repo_id = index::repo_id_of(&conn, &target.root)?
+            .ok_or_else(|| anyhow::anyhow!("checkout index was reset before the read"))?;
         ready.push(ReadyTarget {
             target,
             conn,
@@ -357,7 +390,27 @@ fn main() -> Result<()> {
     };
 
     match cli.cmd {
+        Cmd::Identity { path, lineage } => {
+            let root = repo::root_of(&path)?;
+            let mut conn = db::open(&store)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&identity::inspect(&mut conn, &root, lineage)?)?
+            );
+        }
+        Cmd::Relocate { from, to } => {
+            let mut conn = db::open(&store)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&identity::relocate(&mut conn, &from, &to)?)?
+            );
+        }
+
         Cmd::Build { path, jobs } => {
+            use std::io::IsTerminal;
+            if std::io::stderr().is_terminal() {
+                progress::install(|update| eprintln!("{}", update.message()));
+            }
             let mut conn = db::open(&store)?;
             for target in repo::targets(&path)? {
                 let t0 = std::time::Instant::now();
@@ -390,8 +443,23 @@ fn main() -> Result<()> {
             source,
             full,
             scope,
+            view_scope,
+            lineage_root,
             json,
         } => {
+            if view_scope != "checkout" || lineage_root.is_some() {
+                let mut args = serde_json::json!({"query":query,"limit":limit,"source":source || full,"full":full,"scope":view_scope});
+                if let Some(scope) = scope {
+                    args["in"] = scope.into();
+                }
+                if let Some(root) = lineage_root {
+                    args["lineageRoot"] = root.into();
+                }
+                let value =
+                    mcp::call_tool(&store, &repo::targets(&path)?, "find", &args, no_refresh)?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
             let Some(ready) = ready_targets(&store, &path, no_refresh)? else {
                 std::process::exit(2);
             };
@@ -687,7 +755,7 @@ fn main() -> Result<()> {
             let Some(ready) = ready_targets(&store, &path, no_refresh)? else {
                 std::process::exit(2);
             };
-            let requested = file.to_string_lossy().replace('\\', "/");
+            let requested = repo::path_key(&file)?;
             let mut matches = Vec::new();
             for target in &ready {
                 let local = std::fs::canonicalize(&file)
@@ -696,8 +764,10 @@ fn main() -> Result<()> {
                         absolute
                             .strip_prefix(&target.target.root)
                             .ok()
-                            .map(|path| path.to_string_lossy().replace('\\', "/"))
+                            .map(std::path::Path::to_path_buf)
                     })
+                    .map(|path| repo::path_key(&path))
+                    .transpose()?
                     .or_else(|| {
                         requested
                             .strip_prefix(&format!("{}/", target.target.label))
@@ -979,8 +1049,15 @@ fn main() -> Result<()> {
                 println!("created clean store at {}", store.display());
                 return Ok(());
             }
-            let conn = db::open(&store)?;
+            let mut conn = db::open(&store)?;
             match command {
+                CacheCmd::Gc { yes } => {
+                    anyhow::ensure!(
+                        yes,
+                        "rerun cache gc with --yes to reclaim unused cached objects"
+                    );
+                    println!("{}", snapshot::gc(&mut conn)?);
+                }
                 CacheCmd::Clear { yes } => {
                     if !yes {
                         anyhow::bail!("refusing to clear the whole store; rerun with --yes");
@@ -1062,12 +1139,12 @@ fn main() -> Result<()> {
         } => {
             let root = repo::root_of(&path)?;
             let mut conn = db::open(&store)?;
-            let Some(repo_id) = ready_repo(&mut conn, &root, no_refresh)? else {
+            let Some(_) = ready_repo(&mut conn, &root, no_refresh)? else {
                 eprintln!("{}", not_indexed(&root));
                 std::process::exit(2);
             };
             let title = root.file_name().unwrap_or_default().to_string_lossy();
-            let html = viz::render(&conn, repo_id, &title)?;
+            let html = viz::render_current(&conn, &root, &title)?;
             if let Some(output) = output {
                 viz::write(&output, &html, force)?;
                 println!("wrote {}", output.display());
@@ -1078,6 +1155,7 @@ fn main() -> Result<()> {
 
         Cmd::Status { path, json } => {
             let conn = db::open(&store)?;
+            conn.execute_batch("begin deferred")?;
             let mut outputs = Vec::new();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1097,6 +1175,7 @@ fn main() -> Result<()> {
                     age_seconds,
                     store: store.to_string_lossy().into_owned(),
                     freshness: index::freshness(&conn, &target.root)?,
+                    identity: identity::metadata(&conn, &target.root)?,
                 });
             }
             if json {

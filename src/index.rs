@@ -14,6 +14,7 @@ use crate::repo::{self, Lang, SourceFile};
 /// by a different extractor and cannot be trusted.
 pub const EXTRACTOR_STAMP: &str = "panoptes-16";
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BuildStats {
     pub files: usize,
     pub symbols: usize,
@@ -27,7 +28,9 @@ pub struct BuildStats {
 #[derive(Debug, Serialize)]
 pub struct Freshness {
     pub indexed: bool,
+    pub live_checked: bool,
     pub extractor_current: bool,
+    pub snapshot_current: bool,
     pub added: Vec<String>,
     pub modified: Vec<String>,
     pub deleted: Vec<String>,
@@ -36,7 +39,9 @@ pub struct Freshness {
 impl Freshness {
     pub fn is_clean(&self) -> bool {
         self.indexed
+            && self.live_checked
             && self.extractor_current
+            && self.snapshot_current
             && self.added.is_empty()
             && self.modified.is_empty()
             && self.deleted.is_empty()
@@ -50,10 +55,15 @@ impl Freshness {
 /// Compare the live source set with stored hashes without mutating the store.
 pub fn freshness(db: &Connection, root: &Path) -> Result<Freshness> {
     use rusqlite::OptionalExtension;
+    let _read = if db.is_autocommit() {
+        Some(db.unchecked_transaction()?)
+    } else {
+        None
+    };
 
     let repo: Option<(i64, String)> = db
         .query_row(
-            "select id, extractor_stamp from repos where root=?1",
+            "select s.id,s.extractor_stamp from checkouts c join snapshots s on s.id=c.snapshot_id where c.root=?1",
             [root.to_string_lossy()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -61,7 +71,9 @@ pub fn freshness(db: &Connection, root: &Path) -> Result<Freshness> {
     let Some((repo_id, stamp)) = repo else {
         return Ok(Freshness {
             indexed: false,
+            live_checked: true,
             extractor_current: false,
+            snapshot_current: false,
             added: Vec::new(),
             modified: Vec::new(),
             deleted: Vec::new(),
@@ -97,24 +109,59 @@ pub fn freshness(db: &Connection, root: &Path) -> Result<Freshness> {
         .filter(|path| !live.contains_key(path.as_str()))
         .cloned()
         .collect();
+    let go_mod = resolver_input(root)?;
+    let prior: Option<Option<Vec<u8>>> = db
+        .query_row(
+            "select content from repo_inputs where repo_id=?1 and path='go.mod'",
+            [repo_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // A missing row is an unverified legacy graph, not proof of an absent file.
+    if prior.as_ref() != Some(&go_mod) {
+        match (prior, go_mod.as_ref()) {
+            (Some(None), Some(_)) => added.push("go.mod".into()),
+            (Some(Some(_)), None) => deleted.push("go.mod".into()),
+            _ => modified.push("go.mod".into()),
+        }
+    }
     added.sort();
     modified.sort();
     deleted.sort();
     Ok(Freshness {
         indexed: true,
+        live_checked: true,
         extractor_current: stamp == EXTRACTOR_STAMP,
+        snapshot_current: crate::snapshot::current_key(db, repo_id)?.as_deref()
+            == Some(
+                crate::snapshot::manifest(&files, go_mod.as_deref())?
+                    .key
+                    .as_str(),
+            ),
         added,
         modified,
         deleted,
     })
 }
 
-#[derive(Debug)]
-struct ExistingFile {
-    id: i64,
-    hash: String,
-    mtime: i64,
-    size: i64,
+/// Stored availability for --no-refresh reads; makes no claim about the live tree.
+pub fn stored_freshness(db: &Connection, root: &Path) -> Result<Freshness> {
+    use rusqlite::OptionalExtension;
+    let state: Option<(String, bool)> = db.query_row(
+        "select s.extractor_stamp,m.source_complete from checkouts c join snapshots s on s.id=c.snapshot_id join snapshot_manifests m on m.snapshot_id=s.id where c.root=?1 and m.ready=1",
+        [root.to_string_lossy()], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional()?;
+    Ok(Freshness {
+        indexed: state.is_some(),
+        live_checked: false,
+        extractor_current: state
+            .as_ref()
+            .is_some_and(|(stamp, _)| stamp == EXTRACTOR_STAMP),
+        snapshot_current: state.is_some_and(|(_, complete)| complete),
+        added: Vec::new(),
+        modified: Vec::new(),
+        deleted: Vec::new(),
+    })
 }
 
 pub(crate) struct Pending {
@@ -128,10 +175,9 @@ pub(crate) struct Pending {
 
 /// Incrementally index `root` into `db`.
 ///
-/// Unchanged files replay their serialized extraction payload and retain stable
-/// file/symbol row ids. Changed and added files alone are parsed. Edges are then
-/// rebuilt from all cached/current extraction payloads because a definition
-/// change in one file can change resolution for callers in every other file.
+/// Base extractions are reused by profile and content. Changed graph inputs get
+/// a new immutable graph; a checkout switches to it only after complete input
+/// verification. Symbol IDs belong to a graph, not to a cross-snapshot identity.
 pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
     build_with_jobs(db, root, default_jobs())
 }
@@ -161,91 +207,122 @@ pub fn build_with_jobs(
     root: &Path,
     requested_jobs: usize,
 ) -> Result<BuildStats> {
+    build_internal(db, root, requested_jobs, false)?.context("explicit build was skipped")
+}
+
+/// Serialize builders across processes, then recheck after acquiring the writer
+/// lock: another request may already have refreshed this checkout while we waited.
+pub fn build_if_stale(db: &mut Connection, root: &Path) -> Result<bool> {
+    Ok(build_internal(db, root, default_jobs(), true)?.is_some())
+}
+
+fn build_internal(
+    db: &mut Connection,
+    root: &Path,
+    requested_jobs: usize,
+    only_stale: bool,
+) -> Result<Option<BuildStats>> {
+    crate::progress::report("Waiting for index writer", 0, None, &root.to_string_lossy());
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .context("begin build transaction")?;
+    crate::progress::report("Index writer acquired", 0, None, &root.to_string_lossy());
+    if only_stale && freshness(&tx, root)?.is_clean() {
+        return Ok(None);
+    }
+    let go_mod = resolver_input(root)?;
     let files = repo::walk(root).context("walk the work tree")?;
-    let common = repo::git_common_dir(root);
-    let now = unix_now();
-
-    let tx = db.transaction().context("begin build transaction")?;
-    tx.execute(
-        "insert into repos(root, git_common_dir, indexed_at, extractor_stamp)
-         values (?1, ?2, ?3, ?4)
-         on conflict(root) do update set
-           git_common_dir=excluded.git_common_dir,
-           indexed_at=excluded.indexed_at,
-           extractor_stamp=excluded.extractor_stamp",
-        rusqlite::params![root.to_string_lossy(), common, now, EXTRACTOR_STAMP],
-    )?;
-    let repo_id: i64 = tx.query_row(
-        "select id from repos where root=?1",
-        [root.to_string_lossy()],
-        |r| r.get(0),
-    )?;
-
-    let existing = load_existing_files(&tx, repo_id)?;
-    let current_paths: std::collections::HashSet<&str> =
-        files.iter().map(|f| f.rel.as_str()).collect();
-    let deleted = existing
-        .keys()
+    let manifest = crate::snapshot::manifest(&files, go_mod.as_deref())?;
+    let previous = repo_id_of(&tx, root)?;
+    if let Some(id) = previous
+        && crate::snapshot::current_key(&tx, id)?.as_deref() == Some(manifest.key.as_str())
+    {
+        let stats = crate::snapshot::reused_stats(&tx, id)?;
+        crate::identity::register(&tx, root, Some(id))?;
+        tx.commit()?;
+        crate::progress::report(
+            "Snapshot already current",
+            files.len(),
+            Some(files.len()),
+            &root.to_string_lossy(),
+        );
+        return Ok(Some(stats));
+    }
+    let previous_paths = if let Some(id) = previous {
+        let mut statement = tx.prepare("select path from files where repo_id=?1")?;
+        statement
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    let current_paths: std::collections::HashSet<_> =
+        files.iter().map(|file| file.rel.as_str()).collect();
+    let deleted = previous_paths
+        .iter()
         .filter(|path| !current_paths.contains(path.as_str()))
         .count();
-
-    // Every relationship is cheap to reconstruct from extraction payloads and
-    // may depend on a changed definition elsewhere. Module nodes are derived from
-    // unresolved imports and are recreated with those relationships.
-    tx.execute("delete from edges where repo_id=?1", [repo_id])?;
-    tx.execute(
-        "delete from symbols where repo_id=?1 and kind='module'",
-        [repo_id],
-    )?;
-    for (path, old) in &existing {
-        if !current_paths.contains(path.as_str()) {
-            tx.execute("delete from files where id=?1", [old.id])?;
-        }
+    if let Some(id) = crate::snapshot::lookup(&tx, &manifest)? {
+        let verified =
+            crate::snapshot::manifest(&repo::walk(root)?, resolver_input(root)?.as_deref())?;
+        anyhow::ensure!(
+            verified.json == manifest.json,
+            "checkout changed during snapshot attachment; retry"
+        );
+        let mut stats = crate::snapshot::reused_stats(&tx, id)?;
+        stats.deleted = deleted;
+        crate::identity::register(&tx, root, Some(id))?;
+        crate::snapshot::collect_unreferenced(&tx)?;
+        tx.commit()?;
+        crate::progress::report(
+            "Reusing ready snapshot",
+            files.len(),
+            Some(files.len()),
+            &root.to_string_lossy(),
+        );
+        return Ok(Some(stats));
     }
-
+    let repo_id = crate::snapshot::begin(&tx, &manifest, go_mod.as_deref(), unix_now())?;
     let mut pending: Vec<Option<Pending>> = (0..files.len()).map(|_| None).collect();
-    let mut changed = Vec::new();
+    let changed: Vec<usize> = (0..files.len()).collect();
     let mut reused = 0usize;
-    for (index, file) in files.iter().enumerate() {
-        let cached = existing
-            .get(&file.rel)
-            .filter(|old| old.hash == file.hash)
-            .and_then(|old| load_cached(&tx, file, old.id).transpose())
-            .transpose()?;
-
-        if let Some(cached) = cached {
-            let old = existing
-                .get(&file.rel)
-                .context("cached file missing from existing rows")?;
-            if old.mtime != file.mtime || old.size != file.size {
-                tx.execute(
-                    "update files set mtime=?1, size=?2 where id=?3",
-                    rusqlite::params![file.mtime, file.size, cached.file_id],
-                )?;
-            }
-            pending[index] = Some(cached);
-            reused += 1;
-            continue;
-        }
-
-        if let Some(old) = existing.get(&file.rel) {
-            tx.execute("delete from files where id=?1", [old.id])?;
-        }
-        changed.push(index);
-    }
 
     // Parsing is CPU-bound and owns no database state. Each bounded worker gets
     // its own Tree-sitter parsers/queries; rows are still inserted serially in
     // sorted file order so IDs and exported graph output remain deterministic.
-    let parsed_files = extract_changed(&files, &changed, requested_jobs)?;
-    for (index, extracted) in parsed_files {
+    let mut needing_parse = Vec::new();
+    let mut extracted_files = Vec::new();
+    crate::progress::report("Looking up shared extractions", 0, Some(changed.len()), "");
+    for (inspected, &index) in changed.iter().enumerate() {
+        if let Some(extracted) = crate::content::load_base(&tx, &files[index])? {
+            extracted_files.push((index, extracted));
+            reused += 1;
+        } else {
+            needing_parse.push(index);
+        }
+        crate::progress::report(
+            "Looking up shared extractions",
+            inspected + 1,
+            Some(changed.len()),
+            &files[index].rel,
+        );
+    }
+    for (index, extracted) in extract_changed(&files, &needing_parse, requested_jobs)? {
+        // Store only the immutable base result, before contextualize mutates it.
+        crate::content::store_base(&tx, &files[index], &extracted)?;
+        extracted_files.push((index, extracted));
+    }
+    // Hit/miss mixtures preserve the same insertion order as a cold serial build.
+    extracted_files.sort_by_key(|(index, _)| *index);
+    for (index, extracted) in extracted_files {
         pending[index] = Some(index_extracted(&tx, repo_id, &files[index], extracted)?);
     }
     let mut pending: Vec<Pending> = pending
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .context("missing extraction after parallel parse")?;
-    let mut parsed = changed.len();
+    let mut parsed = needing_parse.len();
+    crate::progress::report("Resolving file context", 0, None, "");
     let mut context_changed = crate::ansible::contextualize(&mut pending, &files)?;
     context_changed.extend(crate::gitlab_ci::contextualize(&mut pending, &files)?);
     context_changed.sort_unstable();
@@ -259,7 +336,7 @@ pub fn build_with_jobs(
             &files[index],
             pending[index].extracted.clone(),
         )?;
-        if changed.binary_search(&index).is_err() {
+        if needing_parse.binary_search(&index).is_err() {
             parsed += 1;
             reused -= 1;
         }
@@ -271,7 +348,13 @@ pub fn build_with_jobs(
     let mut file_symbol: HashMap<String, i64> = HashMap::new();
     let mut file_rows: HashMap<String, i64> = HashMap::new();
     let mut n_symbols = 0usize;
-    for file in &pending {
+    for (file_index, file) in pending.iter().enumerate() {
+        crate::progress::report(
+            "Collecting definitions",
+            file_index,
+            Some(pending.len()),
+            &file.rel,
+        );
         file_symbol.insert(file.rel.clone(), file.file_symbol);
         file_rows.insert(file.rel.clone(), file.file_id);
         n_symbols += 1 + file.symbol_ids.len();
@@ -303,7 +386,13 @@ pub fn build_with_jobs(
         "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
          values (?1, ?2, ?3, ?4)",
     )?;
-    for file in &pending {
+    for (file_index, file) in pending.iter().enumerate() {
+        crate::progress::report(
+            "Linking definitions",
+            file_index,
+            Some(pending.len()),
+            &file.rel,
+        );
         for (index, &id) in file.symbol_ids.iter().enumerate() {
             let parent = file
                 .extracted
@@ -318,9 +407,15 @@ pub fn build_with_jobs(
     }
 
     let mut external: HashMap<String, i64> = HashMap::new();
-    let go_module = go_module_path(root);
+    let go_module = go_mod.as_deref().and_then(go_module_path);
     let active_gitlab = crate::gitlab_ci::active_paths(&pending);
-    for file in &pending {
+    for (file_index, file) in pending.iter().enumerate() {
+        crate::progress::report(
+            "Resolving imports",
+            file_index,
+            Some(pending.len()),
+            &file.rel,
+        );
         if file.extracted.automation.dialect == crate::yaml::Dialect::GitLab
             && !active_gitlab.contains(file.rel.as_str())
         {
@@ -365,7 +460,13 @@ pub fn build_with_jobs(
     }
 
     let mut unresolved = 0usize;
-    for file in &pending {
+    for (file_index, file) in pending.iter().enumerate() {
+        crate::progress::report(
+            "Resolving calls",
+            file_index,
+            Some(pending.len()),
+            &file.rel,
+        );
         let mut bindings: HashMap<(Option<usize>, &str), &str> = HashMap::new();
         for binding in &file.extracted.bindings {
             bindings.insert((binding.owner, binding.name.as_str()), binding.ty.as_str());
@@ -423,22 +524,29 @@ pub fn build_with_jobs(
         }
     }
 
+    crate::progress::report("Resolving automation", 0, Some(7), "ansible");
     let mut automation = crate::ansible::resolve(&pending, &file_symbol);
+    crate::progress::report("Resolving automation", 1, Some(7), "github_actions");
     let actions = crate::github_actions::resolve(&pending, &file_symbol, &external);
     automation.edges.extend(actions.edges);
     automation.unresolved += actions.unresolved;
+    crate::progress::report("Resolving automation", 2, Some(7), "compose");
     let compose = crate::compose::resolve(&pending, &file_symbol);
     automation.edges.extend(compose.edges);
     automation.unresolved += compose.unresolved;
+    crate::progress::report("Resolving automation", 3, Some(7), "kubernetes");
     let kube = crate::kubernetes::resolve(&pending);
     automation.edges.extend(kube.edges);
     automation.unresolved += kube.unresolved;
+    crate::progress::report("Resolving automation", 4, Some(7), "kustomize");
     let kustomize = crate::kustomize::resolve(&pending, &file_symbol);
     automation.edges.extend(kustomize.edges);
     automation.unresolved += kustomize.unresolved;
+    crate::progress::report("Resolving automation", 5, Some(7), "gitlab_ci");
     let gitlab = crate::gitlab_ci::resolve(&pending, &file_symbol, &external);
     automation.edges.extend(gitlab.edges);
     automation.unresolved += gitlab.unresolved;
+    crate::progress::report("Resolving automation", 6, Some(7), "cloudformation");
     let cloudformation = crate::cloudformation::resolve(&pending);
     automation.edges.extend(cloudformation.edges);
     automation.unresolved += cloudformation.unresolved;
@@ -448,8 +556,18 @@ pub fn build_with_jobs(
     }
 
     drop(insert_edge);
-    tx.commit().context("commit build")?;
-    Ok(BuildStats {
+    crate::progress::report(
+        "Verifying captured inputs",
+        0,
+        None,
+        &root.to_string_lossy(),
+    );
+    let verified = crate::snapshot::manifest(&repo::walk(root)?, resolver_input(root)?.as_deref())?;
+    anyhow::ensure!(
+        verified.key == manifest.key,
+        "source changed while indexing; retry the request"
+    );
+    let stats = BuildStats {
         files: files.len(),
         symbols: n_symbols,
         edges: n_edges,
@@ -457,7 +575,23 @@ pub fn build_with_jobs(
         parsed,
         reused,
         deleted,
-    })
+    };
+    crate::snapshot::finish(&tx, repo_id, root, &stats)?;
+    crate::snapshot::collect_unreferenced(&tx)?;
+    crate::progress::report(
+        "Committing index",
+        files.len(),
+        Some(files.len()),
+        &root.to_string_lossy(),
+    );
+    tx.commit().context("commit build")?;
+    crate::progress::report(
+        "Index committed",
+        files.len(),
+        Some(files.len()),
+        &root.to_string_lossy(),
+    );
+    Ok(Some(stats))
 }
 
 fn unix_now() -> i64 {
@@ -465,80 +599,6 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
-}
-
-fn load_existing_files(
-    tx: &rusqlite::Transaction<'_>,
-    repo_id: i64,
-) -> Result<HashMap<String, ExistingFile>> {
-    let mut statement =
-        tx.prepare("select id, path, hash, mtime, size from files where repo_id=?1")?;
-    let rows = statement.query_map([repo_id], |row| {
-        Ok((
-            row.get::<_, String>(1)?,
-            ExistingFile {
-                id: row.get(0)?,
-                hash: row.get(2)?,
-                mtime: row.get(3)?,
-                size: row.get(4)?,
-            },
-        ))
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
-}
-
-fn load_cached(
-    tx: &rusqlite::Transaction<'_>,
-    source: &SourceFile,
-    file_id: i64,
-) -> Result<Option<Pending>> {
-    use rusqlite::OptionalExtension;
-
-    let payload: Option<String> = tx
-        .query_row(
-            "select payload from file_extracts
-              where file_id=?1 and extractor_stamp=?2",
-            rusqlite::params![file_id, EXTRACTOR_STAMP],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(payload) = payload else {
-        return Ok(None);
-    };
-    let Ok(extracted) = serde_json::from_str::<extract::Extracted>(&payload) else {
-        return Ok(None);
-    };
-    let file_symbol: Option<i64> = tx
-        .query_row(
-            "select id from symbols where file_id=?1 and kind='file'",
-            [file_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(file_symbol) = file_symbol else {
-        return Ok(None);
-    };
-
-    let mut statement = tx.prepare(
-        "select id from symbols
-          where file_id=?1 and kind not in ('file','module')
-          order by id",
-    )?;
-    let symbol_ids: Vec<i64> = statement
-        .query_map([file_id], |row| row.get(0))?
-        .collect::<std::result::Result<_, _>>()?;
-    if symbol_ids.len() != extracted.symbols.len() {
-        return Ok(None);
-    }
-
-    Ok(Some(Pending {
-        rel: source.rel.clone(),
-        lang: source.lang,
-        file_id,
-        file_symbol,
-        symbol_ids,
-        extracted,
-    }))
 }
 
 const MIN_FILES_PER_WORKER: usize = 64;
@@ -555,6 +615,8 @@ fn extract_changed(
     let jobs = requested_jobs.clamp(1, 32).min(useful_workers);
     let chunk_size = indexes.len().div_ceil(jobs);
 
+    let completed = std::sync::atomic::AtomicUsize::new(0);
+    crate::progress::report("Parsing files", 0, Some(indexes.len()), "");
     if jobs == 1 {
         let mut extractor = extract::Extractor::new();
         return indexes
@@ -563,7 +625,16 @@ fn extract_changed(
                 extractor
                     .extract_file(files[index].lang, &files[index].text, &files[index].rel)
                     .with_context(|| format!("extract {}", files[index].rel))
-                    .map(|extracted| (index, extracted))
+                    .map(|extracted| {
+                        let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        crate::progress::report(
+                            "Parsing files",
+                            done,
+                            Some(indexes.len()),
+                            &files[index].rel,
+                        );
+                        (index, extracted)
+                    })
             })
             .collect();
     }
@@ -571,6 +642,7 @@ fn extract_changed(
     std::thread::scope(|scope| {
         let mut workers = Vec::with_capacity(jobs);
         for chunk in indexes.chunks(chunk_size) {
+            let completed = &completed;
             workers.push(
                 scope.spawn(move || -> Result<Vec<(usize, extract::Extracted)>> {
                     let mut extractor = extract::Extractor::new();
@@ -584,7 +656,18 @@ fn extract_changed(
                                     &files[index].rel,
                                 )
                                 .with_context(|| format!("extract {}", files[index].rel))
-                                .map(|extracted| (index, extracted))
+                                .map(|extracted| {
+                                    let done = completed
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        + 1;
+                                    crate::progress::report(
+                                        "Parsing files",
+                                        done,
+                                        Some(indexes.len()),
+                                        &files[index].rel,
+                                    );
+                                    (index, extracted)
+                                })
                         })
                         .collect()
                 }),
@@ -609,6 +692,7 @@ fn index_extracted(
     extracted: extract::Extracted,
 ) -> Result<Pending> {
     let file_id = insert_file(tx, repo_id, source)?;
+    crate::content::attach_file(tx, file_id, source)?;
     let lines = source.text.lines().count().max(1) as i64;
     tx.execute(
         "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature, summary)
@@ -618,6 +702,12 @@ fn index_extracted(
     let file_symbol = tx.last_insert_rowid();
     crate::search::index_symbol(tx, file_symbol)?;
     let mut symbol_ids = Vec::with_capacity(extracted.symbols.len());
+    crate::progress::report(
+        "Writing symbols",
+        0,
+        Some(extracted.symbols.len()),
+        &source.rel,
+    );
     for (index, symbol) in extracted.symbols.iter().enumerate() {
         let container = extracted.containers.get(index).cloned().flatten();
         tx.execute(
@@ -638,13 +728,13 @@ fn index_extracted(
         let id = tx.last_insert_rowid();
         crate::search::index_symbol(tx, id)?;
         symbol_ids.push(id);
+        crate::progress::report(
+            "Writing symbols",
+            index + 1,
+            Some(extracted.symbols.len()),
+            &source.rel,
+        );
     }
-    let payload = serde_json::to_string(&extracted).context("serialize extraction cache")?;
-    tx.execute(
-        "insert into file_extracts(file_id, extractor_stamp, payload)
-         values (?1, ?2, ?3)",
-        rusqlite::params![file_id, EXTRACTOR_STAMP, payload],
-    )?;
 
     Ok(Pending {
         rel: source.rel.clone(),
@@ -916,8 +1006,16 @@ fn resolve_rust_import(from_rel: &str, spec: &str, files: &HashMap<String, i64>)
     Vec::new()
 }
 
-fn go_module_path(root: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(root.join("go.mod")).ok()?;
+fn resolver_input(root: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(root.join("go.mod")) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("read resolver input go.mod"),
+    }
+}
+
+fn go_module_path(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
     text.lines().find_map(|line| {
         line.trim()
             .strip_prefix("module ")
@@ -981,9 +1079,8 @@ struct SpanRow {
 /// only names would return one line and hide the fourteen call sites that
 /// actually matter for a change.
 ///
-/// Files are re-read from the work tree rather than duplicated into the store.
-/// The store holds structure; the source is already on disk, and copying it would
-/// double the database for data that goes stale the moment anyone edits.
+/// Contents come from the selected snapshot's captured source objects, so spans
+/// and text remain coherent even when the work tree changes during a query.
 pub struct GrepOptions<'a> {
     pub ignore_case: bool,
     pub fixed: bool,
@@ -1008,7 +1105,7 @@ pub fn grep(db: &Connection, repo_id: i64, root: &Path, needle: &str) -> Result<
 pub fn grep_with_options(
     db: &Connection,
     repo_id: i64,
-    root: &Path,
+    _root: &Path,
     pattern: &str,
     options: GrepOptions<'_>,
 ) -> Result<GrepResult> {
@@ -1056,7 +1153,7 @@ pub fn grep_with_options(
     let mut unreadable = 0usize;
 
     for path in &paths {
-        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+        let Some(text) = crate::content::source(db, repo_id, path)? else {
             unreadable += 1;
             continue;
         };
@@ -1123,7 +1220,7 @@ pub fn path_in_scope(path: &str, scope: &str) -> bool {
 }
 
 pub fn repo_id_of(db: &Connection, root: &Path) -> Result<Option<i64>> {
-    let mut stmt = db.prepare("select id from repos where root=?1 and extractor_stamp=?2")?;
+    let mut stmt = db.prepare("select s.id from checkouts c join snapshots s on s.id=c.snapshot_id join snapshot_manifests m on m.snapshot_id=s.id where c.root=?1 and s.extractor_stamp=?2 and m.ready=1")?;
     let mut rows = stmt.query(rusqlite::params![root.to_string_lossy(), EXTRACTOR_STAMP])?;
     Ok(match rows.next()? {
         Some(r) => Some(r.get(0)?),
@@ -1147,7 +1244,7 @@ pub fn repo_status(db: &Connection, repo_id: i64) -> Result<RepoStatus> {
             (select count(*) from symbols where repo_id=?1),
             (select count(*) from edges where repo_id=?1),
             extractor_stamp, indexed_at
-           from repos where id=?1",
+           from snapshots where id=?1",
         [repo_id],
         |row| {
             Ok(RepoStatus {
@@ -1673,7 +1770,7 @@ mod tests {
     fn stale_extractor_rows_force_a_rebuild() {
         let (db, root) = fixture(&[("src/a.ts", "function f() {}\n")]);
         db.execute(
-            "update repos set extractor_stamp='obsolete-extractor' where root=?1",
+            "update snapshots set extractor_stamp='obsolete-extractor' where id=(select snapshot_id from checkouts where root=?1)",
             [root.to_string_lossy()],
         )
         .unwrap();
@@ -3887,6 +3984,309 @@ module "child" {
         assert_eq!(symbols(&serial), symbols(&parallel));
         assert_eq!(edges(&serial), edges(&parallel));
         drop((serial, parallel));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_readers_keep_captured_source_after_checkout_advances() {
+        let (mut writer, root) = fixture(&[("a.rs", "pub fn original() { let value = 1; }\n")]);
+        let mut reader = crate::db::open(&root.join("store.db")).unwrap();
+        let view = reader.transaction().unwrap();
+        let old = repo_id_of(&view, &root).unwrap().unwrap();
+        std::fs::write(
+            root.join("a.rs"),
+            "pub fn replacement() { let value = 2; }\n",
+        )
+        .unwrap();
+        build(&mut writer, &root).unwrap();
+        let new = repo_id_of(&writer, &root).unwrap().unwrap();
+        assert_ne!(old, new);
+        assert_eq!(repo_id_of(&view, &root).unwrap(), Some(old));
+        assert!(
+            crate::content::source(&view, old, "a.rs")
+                .unwrap()
+                .unwrap()
+                .contains("original")
+        );
+        assert!(
+            crate::content::source(&writer, new, "a.rs")
+                .unwrap()
+                .unwrap()
+                .contains("replacement")
+        );
+        let hits = crate::ask::ask(
+            &view,
+            old,
+            &root,
+            "original",
+            crate::ask::AskOptions {
+                limit: 8,
+                scope: None,
+                source: true,
+                full: true,
+            },
+        )
+        .unwrap();
+        assert!(hits.hits.iter().any(|hit| {
+            hit.source
+                .as_ref()
+                .is_some_and(|source| source.contains("value = 1"))
+        }));
+        assert_eq!(grep(&view, old, &root, "original").unwrap().total_hits, 1);
+        view.commit().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_failure_preserves_the_previous_complete_attachment() {
+        let (mut db, root) = fixture(&[("a.rs", "pub fn original() {}\n")]);
+        let old = repo_id_of(&db, &root).unwrap().unwrap();
+        db.execute_batch("create trigger reject_test_symbol before insert on symbols when new.name='reject_this_build' begin select raise(abort,'injected graph failure'); end;").unwrap();
+        std::fs::write(root.join("a.rs"), "pub fn reject_this_build() {}\n").unwrap();
+        assert!(build(&mut db, &root).is_err());
+        assert_eq!(repo_id_of(&db, &root).unwrap(), Some(old));
+        assert_eq!(
+            db.query_row("select count(*) from snapshots", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row("select count(*) from content_objects", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(
+            crate::content::source(&db, old, "a.rs")
+                .unwrap()
+                .unwrap()
+                .contains("original")
+        );
+        std::fs::write(root.join("a.rs"), [255u8]).unwrap();
+        assert!(build(&mut db, &root).is_err());
+        assert_eq!(repo_id_of(&db, &root).unwrap(), Some(old));
+        assert!(!stored_freshness(&db, &root).unwrap().live_checked);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_keys_include_language_and_exact_resolver_inputs() {
+        let (db, root) = fixture(&[("a.ts", "export function item() {}\n")]);
+        let mut files = repo::walk(&root).unwrap();
+        let first = crate::snapshot::manifest(&files, None).unwrap();
+        files[0].mtime += 100;
+        assert_eq!(
+            first.key,
+            crate::snapshot::manifest(&files, None).unwrap().key
+        );
+        files[0].lang = Lang::JavaScript;
+        let language = crate::snapshot::manifest(&files, None).unwrap();
+        assert_eq!(first.tree_key, language.tree_key);
+        assert_ne!(first.key, language.key);
+        let empty = crate::snapshot::manifest(&files, Some(b"")).unwrap();
+        assert_ne!(language.key, empty.key);
+        assert_ne!(
+            empty.key,
+            crate::snapshot::manifest(&files, Some(b"module example.test/a"))
+                .unwrap()
+                .key
+        );
+        assert!(freshness(&db, &root).unwrap().is_clean());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_guards_reject_unready_attachments_and_cross_graph_edges() {
+        let (mut db, root) = fixture(&[("a.rs", "pub fn first() {}\n")]);
+        let first = repo_id_of(&db, &root).unwrap().unwrap();
+        let second_root = root.with_extension("second");
+        std::fs::create_dir_all(&second_root).unwrap();
+        std::fs::write(second_root.join("a.rs"), "pub fn second() {}\n").unwrap();
+        build(&mut db, &second_root).unwrap();
+        let second = repo_id_of(&db, &second_root).unwrap().unwrap();
+        let symbol = |owner| {
+            db.query_row(
+                "select id from symbols where repo_id=?1 and kind='function'",
+                [owner],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert!(db.execute("insert into edges(repo_id,src_symbol_id,dst_symbol_id,kind) values (?1,?2,?3,'calls')",rusqlite::params![first,symbol(first),symbol(second)]).is_err());
+        assert!(
+            db.execute("delete from snapshots where id=?1", [first])
+                .is_err()
+        );
+        let tx = db.transaction().unwrap();
+        let manifest = crate::snapshot::manifest(&[], None).unwrap();
+        let pending = crate::snapshot::begin(&tx, &manifest, None, 0).unwrap();
+        assert!(crate::identity::register(&tx, &root, Some(pending)).is_err());
+        tx.rollback().unwrap();
+        assert_eq!(repo_id_of(&db, &root).unwrap(), Some(first));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(second_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_paths_preserve_literal_backslashes() {
+        let (db, root) = fixture(&[
+            ("a\\b.rs", "pub fn literal() {}\n"),
+            ("a/b.rs", "pub fn nested() {}\n"),
+        ]);
+        let files = repo::walk(&root).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.rel.as_str())
+                .collect::<Vec<_>>(),
+            ["a/b.rs", "a\\b.rs"]
+        );
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+        assert!(
+            crate::content::source(&db, id, "a\\b.rs")
+                .unwrap()
+                .unwrap()
+                .contains("literal")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shared_base_extractions_reuse_identical_files_across_checkouts() {
+        let source = "export function shared() { return 7; }\n";
+        let (mut db, root) = fixture(&[("src/a.ts", source)]);
+        let second = root.with_extension("second");
+        std::fs::create_dir_all(second.join("src")).unwrap();
+        std::fs::write(second.join("src/a.ts"), source).unwrap();
+        let stats = build(&mut db, &second).unwrap();
+        assert_eq!((stats.parsed, stats.reused), (0, 1));
+        for table in ["content_objects", "extractions"] {
+            assert_eq!(
+                db.query_row(&format!("select count(*) from {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        assert_eq!(
+            db.query_row("select count(*) from file_objects", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        crate::db::reset_repo(&db, &root).unwrap();
+        let id = repo_id_of(&db, &second).unwrap().unwrap();
+        assert_eq!(grep(&db, id, &second, "shared").unwrap().total_hits, 1);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(second);
+    }
+
+    #[test]
+    fn shared_yaml_profiles_separate_paths_and_keep_context_out_of_base_cache() {
+        let workflow = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        let template = ".base: {image: alpine}\n";
+        let (db, root) = fixture(&[
+            (".github/workflows/ci.yml", workflow),
+            ("ordinary/ci.yml", workflow),
+            (
+                ".gitlab-ci.yml",
+                "include: templates/base.yml\njob:\n  extends: .base\n  script: echo hi\n",
+            ),
+            ("templates/base.yml", template),
+        ]);
+        let files = repo::walk(&root).unwrap();
+        let first = files
+            .iter()
+            .find(|file| file.rel == ".github/workflows/ci.yml")
+            .unwrap();
+        let ordinary = files
+            .iter()
+            .find(|file| file.rel == "ordinary/ci.yml")
+            .unwrap();
+        let a = crate::content::load_base(&db, first).unwrap().unwrap();
+        let b = crate::content::load_base(&db, ordinary).unwrap().unwrap();
+        assert_ne!(
+            serde_json::to_value(a).unwrap(),
+            serde_json::to_value(b).unwrap()
+        );
+        let file = files
+            .iter()
+            .find(|file| file.rel == "templates/base.yml")
+            .unwrap();
+        let raw =
+            serde_json::to_value(crate::content::load_base(&db, file).unwrap().unwrap()).unwrap();
+        let expected = extract::Extractor::new()
+            .extract_file(file.lang, &file.text, &file.rel)
+            .unwrap();
+        assert_eq!(raw, serde_json::to_value(expected).unwrap());
+        let contextual: i64 = db.query_row("select count(*) from symbols s join files f on f.id=s.file_id where f.path='templates/base.yml' and s.name='gitlab job: .base'", [], |row| row.get(0)).unwrap();
+        assert_eq!(contextual, 1);
+        assert!(
+            !raw["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol["name"] == "gitlab job: .base")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shared_profiles_isolate_languages_and_extractor_versions() {
+        let (db, root) = fixture(&[("src/a.ts", "export function shared() {}\n")]);
+        let mut file = repo::walk(&root).unwrap().remove(0);
+        assert!(crate::content::load_base(&db, &file).unwrap().is_some());
+        file.lang = Lang::Rust;
+        assert!(crate::content::load_base(&db, &file).unwrap().is_none());
+        file.lang = Lang::TypeScript;
+        db.execute(
+            "update extraction_profiles set extractor_stamp='previous-version'",
+            [],
+        )
+        .unwrap();
+        assert!(crate::content::load_base(&db, &file).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn go_module_changes_invalidate_and_relink_cached_source() {
+        let (mut db, root) = fixture(&[
+            ("go.mod", "module example.test/a\n"),
+            (
+                "main.go",
+                "package main\nimport \"example.test/a/lib\"\nfunc main() { lib.Helper() }\n",
+            ),
+            ("lib/helper.go", "package lib\nfunc Helper() {}\n"),
+        ]);
+        assert!(freshness(&db, &root).unwrap().is_clean());
+        std::fs::write(root.join("go.mod"), "module example.test/b\n").unwrap();
+        assert_eq!(freshness(&db, &root).unwrap().modified, ["go.mod"]);
+        assert!(build_if_stale(&mut db, &root).unwrap());
+        let external: i64 = db
+            .query_row(
+                "select count(*) from symbols where kind='module' and name='example.test/a/lib'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(external, 1);
+        assert!(freshness(&db, &root).unwrap().is_clean());
+        std::fs::remove_file(root.join("go.mod")).unwrap();
+        assert_eq!(freshness(&db, &root).unwrap().deleted, ["go.mod"]);
+        build(&mut db, &root).unwrap();
+        std::fs::write(root.join("go.mod"), "module example.test/a\n").unwrap();
+        assert_eq!(freshness(&db, &root).unwrap().added, ["go.mod"]);
+        build(&mut db, &root).unwrap();
+        let external: i64 = db
+            .query_row(
+                "select count(*) from symbols where kind='module'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(external, 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

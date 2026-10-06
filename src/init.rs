@@ -28,7 +28,11 @@ individual files; use one exhaustive `grep`, then read only needed spans. When
 Panoptes was used, end the response with the MCP-provided session savings
 display in this form: `ꙮ Estimated tokens saved for this session: 1,231,578`.
 Treat it as an estimate versus reading matched files whole, never as model
-billing."#;
+billing. For PR worktrees, pass the absolute checkout path as `repo` on every
+call; changing the shell cwd does not retarget the MCP connection. Use `worktrees`
+to discover new checkouts and verify `panoptesCheckouts` in results. Wait for
+pending calls: identical in-flight requests share one operation and progress
+stream. The 30-second timeout measures inactivity; meaningful progress resets it."#;
 
 struct Provider {
     id: &'static str,

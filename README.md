@@ -109,16 +109,55 @@ registration and usage guidance while preserving existing configuration. The
 MCP server indexes the current repository when needed and refreshes changed
 files automatically.
 
-MCP tool calls have a **30-second timeout**, including waiting for startup
-indexing, refreshing files, and SQLite queries. Startup indexing also has a
-30-second budget. On timeout, Panoptes stops the worker, releases its database
-locks, and returns an error; the MCP server stays available for the next request.
-Uncommitted index updates roll back, preserving the last committed snapshot.
+MCP tool calls have a **30-second inactivity timeout**. Real progress in file
+scanning, parsing, symbol writing, graph resolution, and SQLite execution resets
+that timer, so a
+productive build can run longer than 30 seconds. Repeated waiting messages do
+not reset it. A queued request also expires after 30 seconds without starting.
+On inactivity, Panoptes stops the worker, releases database locks, and rolls back
+uncommitted index changes; the MCP connection remains usable.
 
-For a large initial index, run `panoptes build /path/to/repo` separately. To
-change the MCP budget, add `--timeout-secs 60` to the server's `mcp` arguments
-(allowed range: 1-300 seconds), then restart the client. Direct CLI builds are
-not subject to the MCP timeout.
+Progress is streamed while work runs. Clients that provide
+`_meta.progressToken` receive `notifications/progress` with an increasing update
+count and a stage message. Other clients receive structured
+`notifications/message` logs at `info` level; `logging/setLevel` controls those
+logs. Stage messages include file/symbol counts where available; database updates
+count approximate SQLite VM instructions, not rows or percent complete. A busy
+lock wait does not produce database progress. Interactive
+`panoptes build` also prints progress to stderr. The client controls how MCP
+notifications appear in its interface.
+
+To change the inactivity window, add `--timeout-secs 60` to the server's `mcp`
+arguments (allowed range: 1-300 seconds), then restart the client. Direct CLI
+builds have no MCP inactivity limit. A stalled indexing transaction is rolled
+back; retrying starts another attempt rather than resuming its partial writes.
+
+For concurrent PR reviews, pass the absolute worktree path in `repo` on each
+MCP call, for example:
+
+```json
+{"name":"find","arguments":{"query":"authentication","repo":"/src/project-pr-42"}}
+```
+
+Use `worktrees` to discover related checkouts, including ones created after the
+MCP connection started. Discovery retains the common Git directory when the
+startup worktree is removed, and omits missing checkouts. Unique checkout labels
+also work; absolute paths avoid label collisions. Omitting `repo` continues to select the startup repositories.
+Changing a shell's working directory does not retarget an existing connection.
+Repository results are under `repositories[checkout_label]`, separate from
+metadata even when the checkout name matches a metadata key. Results include
+`panoptesCheckouts` with the canonical root, common Git directory,
+branch, and observed HEAD. These describe live working files, including edits;
+they are not immutable branch snapshots.
+
+Each connection runs at most two isolated query workers, with up to 32 outstanding
+operations and 128 callers. Identical parameters arriving while an operation is
+queued or running share that operation, its progress, and its inactivity timer; completed
+results are not cached. `panoptesExecution` identifies shared operations. Ping and
+tool listing remain responsive during indexing. Cancellation removes only that
+caller's interest; a worker stops when no callers remain. SQLite WAL permits
+concurrent readers; builders serialize and recheck freshness after obtaining the
+write lock. Separate checkouts retain separate graphs and parse caches.
 
 Ranked search caches per-field terms when files are indexed, so queries retrieve
 matching symbols without tokenizing the whole repository again. ASCII text uses
@@ -196,3 +235,138 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 See [SECURITY.md](SECURITY.md) for security policy. Panoptes is available under
 the [MIT license](LICENSE).
+
+### Checkout identity and lineage
+
+`panoptes identity /absolute/checkout` registers/prints a store-local checkout ID
+and Git-instance ID without indexing source. Linked worktrees share an instance;
+independent clones retain distinct instances even when they share object storage.
+MCP indexed results include these IDs in `panoptesCheckouts`, and CLI status JSON
+includes `identity`. Discovery alone remains observational and does not create a
+store. A replaced `.git` directory invalidates the observed instance locator.
+
+After moving a checkout, use `panoptes relocate /old/absolute/root /new/root` to
+preserve its ID. The old path must be absent and the destination unregistered.
+Panoptes never infers relocation from matching contents, HEAD, or remote URLs.
+
+Add `--lineage` to `identity` for optional local ancestry inspection. Each of two
+Git commands has a two-second limit and a 128 KiB output cap. Git must support
+`--no-lazy-fetch`; missing objects, unavailable Git, shallow boundaries, or grafts
+produce an incomplete status rather than invented roots. Replacement refs are
+ignored deliberately: lineage records physical commit ancestry. Each verified
+root is keyed by object format and full OID; unrelated-history merges retain all
+roots independently. Observations are tied to HEAD and refreshed on request;
+lineage is relationship metadata, never an extraction or graph cache key.
+
+Schema v4 adds identity metadata without rewriting existing graphs. Cache reset
+removes graph data while retaining registered checkout IDs; global cache clear
+also clears identity metadata. Keep a pre-migration SQLite backup when an older
+binary must remain a rollback option.
+
+### Shared source and extraction objects
+
+Schema v5 stores exact source bytes once under an algorithm-tagged BLAKE3-256
+identity. The official Rust implementation selects its supported SIMD backend
+automatically (NEON on little-endian AArch64). Hashes are independent of CPU,
+checkout path, Git instance, branch, and ancestry.
+
+Base extraction profiles include language, full relative path, extractor stamp,
+payload schema, and base mode. Keeping the path prevents identical YAML bytes in
+workflow and ordinary directories from sharing incompatible results. Ansible and
+GitLab include context is still recomputed per checkout; contextual payloads and
+legacy `file_extracts` rows are never promoted into the shared base cache.
+
+A second checkout reuses matching base extractions; an identical complete input
+manifest also shares the graph and search postings. Old FNV file hashes invalidate
+on the next refresh; migration itself preserves legacy graphs.
+`cache clear` removes the shared objects too.
+
+### Immutable graph snapshots
+
+Schema v6 separates canonical checkout locations from graph ownership. Each
+snapshot records a complete input manifest: exact source-byte identities and
+relative paths, language selection, exact `go.mod` bytes or absence, scan policy,
+and extractor/graph/search versions. A separate source-tree key excludes resolver
+context and language interpretation. Neither key depends on Git ancestry.
+
+A changed build creates a new graph, captures its source, verifies the inputs a
+second time, marks it ready, and atomically advances the checkout attachment.
+Failed scans or writes leave the previous attachment intact. Unchanged explicit
+builds keep their current snapshot. Graph IDs and symbol IDs belong to snapshots;
+a changed snapshot does not promise to retain the old numeric symbol IDs.
+
+`find` excerpts and `grep` read captured bytes belonging to the selected graph.
+CLI and MCP readers pin their attachment and graph in one SQLite read view.
+`--no-refresh` can therefore answer from the last captured graph after live edits;
+MCP reports `live_checked: false` when it deliberately skips the live scan. Legacy
+snapshots remain queryable but have `sourceComplete: false` and no captured source
+excerpts until refreshed. They are never treated as verified reusable snapshots.
+
+The scan rejects unreadable/non-UTF-8 supported source and lossy path conversion,
+rather than publishing an incomplete reusable graph. Literal backslashes in Unix
+filenames stay distinct from directory separators. Symlinks and unsupported
+languages remain excluded by the recorded scan policy. Two matching scans are a
+stability check, not an operating-system-level atomic filesystem snapshot.
+
+Old unreferenced graphs are reclaimed after attachment changes. Attached graphs
+survive another checkout's reset, and SQLite readers retain their prior view
+until their read transaction ends. Base source/extraction objects remain cached
+until explicit cache cleanup. `panoptes cache gc --yes` reclaims unused source
+objects and extraction profiles without removing any attached snapshot.
+
+
+### Shared snapshots and explicit query scopes
+
+Schema v7 attaches checkouts with identical complete input manifests to one ready
+snapshot, even across unrelated Git instances. A second identical checkout does
+not parse, resolve, or write graph/search rows again. Editing one checkout creates
+or selects a different snapshot without changing other checkouts. Migration
+consolidates verified schema-v6 duplicates while preserving checkout IDs; legacy
+unverified graphs remain private until refreshed.
+
+MCP `find`, `grep`, `callers`, `skeleton`, `map`, and `status` accept:
+
+| `scope` | Membership |
+| --- | --- |
+| `checkout` (default) | Selected checkout(s), preserving current behavior |
+| `repository` | Registered live checkouts with the selected store-local Git instance ID |
+| `lineage` | Registered live checkouts with a current complete observation containing exactly `lineageRoot` |
+
+Use `panoptes identity /absolute/checkout --lineage` to record bounded physical
+ancestry first. Lineage scope requires `lineageRoot: "sha1:<root-oid>"` (or
+`sha256:<root-oid>`). Missing/stale observations, shallow history, and grafts do not
+establish membership. MCP does not start ancestry subprocesses; a changed HEAD
+requires an explicit new observation. A merge containing roots A and B belongs
+to either explicitly selected root; selecting A never includes B-only histories.
+New worktrees must be registered/indexed before expanded scopes include them.
+
+Expanded queries execute once per distinct snapshot, retain per-snapshot ranking,
+and return every checkout's provenance in `panoptesCheckouts`. Duplicate basename
+labels use absolute paths as result keys. `panoptesScope` reports scope, number
+of snapshots searched, and skipped checkouts with unverified membership. No
+cross-snapshot symbol-ID deduplication or blended-corpus ranking is implied.
+`freshness` and `worktrees` remain observational checkout-scope tools.
+
+CLI examples (expanded scopes always print JSON with provenance):
+
+```sh
+panoptes ask 'resolve imports' /absolute/checkout --view-scope repository
+panoptes identity /absolute/checkout --lineage
+panoptes ask 'resolve imports' /absolute/checkout --view-scope lineage --lineage-root sha1:<root-oid>
+```
+
+Snapshot sharing optimizes identical trees. A changed manifest still materializes
+a complete graph using cached base extractions; fine-grained incremental graph
+sharing is deferred. Two-pass input verification adds source reads. Benchmark
+changed-checkout latency separately from identical-checkout attachment.
+
+
+
+Git-instance locator validation uses a read-only filesystem incarnation token
+(inode generation where available, otherwise birth time) together with device
+and inode. Device/inode alone is never trusted after reopening. Filesystems that
+expose neither token report an unknown Git instance; checkout IDs and ordinary
+indexing remain usable. Legacy inode-only registrations are re-established on
+explicit registration, preserving the checkout ID while assigning a new Git
+instance ID. Ancestry inspection captures the registered instance before the
+walk and rejects persistence if its generation or registration changes.

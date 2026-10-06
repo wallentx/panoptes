@@ -8,6 +8,27 @@ use std::path::Path;
 
 use crate::index;
 
+/// Pin the checkout attachment through every map query, then release the view
+/// before the caller writes the output or starts a long-running HTTP server.
+pub fn render_current(db: &rusqlite::Connection, root: &Path, title: &str) -> Result<String> {
+    render_current_with(db, root, title, || {})
+}
+
+fn render_current_with(
+    db: &rusqlite::Connection,
+    root: &Path,
+    title: &str,
+    after_select: impl FnOnce(),
+) -> Result<String> {
+    let view = db.unchecked_transaction()?;
+    let id =
+        index::repo_id_of(&view, root)?.context("checkout index was reset before visualization")?;
+    after_select();
+    let html = render(&view, id, title)?;
+    view.commit()?;
+    Ok(html)
+}
+
 pub fn render(db: &rusqlite::Connection, repo_id: i64, title: &str) -> Result<String> {
     let map = index::repo_map(db, repo_id, 100)?;
     let data = serde_json::to_string(&map)?.replace("</", "<\\/");
@@ -77,6 +98,35 @@ fn is_loopback(address: SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendering_pins_the_selected_snapshot_during_rebuild_and_reclamation() {
+        let root =
+            std::env::temp_dir().join(format!("panoptes-viz-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "pub fn original() {}\n").unwrap();
+        let store = root.join("store.db");
+        let mut writer = crate::db::open(&store).unwrap();
+        index::build(&mut writer, &root).unwrap();
+        let reader = crate::db::open(&store).unwrap();
+        let old = index::repo_id_of(&reader, &root).unwrap();
+        let html = render_current_with(&reader, &root, "fixture", || {
+            std::fs::write(root.join("a.rs"), "pub fn replacement() {}\n").unwrap();
+            std::fs::write(root.join("b.rs"), "pub fn second() {}\n").unwrap();
+            index::build(&mut writer, &root).unwrap();
+            assert_ne!(old, index::repo_id_of(&writer, &root).unwrap());
+        })
+        .unwrap();
+        assert!(html.contains("\"files\":1"), "{html}");
+        assert!(reader.is_autocommit());
+        assert!(
+            render_current(&reader, &root, "fixture")
+                .unwrap()
+                .contains("\"files\":2")
+        );
+        drop((reader, writer));
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn only_loopback_is_accepted_by_default() {

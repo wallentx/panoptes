@@ -56,7 +56,7 @@ pub struct AskOptions<'a> {
 pub fn ask(
     db: &Connection,
     repo_id: i64,
-    root: &Path,
+    _root: &Path,
     query: &str,
     options: AskOptions<'_>,
 ) -> Result<AskResult> {
@@ -88,7 +88,8 @@ pub fn ask(
                         .source
                         .then(|| {
                             source_excerpt(
-                                root,
+                                db,
+                                repo_id,
                                 &reached.path,
                                 reached.start_line,
                                 reached.end_line,
@@ -236,7 +237,8 @@ pub fn ask(
     for (score, document) in scored.into_iter().take(options.limit.max(1)) {
         let source = if options.source {
             source_excerpt(
-                root,
+                db,
+                repo_id,
                 &document.path,
                 document.start_line,
                 document.end_line,
@@ -302,8 +304,15 @@ fn is_test_path(path: &str) -> bool {
         || file.contains("_test.")
 }
 
-fn source_excerpt(root: &Path, path: &str, start: i64, end: i64, full: bool) -> Option<String> {
-    let text = std::fs::read_to_string(root.join(path)).ok()?;
+fn source_excerpt(
+    db: &Connection,
+    snapshot: i64,
+    path: &str,
+    start: i64,
+    end: i64,
+    full: bool,
+) -> Option<String> {
+    let text = crate::content::source(db, snapshot, path).ok()??;
     let start = start.max(1) as usize;
     let mut end = end.max(start as i64) as usize;
     if !full {

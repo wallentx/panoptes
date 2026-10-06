@@ -27,6 +27,17 @@ line spans, signatures, and bounded source.
 - Use `status` or `freshness` only to inspect index state. Normal retrieval calls
   create or refresh the index automatically unless refresh is disabled.
 
+## Select the checkout
+
+For a PR worktree, pass its absolute path as `repo` on every call. The MCP
+connection retains its startup roots even if the shell changes directory. Use
+`worktrees` to discover checkouts created after connection; check
+`panoptesCheckouts` in results to confirm the root, branch, and observed HEAD.
+Wait for a pending request to complete: identical in-flight calls share one
+operation, progress stream, and inactivity timer. Meaningful indexing progress
+resets the default 30-second timer; repeated waiting messages do not. Completed
+results are refreshed on the next call.
+
 ## Work from the result
 
 - For a scoped question, start with one `find` or `grep` call, not `map`. Treat

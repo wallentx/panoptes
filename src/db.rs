@@ -6,13 +6,12 @@
 //!
 //! Schema notes that are load-bearing rather than incidental:
 //!
-//! * `repos.root` is the realpath of the git toplevel and is UNIQUE. It is the
-//!   key the MCP server looks up on startup to decide between answering and
-//!   reporting "not indexed".
-//! * `repos.extractor_stamp` records which extractor produced the repository's
-//!   rows. A changed stamp marks the stored graph for rebuilding.
-//! * `files.hash` is what makes a rebuild incremental: unchanged hash means the
-//!   file's symbols and edges are still valid and are not re-parsed.
+//! * `checkouts.root` is a canonical selector for a stable checkout UID and its
+//!   active snapshot. Identity metadata and graph ownership are separate.
+//! * `snapshots.extractor_stamp` and a complete input manifest govern graph
+//!   freshness. Legacy graphs have no verified manifest until they are rebuilt.
+//! * Legacy `repo_id` column names now reference immutable snapshot owners.
+//!   Source objects and base extractions are shared by strong content/profile keys.
 //! * `symbols_fts` is an external-content FTS5 table over `symbols`, kept in sync
 //!   by triggers. External content means the text is not stored twice; the
 //!   triggers are mandatory, not an optimization, because a contentless FTS index
@@ -24,8 +23,9 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever the DDL below changes in a way an existing store cannot serve.
 /// Read from and written to `pragma user_version`.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 7;
 
+// Historical v1 schema: migrations preserve its row IDs while evolving ownership.
 const DDL: &str = r#"
 create table if not exists repos (
   id              integer primary key,
@@ -132,10 +132,21 @@ pub fn open(path: &Path) -> Result<Connection> {
     }
     let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
+    if crate::progress::enabled() {
+        let mut steps = 0u64;
+        db.progress_handler(
+            50_000,
+            Some(move || {
+                steps = steps.saturating_add(50_000);
+                crate::progress::database_steps(steps);
+                false
+            }),
+        )?;
+    }
 
     let found: i64 = db.query_row("pragma user_version", [], |r| r.get(0))?;
     anyhow::ensure!(
-        matches!(found, 0 | 1 | SCHEMA_VERSION),
+        matches!(found, 0..=SCHEMA_VERSION),
         "store at {} is schema v{found}; expected v{SCHEMA_VERSION}",
         path.display()
     );
@@ -163,18 +174,65 @@ pub fn open(path: &Path) -> Result<Connection> {
         // Another process may have migrated between opening and taking the lock.
         let version: i64 = tx.query_row("pragma user_version", [], |r| r.get(0))?;
         anyhow::ensure!(
-            matches!(version, 0 | 1 | SCHEMA_VERSION),
+            matches!(version, 0..=SCHEMA_VERSION),
             "unsupported store schema v{version}"
         );
         if version == 0 {
             tx.execute_batch(DDL).context("apply schema")?;
         }
-        if version < SCHEMA_VERSION {
+        if version < 3 {
+            tx.execute_batch(
+                "create index if not exists edges_fk_src on edges(src_symbol_id);
+                 create index if not exists edges_fk_dst on edges(dst_symbol_id);
+                 create table if not exists repo_inputs (
+                   repo_id integer not null references repos(id) on delete cascade,
+                   path text not null,
+                   content blob,
+                   primary key(repo_id, path)
+                 ) without rowid;",
+            )
+            .context("index edge foreign keys and track resolver inputs")?;
+        }
+        if version < 4 {
+            tx.execute_batch(crate::identity::DDL)
+                .context("create repository identities")?;
+            tx.execute(
+                "insert into checkouts(root,graph_repo_id) select root,id from repos",
+                [],
+            )?;
+        }
+        if version < 5 {
+            tx.execute_batch(crate::content::DDL)
+                .context("create shared source and extraction cache")?;
+        }
+        if version < 2 {
             tx.execute_batch(crate::search::DDL)
                 .context("create search term index")?;
             if version == 1 {
                 crate::search::backfill(&tx).context("backfill search terms")?;
             }
+        }
+        if version < 6 {
+            tx.execute_batch(crate::snapshot::DDL)
+                .context("separate immutable snapshots from checkouts")?;
+            let roots = {
+                let mut statement = tx.prepare("select root,snapshot_id from checkouts")?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (root, snapshot) in roots {
+                if Path::new(&root).exists() {
+                    crate::identity::register(&tx, Path::new(&root), snapshot)?;
+                }
+            }
+        }
+        if version < 7 {
+            crate::snapshot::enable_reuse(&tx)?;
+        }
+        if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         tx.commit().context("commit store migration")?;
@@ -183,30 +241,53 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 pub fn reset_repo(db: &Connection, root: &Path) -> Result<bool> {
-    Ok(db.execute("delete from repos where root=?1", [root.to_string_lossy()])? > 0)
+    let tx = db.unchecked_transaction()?;
+    let changed = tx.execute("update checkouts set snapshot_id=null,generation=generation+1 where root=?1 and snapshot_id is not null", [root.to_string_lossy()])?;
+    crate::snapshot::collect_unreferenced(&tx)?;
+    tx.commit()?;
+    Ok(changed > 0)
 }
 
-/// Remove every indexed repository while preserving a valid, reusable store.
+/// Remove graphs and identities together, preserving a reusable store.
 pub fn clear(db: &Connection) -> Result<i64> {
-    let repositories: i64 = db.query_row("select count(*) from repos", [], |row| row.get(0))?;
-    db.execute("delete from repos", [])?;
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+    let count = tx.query_row(
+        "select count(*) from checkouts where snapshot_id is not null",
+        [],
+        |row| row.get(0),
+    )?;
+    tx.execute("delete from checkouts", [])?;
+    tx.execute("delete from snapshots", [])?;
+    tx.execute("delete from git_instances", [])?;
+    tx.execute("delete from lineages", [])?;
+    tx.execute("delete from content_objects", [])?;
+    tx.execute("delete from extraction_profiles", [])?;
+    tx.commit()?;
     db.execute_batch("pragma wal_checkpoint(truncate); vacuum;")?;
-    Ok(repositories)
+    Ok(count)
 }
 
 pub fn prune_missing(db: &Connection) -> Result<Vec<String>> {
-    let mut statement = db.prepare("select root from repos order by root")?;
-    let roots = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(statement);
-    let missing: Vec<String> = roots
+    let roots = {
+        let mut statement =
+            db.prepare("select root from checkouts where snapshot_id is not null order by root")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let missing: Vec<_> = roots
         .into_iter()
         .filter(|root| !Path::new(root).exists())
         .collect();
+    let tx = db.unchecked_transaction()?;
     for root in &missing {
-        db.execute("delete from repos where root=?1", [root])?;
+        tx.execute(
+            "update checkouts set snapshot_id=null,generation=generation+1 where root=?1",
+            [root],
+        )?;
     }
+    crate::snapshot::collect_unreferenced(&tx)?;
+    tx.commit()?;
     Ok(missing)
 }
 
@@ -275,13 +356,27 @@ mod tests {
     }
 
     fn seed_repo(db: &Connection) -> i64 {
-        db.execute(
-            "insert into repos(root, git_common_dir, indexed_at, extractor_stamp)
-             values ('/src/demo', '/src/demo/.git', 1, 'stamp-a')",
-            [],
-        )
-        .unwrap();
+        let modern: bool = db
+            .query_row(
+                "select exists(select 1 from sqlite_master where name='snapshots')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute(if modern {
+            "insert into snapshots(storage_key, git_common_dir, indexed_at, extractor_stamp) values ('/src/demo','/src/demo/.git',1,'stamp-a')"
+        } else {
+            "insert into repos(root, git_common_dir, indexed_at, extractor_stamp) values ('/src/demo','/src/demo/.git',1,'stamp-a')"
+        }, []).unwrap();
         let repo = db.last_insert_rowid();
+        if modern {
+            db.execute(
+                "insert into snapshot_manifests(snapshot_id,ready,source_complete) values (?1,1,0)",
+                [repo],
+            )
+            .unwrap();
+            crate::identity::register(db, Path::new("/src/demo"), Some(repo)).unwrap();
+        }
         db.execute(
             "insert into files(repo_id, path, mtime, size, hash)
              values (?1, 'src/a.ts', 1, 10, 'h')",
@@ -348,13 +443,124 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap()
         );
-        db.execute("delete from repos where id=?1", [repo]).unwrap();
+        reset_repo(&db, Path::new("/src/demo")).unwrap();
         assert_eq!(
             0,
             db.query_row("select count(*) from search_terms", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn migration_indexes_each_edge_foreign_key_without_rewriting_graph() {
+        let g = tempdir::Guard::new();
+        let path = g.path().join("v2.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("pragma journal_mode=wal").unwrap();
+        db.execute_batch(DDL).unwrap();
+        db.execute_batch(crate::search::DDL).unwrap();
+        db.execute_batch("pragma user_version=2").unwrap();
+        let repo = seed_repo(&db);
+        drop(db);
+        let db = open(&path).unwrap();
+        for (column, index) in [
+            ("src_symbol_id", "edges_fk_src"),
+            ("dst_symbol_id", "edges_fk_dst"),
+        ] {
+            let plan: String = db
+                .query_row(
+                    &format!("explain query plan select rowid from edges where {column}=?1"),
+                    [1],
+                    |row| row.get(3),
+                )
+                .unwrap();
+            assert!(plan.contains("SEARCH") && plan.contains(index), "{plan}");
+        }
+        let count: i64 = db
+            .query_row(
+                "select count(*) from symbols where repo_id=?1",
+                [repo],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(integrity(&db).unwrap(), "ok");
+        assert!(
+            db.prepare("pragma foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn snapshot_migration_preserves_v3_v4_v5_graphs_and_existing_checkout_ids() {
+        for version in 3..=5 {
+            let guard = tempdir::Guard::new();
+            let path = guard.path().join("historical.db");
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch("pragma journal_mode=wal").unwrap();
+            old.execute_batch(DDL).unwrap();
+            old.execute_batch(crate::search::DDL).unwrap();
+            old.execute_batch("create index edges_fk_src on edges(src_symbol_id); create index edges_fk_dst on edges(dst_symbol_id); create table repo_inputs(repo_id integer not null references repos(id) on delete cascade,path text not null,content blob,primary key(repo_id,path)) without rowid;").unwrap();
+            let graph = seed_repo(&old);
+            let file: i64 = old
+                .query_row("select id from files where repo_id=?1", [graph], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            old.execute("insert into file_extracts(file_id,extractor_stamp,payload) values (?1,'legacy','legacy-contextual-payload')",[file]).unwrap();
+            if version >= 4 {
+                old.execute_batch(crate::identity::DDL).unwrap();
+                old.execute("insert into checkouts(uid,root,graph_repo_id) values ('0123456789abcdef0123456789abcdef','/src/demo',?1)",[graph]).unwrap();
+            }
+            if version >= 5 {
+                old.execute_batch(crate::content::DDL).unwrap();
+            }
+            old.pragma_update(None, "user_version", version).unwrap();
+            drop(old);
+            let db = open(&path).unwrap();
+            let (active, uid): (i64, String) = db
+                .query_row(
+                    "select snapshot_id,uid from checkouts where root='/src/demo'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(active, graph);
+            if version >= 4 {
+                assert_eq!(uid, "0123456789abcdef0123456789abcdef");
+            }
+            assert_eq!(
+                db.query_row(
+                    "select payload from file_extracts where file_id=?1",
+                    [file],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "legacy-contextual-payload"
+            );
+            assert!(crate::snapshot::current_key(&db, graph).unwrap().is_none());
+            assert_eq!(
+                db.query_row("select count(*) from extractions", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert!(
+                db.prepare("pragma foreign_key_check")
+                    .unwrap()
+                    .query([])
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -366,7 +572,10 @@ mod tests {
         drop(db);
 
         let error = open(&p).unwrap_err().to_string();
-        assert!(error.contains("schema v99; expected v2"), "{error}");
+        assert!(
+            error.contains(&format!("schema v99; expected v{SCHEMA_VERSION}")),
+            "{error}"
+        );
     }
 
     #[test]
@@ -377,17 +586,17 @@ mod tests {
         let reader = open(&path).unwrap();
         let tx = writer.transaction().unwrap();
         tx.execute(
-            "insert into repos(root, indexed_at, extractor_stamp) values ('/pending', 1, 'x')",
+            "insert into snapshots(storage_key, indexed_at, extractor_stamp) values ('/pending', 1, 'x')",
             [],
         )
         .unwrap();
         let before: i64 = reader
-            .query_row("select count(*) from repos", [], |row| row.get(0))
+            .query_row("select count(*) from snapshots", [], |row| row.get(0))
             .unwrap();
         assert_eq!(before, 0);
         tx.commit().unwrap();
         let after: i64 = reader
-            .query_row("select count(*) from repos", [], |row| row.get(0))
+            .query_row("select count(*) from snapshots", [], |row| row.get(0))
             .unwrap();
         assert_eq!(after, 1);
     }
@@ -399,14 +608,14 @@ mod tests {
         let mut writer = open(&path).unwrap();
         let tx = writer.transaction().unwrap();
         tx.execute(
-            "insert into repos(root, indexed_at, extractor_stamp) values ('/pending', 1, 'x')",
+            "insert into snapshots(storage_key, indexed_at, extractor_stamp) values ('/pending', 1, 'x')",
             [],
         )
         .unwrap();
 
         let reader = open(&path).unwrap();
         let visible: i64 = reader
-            .query_row("select count(*) from repos", [], |row| row.get(0))
+            .query_row("select count(*) from snapshots", [], |row| row.get(0))
             .unwrap();
         assert_eq!(visible, 0, "the uncommitted writer remains invisible");
     }
@@ -419,13 +628,13 @@ mod tests {
         {
             let tx = db.transaction().unwrap();
             tx.execute(
-                "insert into repos(root, indexed_at, extractor_stamp) values ('/partial', 1, 'x')",
+                "insert into snapshots(storage_key, indexed_at, extractor_stamp) values ('/partial', 1, 'x')",
                 [],
             )
             .unwrap();
         }
         let count: i64 = db
-            .query_row("select count(*) from repos", [], |row| row.get(0))
+            .query_row("select count(*) from snapshots", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -491,7 +700,7 @@ mod tests {
         )
         .unwrap();
 
-        db.execute("delete from repos where id=?1", [repo]).unwrap();
+        reset_repo(&db, Path::new("/src/demo")).unwrap();
 
         for t in ["files", "symbols", "edges"] {
             let n: i64 = db
@@ -514,7 +723,7 @@ mod tests {
         let (_g, db) = temp_db();
         seed_repo(&db);
         assert_eq!(clear(&db).unwrap(), 1);
-        for table in ["repos", "files", "file_extracts", "symbols", "edges"] {
+        for table in ["snapshots", "files", "file_extracts", "symbols", "edges"] {
             let rows: i64 = db
                 .query_row(&format!("select count(*) from {table}"), [], |row| {
                     row.get(0)
@@ -527,17 +736,44 @@ mod tests {
     }
 
     #[test]
+    fn failed_clear_rolls_back_graphs_and_identity_metadata_together() {
+        let (_g, db) = temp_db();
+        let graph = seed_repo(&db);
+        db.execute("insert into git_instances default values", [])
+            .unwrap();
+        let instance = db.last_insert_rowid();
+        db.execute(
+            "update checkouts set instance_id=?1 where snapshot_id=?2",
+            rusqlite::params![instance, graph],
+        )
+        .unwrap();
+        db.execute_batch("create trigger reject_instance_delete before delete on git_instances begin select raise(abort,'injected clear failure'); end;").unwrap();
+        assert!(clear(&db).is_err());
+        assert_eq!(
+            db.query_row(
+                "select snapshot_id from checkouts where root='/src/demo'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            graph
+        );
+        assert!(
+            db.query_row("select count(*) from symbols", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+                > 0
+        );
+        assert_eq!(integrity(&db).unwrap(), "ok");
+    }
+
+    #[test]
     fn a_repo_root_can_only_be_registered_once() {
         let (_g, db) = temp_db();
         seed_repo(&db);
-        let again = db.execute(
-            "insert into repos(root, indexed_at, extractor_stamp)
-             values ('/src/demo', 2, 'stamp-b')",
-            [],
-        );
+        let again = db.execute("insert into checkouts(root) values ('/src/demo')", []);
         assert!(
             again.is_err(),
-            "repos.root is the lookup key; duplicates would make it ambiguous"
+            "checkouts.root is the selector; duplicates would make it ambiguous"
         );
     }
 }

@@ -1,19 +1,158 @@
 //! Repo identity and the source-file walk.
 //!
-//! A repo is identified by the realpath of its git toplevel. That is the key in
-//! `repos.root`, and it is what the MCP server resolves the working directory to
-//! before deciding whether it can answer or has to report "not indexed". Using
-//! the toplevel rather than the caller's cwd means `panoptes grep` from a
-//! subdirectory hits the same store entry as one run from the root.
+//! Canonical roots select checkout records. Stable checkout/instance identities
+//! live in the store; complete captured inputs identify immutable graph snapshots.
 
 use anyhow::{Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Encode native separators while retaining literal backslashes on Unix.
+pub fn path_key(path: &Path) -> Result<String> {
+    path.components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .context("source path is not UTF-8")
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("/"))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Target {
     pub label: String,
     pub root: PathBuf,
+    /// Captured when the target is selected, so discovery survives removal of
+    /// that checkout. Serialized into workers instead of rediscovered there.
+    #[serde(default)]
+    pub common_dir: Option<String>,
+}
+
+/// Explicit MCP checkout selection must never fall back to a broad plain directory.
+pub fn checkout_target(path: &Path) -> Result<Target> {
+    anyhow::ensure!(path.is_absolute(), "repo paths must be absolute");
+    let root = git_toplevel(path).context("repo path is not inside a Git checkout")?;
+    Ok(Target {
+        label: root
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        common_dir: git_common_dir(&root),
+        root,
+    })
+}
+
+/// Re-read Git's worktree registry on every discovery request; stale/pruned
+/// entries are ignored, and each entry must belong to the same common directory.
+pub fn related_worktrees(targets: &[Target]) -> Vec<Target> {
+    let mut roots = std::collections::BTreeSet::new();
+    let mut common_dirs = std::collections::BTreeSet::new();
+    for target in targets {
+        let live_common = git_common_dir(&target.root);
+        let Some(common) = target.common_dir.clone().or_else(|| live_common.clone()) else {
+            continue;
+        };
+        if live_common.as_ref() == Some(&common) {
+            roots.insert(target.root.clone());
+        }
+        common_dirs.insert(common);
+    }
+    for common in common_dirs {
+        let common_path = Path::new(&common);
+        if common_path.file_name().is_some_and(|name| name == ".git")
+            && let Some(main) = common_path.parent()
+            && git_common_dir(main).as_deref() == Some(common.as_str())
+        {
+            roots.insert(main.to_path_buf());
+        }
+        let Ok(entries) = std::fs::read_dir(common_path.join("worktrees")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(pointer) = std::fs::read_to_string(entry.path().join("gitdir")) else {
+                continue;
+            };
+            let marker = PathBuf::from(pointer.trim());
+            let marker = if marker.is_absolute() {
+                marker
+            } else {
+                entry.path().join(marker)
+            };
+            let Some(root) = marker
+                .parent()
+                .and_then(|root| std::fs::canonicalize(root).ok())
+            else {
+                continue;
+            };
+            if git_common_dir(&root).as_deref() == Some(common.as_str()) {
+                roots.insert(root);
+            }
+        }
+    }
+    roots
+        .into_iter()
+        .map(|root| Target {
+            label: root
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            common_dir: git_common_dir(&root),
+            root,
+        })
+        .collect()
+}
+
+/// Observed checkout identity, not an immutable branch snapshot. Unborn heads
+/// and unsupported ref storage have a null commit rather than an invented SHA.
+pub fn checkout_identity(target: &Target) -> serde_json::Value {
+    let common = git_common_dir(&target.root);
+    let directory = git_dir(&target.root);
+    let head = directory
+        .as_ref()
+        .and_then(|dir| std::fs::read_to_string(dir.join("HEAD")).ok());
+    let head = head.as_deref().unwrap_or("").trim();
+    let reference = head.strip_prefix("ref: ");
+    let valid_ref = reference.filter(|name| {
+        name.starts_with("refs/")
+            && Path::new(name)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+    });
+    let commit = if let Some(reference) = valid_ref {
+        directory
+            .as_ref()
+            .and_then(|dir| std::fs::read_to_string(dir.join(reference)).ok())
+            .or_else(|| {
+                common
+                    .as_ref()
+                    .and_then(|dir| std::fs::read_to_string(Path::new(dir).join(reference)).ok())
+            })
+            .or_else(|| {
+                common
+                    .as_ref()
+                    .and_then(|dir| {
+                        std::fs::read_to_string(Path::new(dir).join("packed-refs")).ok()
+                    })
+                    .and_then(|text| {
+                        text.lines().find_map(|line| {
+                            let (sha, name) = line.split_once(' ')?;
+                            (name == reference).then(|| sha.to_string())
+                        })
+                    })
+            })
+    } else if reference.is_none() {
+        Some(head.to_string())
+    } else {
+        None
+    };
+    let commit = commit.map(|value| value.trim().to_string()).filter(|sha| {
+        matches!(sha.len(), 40 | 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    serde_json::json!({"label":target.label, "root":target.root, "gitCommonDir":common, "branch":valid_ref.and_then(|name| name.strip_prefix("refs/heads/")), "head":commit})
 }
 
 /// Languages the extractor understands, chosen by file extension.
@@ -31,6 +170,20 @@ pub enum Lang {
 }
 
 impl Lang {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::TypeScript => "typescript",
+            Self::Tsx => "tsx",
+            Self::JavaScript => "javascript",
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::Shell => "shell",
+            Self::Yaml => "yaml",
+            Self::Hcl => "hcl",
+        }
+    }
+
     pub fn of_path(p: &Path) -> Option<Lang> {
         if p.file_name().is_some_and(|name| name == "Kustomization") {
             return Some(Lang::Yaml);
@@ -130,6 +283,7 @@ pub fn automatic_targets(start: &Path) -> Result<Vec<Target>> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
+            common_dir: git_common_dir(&root),
             root,
         }]);
     }
@@ -144,6 +298,7 @@ pub fn automatic_targets(start: &Path) -> Result<Vec<Target>> {
         if git_toplevel(&child).as_deref() == Some(child.as_path()) {
             children.push(Target {
                 label: entry.file_name().to_string_lossy().into_owned(),
+                common_dir: git_common_dir(&child),
                 root: child,
             });
         }
@@ -168,6 +323,7 @@ pub fn targets(start: &Path) -> Result<Vec<Target>> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
+            common_dir: git_common_dir(&root),
             root,
         });
     }
@@ -202,16 +358,9 @@ pub struct SourceFile {
     pub hash: String,
 }
 
-/// FNV-1a. Deliberately not `DefaultHasher`: SipHash's output is explicitly not
-/// stable across Rust releases, so a compiler upgrade would silently invalidate
-/// every cached file hash and force a full cold reparse of every indexed repo.
-fn fnv1a(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
+/// Algorithm-tagged strong identity for exact bytes, stable across platforms.
+pub fn content_hash(bytes: &[u8]) -> String {
+    format!("blake3-256:{}", blake3::hash(bytes).to_hex())
 }
 
 /// Walk `root` for source files Panoptes can extract, honouring .gitignore.
@@ -221,6 +370,7 @@ fn fnv1a(bytes: &[u8]) -> String {
 /// `.git` itself is always excluded.
 pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
     let mut out = Vec::new();
+    crate::progress::report("Scanning files", 0, None, &root.to_string_lossy());
     let walker = ignore::WalkBuilder::new(root)
         // Tracked configuration commonly lives under .github, .gitlab, or
         // .circleci. Include hidden paths but never descend into Git's database.
@@ -231,11 +381,9 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
         .filter_entry(|entry| entry.file_name() != ".git")
         .build();
 
-    for dent in walker {
-        let dent = match dent {
-            Ok(d) => d,
-            Err(_) => continue, // unreadable entry: skip, never abort the build
-        };
+    for (visited, dent) in walker.enumerate() {
+        crate::progress::report("Scanning files", visited, None, &root.to_string_lossy());
+        let dent = dent.context("source scan is incomplete")?;
         if !dent.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -244,12 +392,11 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
             lang
         } else if abs.extension().is_none() {
             let mut prefix = [0u8; 256];
-            let Ok(mut file) = std::fs::File::open(abs) else {
-                continue;
-            };
-            let Ok(read) = file.read(&mut prefix) else {
-                continue;
-            };
+            let mut file = std::fs::File::open(abs)
+                .with_context(|| format!("inspect source candidate {}", abs.display()))?;
+            let read = file
+                .read(&mut prefix)
+                .with_context(|| format!("read source candidate {}", abs.display()))?;
             let Some(lang) = Lang::of_shebang(&prefix[..read]) else {
                 continue;
             };
@@ -257,10 +404,9 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
         } else {
             continue;
         };
-        // Non-UTF8 files are not source we can parse; skipping beats failing.
-        let Ok(text) = std::fs::read_to_string(abs) else {
-            continue;
-        };
+        // Fail closed rather than publishing a reusable graph with omitted source.
+        let text = std::fs::read_to_string(abs)
+            .with_context(|| format!("capture UTF-8 source {}", abs.display()))?;
         let meta = dent.metadata().ok();
         let mtime = meta
             .as_ref()
@@ -268,15 +414,14 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let rel = abs
+        let relative = abs
             .strip_prefix(root)
-            .unwrap_or(abs)
-            .to_string_lossy()
-            .replace('\\', "/");
+            .context("source path escaped checkout")?;
+        let rel = path_key(relative)?;
         out.push(SourceFile {
             rel,
             lang,
-            hash: fnv1a(text.as_bytes()),
+            hash: content_hash(text.as_bytes()),
             size: text.len() as i64,
             mtime,
             text,
@@ -284,6 +429,12 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
     }
     // Stable order so two builds of an unchanged tree produce identical rowids,
     // which is what lets the differential harness diff output byte for byte.
+    crate::progress::report(
+        "Source files read",
+        out.len(),
+        Some(out.len()),
+        &root.to_string_lossy(),
+    );
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(out)
 }
@@ -356,23 +507,45 @@ mod tests {
     }
 
     #[test]
-    fn fnv_is_stable_and_distinguishes_content() {
-        // Pinned literals, computed independently rather than recorded from this
-        // implementation's own output. If they ever change, every stored file hash
-        // is invalidated and every indexed repo cold-reparses — that should be a
-        // deliberate schema bump, not an accident.
+    fn content_hash_is_strong_stable_and_algorithm_tagged() {
+        // Published BLAKE3 empty-input test vector.
         assert_eq!(
-            fnv1a(b""),
-            "cbf29ce484222325",
-            "the FNV-1a 64-bit offset basis"
+            content_hash(b""),
+            "blake3-256:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         );
-        assert_eq!(fnv1a(b"panoptes"), "db05d32df7ddaad1");
-        assert_ne!(fnv1a(b"panoptes"), fnv1a(b"panoptesx"));
-        assert_eq!(
-            fnv1a(b"panoptes").len(),
-            16,
-            "zero-padded, so hashes sort as text"
-        );
+        assert_ne!(content_hash(b"panoptes"), content_hash(b"panoptesx"));
+        assert_eq!(content_hash(b"panoptes").len(), 75);
+    }
+
+    #[test]
+    fn checkout_identity_handles_loose_packed_detached_and_unsafe_refs() {
+        let root = std::env::temp_dir().join(format!("panoptes-head-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        let target = Target {
+            label: "test".into(),
+            common_dir: None,
+            root: root.clone(),
+        };
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/review\n").unwrap();
+        std::fs::write(root.join(".git/refs/heads/review"), format!("{sha}\n")).unwrap();
+        let identity = checkout_identity(&target);
+        assert_eq!(identity["branch"], "review");
+        assert_eq!(identity["head"], sha);
+        std::fs::remove_file(root.join(".git/refs/heads/review")).unwrap();
+        std::fs::write(
+            root.join(".git/packed-refs"),
+            format!("# pack-refs with: peeled\n{sha} refs/heads/review\n"),
+        )
+        .unwrap();
+        assert_eq!(checkout_identity(&target)["head"], sha);
+        std::fs::write(root.join(".git/HEAD"), format!("{sha}\n")).unwrap();
+        assert!(checkout_identity(&target)["branch"].is_null());
+        assert_eq!(checkout_identity(&target)["head"], sha);
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/../../secret\n").unwrap();
+        assert!(checkout_identity(&target)["head"].is_null());
+        assert!(checkout_identity(&target)["branch"].is_null());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -478,6 +651,28 @@ mod tests {
         assert_eq!(
             git_common_dir(&worktree).unwrap(),
             std::fs::canonicalize(&common).unwrap().to_string_lossy()
+        );
+        let other = base.join("other");
+        let admin = common.join("worktrees/other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/review\n").unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        std::fs::write(admin.join("gitdir"), "../../../other/.git\n").unwrap();
+        std::fs::write(other.join(".git"), "gitdir: ../common/worktrees/other\n").unwrap();
+        let targets = [checkout_target(&worktree).unwrap()];
+        let found = related_worktrees(&targets);
+        assert_eq!(found.len(), 2);
+        assert!(
+            found
+                .iter()
+                .any(|target| target.root == std::fs::canonicalize(&other).unwrap())
+        );
+        std::fs::remove_file(other.join(".git")).unwrap();
+        assert_eq!(
+            related_worktrees(&targets).len(),
+            1,
+            "pruned entries are ignored"
         );
         let _ = std::fs::remove_dir_all(base);
     }

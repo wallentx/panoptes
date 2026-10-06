@@ -156,8 +156,8 @@ mod tests {
         std::fs::write(&path, "export function oldMarker() { return 'oldMarker'; }").unwrap();
         let mut conn = db::open(&root.join("test.db")).unwrap();
         index::build(&mut conn, &root).unwrap();
-        let repo_id = index::repo_id_of(&conn, &root).unwrap().unwrap();
         let names = |query: &str, conn: &Connection| {
+            let repo_id = index::repo_id_of(conn, &root).unwrap().unwrap();
             ask::ask(
                 conn,
                 repo_id,

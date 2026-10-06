@@ -59,12 +59,25 @@ fi
 run init --provider cursor --provider opencode --dry-run > /dev/null
 
 mcp() {
-  {
-    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-      '{"jsonrpc":"2.0","method":"notifications/initialized"}'
-    jq -cn --arg method "$1" --argjson params "$2" \
-      '{jsonrpc:"2.0",id:2,method:$method,params:$params}'
-  } | run mcp "$repo" > "$scratch/mcp.jsonl"
+  # Keep stdin open until the reply: EOF means the client disconnected.
+  mkfifo "$scratch/mcp-in" "$scratch/mcp-out"
+  run mcp "$repo" < "$scratch/mcp-in" > "$scratch/mcp-out" &
+  local mcp_pid=$!
+  exec 3> "$scratch/mcp-in"
+  exec 4< "$scratch/mcp-out"
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' >&3
+  jq -cn --arg method "$1" --argjson params "$2" \
+    '{jsonrpc:"2.0",id:2,method:$method,params:$params}' >&3
+  : > "$scratch/mcp.jsonl"
+  while IFS= read -r -t 60 line <&4; do
+    printf '%s\n' "$line" >> "$scratch/mcp.jsonl"
+    if jq -e '.id == 2' <<< "$line" > /dev/null; then break; fi
+  done
+  exec 3>&-
+  exec 4<&-
+  wait "$mcp_pid"
+  rm "$scratch/mcp-in" "$scratch/mcp-out"
   jq -es --arg version "$version" \
     'any(.[]; .id == 1 and .result.serverInfo.version == $version)' "$scratch/mcp.jsonl" > /dev/null
   jq -es 'any(.[]; .id == 2 and has("result") and (.result.isError != true))' \

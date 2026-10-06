@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -97,6 +96,9 @@ jobs:
 
       - name: Exercise CLI and MCP
         run: bash scripts/smoke.sh target/debug/panoptes
+
+      - name: Check benchmark isolation and reset
+        run: python3 -B tests/test_benchmark_mcp.py
 
   termux-container:
     name: check (Termux Bionic)
