@@ -729,7 +729,7 @@ fn main() -> Result<()> {
             let Some(ready) = ready_targets(&store, &path, no_refresh)? else {
                 std::process::exit(2);
             };
-            let requested = file.to_string_lossy().replace('\\', "/");
+            let requested = repo::path_key(&file)?;
             let mut matches = Vec::new();
             for target in &ready {
                 let local = std::fs::canonicalize(&file)
@@ -738,8 +738,10 @@ fn main() -> Result<()> {
                         absolute
                             .strip_prefix(&target.target.root)
                             .ok()
-                            .map(|path| path.to_string_lossy().replace('\\', "/"))
+                            .map(std::path::Path::to_path_buf)
                     })
+                    .map(|path| repo::path_key(&path))
+                    .transpose()?
                     .or_else(|| {
                         requested
                             .strip_prefix(&format!("{}/", target.target.label))
@@ -1104,12 +1106,12 @@ fn main() -> Result<()> {
         } => {
             let root = repo::root_of(&path)?;
             let mut conn = db::open(&store)?;
-            let Some(repo_id) = ready_repo(&mut conn, &root, no_refresh)? else {
+            let Some(_) = ready_repo(&mut conn, &root, no_refresh)? else {
                 eprintln!("{}", not_indexed(&root));
                 std::process::exit(2);
             };
             let title = root.file_name().unwrap_or_default().to_string_lossy();
-            let html = viz::render(&conn, repo_id, &title)?;
+            let html = viz::render_current(&conn, &root, &title)?;
             if let Some(output) = output {
                 viz::write(&output, &html, force)?;
                 println!("wrote {}", output.display());

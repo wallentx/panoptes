@@ -912,3 +912,35 @@ fn shared_extraction_progress_counts_misses_and_mixed_hits() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn skeleton_cli_preserves_literal_backslashes_in_relative_and_absolute_paths() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("repo");
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::write(root.join("a\\b.rs"), "pub fn literal_file() {}\n").unwrap();
+    std::fs::write(root.join("a/b.rs"), "pub fn nested_file() {}\n").unwrap();
+    fixture.build();
+    for file in [PathBuf::from("a\\b.rs"), root.join("a\\b.rs")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_panoptes"))
+            .current_dir(&root)
+            .arg("--store")
+            .arg(fixture.store())
+            .args(["--no-refresh", "skeleton"])
+            .arg(file)
+            .arg("--path")
+            .arg(&root)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("literal_file"), "{text}");
+        assert!(!text.contains("nested_file"), "{text}");
+    }
+}
