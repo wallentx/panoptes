@@ -859,3 +859,33 @@ fn failed_query_flushes_its_final_worker_phase() {
     assert_eq!(timings.len(), 1);
     assert_eq!(timings[0]["params"]["progressToken"], "failed-query");
 }
+
+#[test]
+fn shared_extraction_progress_counts_misses_and_mixed_hits() {
+    for seeded in [false, true] {
+        let fixture = Fixture::new();
+        if seeded {
+            fixture.build();
+        }
+        let second = fixture.0.join("second");
+        std::fs::create_dir_all(second.join(".git")).unwrap();
+        std::fs::write(second.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::copy(fixture.0.join("repo/lib.rs"), second.join("lib.rs")).unwrap();
+        std::fs::write(second.join("fresh.rs"), "pub fn newly_added() {}\n").unwrap();
+        let mut server = Server::with_timeout(&fixture, "5");
+        let response = server.request(1,"tools/call",json!({"name":"find","arguments":{"query":"newly_added","repo":second},"_meta":{"progressToken":"lookup"}}));
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let messages: Vec<_> = server
+            .notifications
+            .try_iter()
+            .filter_map(|v| v["params"]["message"].as_str().map(str::to_string))
+            .filter(|m| m.starts_with("Looking up shared extractions "))
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("Looking up shared extractions 2/2")),
+            "seeded={seeded}: {messages:?}"
+        );
+    }
+}
