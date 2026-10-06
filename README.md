@@ -359,3 +359,14 @@ Snapshot sharing optimizes identical trees. A changed manifest still materialize
 a complete graph using cached base extractions; fine-grained incremental graph
 sharing is deferred. Two-pass input verification adds source reads. Benchmark
 changed-checkout latency separately from identical-checkout attachment.
+
+
+
+Git-instance locator validation uses a read-only filesystem incarnation token
+(inode generation where available, otherwise birth time) together with device
+and inode. Device/inode alone is never trusted after reopening. Filesystems that
+expose neither token report an unknown Git instance; checkout IDs and ordinary
+indexing remain usable. Legacy inode-only registrations are re-established on
+explicit registration, preserving the checkout ID while assigning a new Git
+instance ID. Ancestry inspection captures the registered instance before the
+walk and rejects persistence if its generation or registration changes.

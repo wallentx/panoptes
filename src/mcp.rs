@@ -317,6 +317,14 @@ fn call_tool_detailed(
             index::freshness(&conn, &target.root)?
         };
         if name == "freshness" {
+            if let Some(checkout) = checkouts.last_mut() {
+                checkout.as_object_mut().unwrap().extend(
+                    crate::identity::metadata(&conn, &target.root)?
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            }
             results.insert(result_key, serde_json::to_value(state)?);
             continue;
         }
@@ -770,6 +778,27 @@ mod tests {
         assert_eq!(output["panoptesScope"]["snapshotsSearched"], 2);
         let unsupported = call_tool(&store, &[], "freshness", &args, false).unwrap_err();
         assert!(unsupported.to_string().contains("only supports checkout"));
+    }
+
+    #[test]
+    fn freshness_includes_registered_checkout_and_instance_metadata() {
+        let (_temp, store, target) = fixture("freshness-identities");
+        std::fs::create_dir(target.root.join(".git")).unwrap();
+        std::fs::write(target.root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let indexed = call_tool(
+            &store,
+            std::slice::from_ref(&target),
+            "find",
+            &json!({"query":"original"}),
+            false,
+        )
+        .unwrap();
+        let freshness = call_tool(&store, &[target], "freshness", &json!({}), false).unwrap();
+        let expected = &indexed["panoptesCheckouts"][0];
+        let actual = &freshness["panoptesCheckouts"][0];
+        assert!(expected["checkoutId"].is_string());
+        assert_eq!(actual["checkoutId"], expected["checkoutId"]);
+        assert_eq!(actual["gitInstanceId"], expected["gitInstanceId"]);
     }
 
     #[test]

@@ -87,6 +87,32 @@ pub fn database_steps(completed: u64) {
     });
 }
 
+/// Emit the last phase once, including normally returned errors, before the
+/// worker result. A killed worker cannot flush and must not fabricate completion.
+pub fn finish() {
+    let Some(reporter) = REPORTER.get() else {
+        return;
+    };
+    let Ok(mut reporter) = reporter.lock() else {
+        return;
+    };
+    let Some((stage, started, prior_steps)) = reporter.phase.take() else {
+        return;
+    };
+    let timing = StageTiming {
+        stage: stage.clone(),
+        elapsed_micros: started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        sqlite_vm_steps: reporter.sqlite_steps.saturating_sub(prior_steps),
+    };
+    (reporter.sink)(Progress {
+        stage,
+        completed: 0,
+        total: None,
+        detail: "phase timing".into(),
+        timing: Some(timing),
+    });
+}
+
 fn emit(mut progress: Progress) {
     let Some(reporter) = REPORTER.get() else {
         return;

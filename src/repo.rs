@@ -7,6 +7,19 @@ use anyhow::{Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Encode native separators while retaining literal backslashes on Unix.
+pub fn path_key(path: &Path) -> Result<String> {
+    path.components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .context("source path is not UTF-8")
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("/"))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Target {
     pub label: String,
@@ -404,16 +417,7 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
         let relative = abs
             .strip_prefix(root)
             .context("source path escaped checkout")?;
-        let rel = relative
-            .components()
-            .map(|component| {
-                component
-                    .as_os_str()
-                    .to_str()
-                    .context("source path is not UTF-8")
-            })
-            .collect::<Result<Vec<_>>>()?
-            .join("/");
+        let rel = path_key(relative)?;
         out.push(SourceFile {
             rel,
             lang,

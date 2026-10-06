@@ -292,19 +292,20 @@ fn build_internal(
     // sorted file order so IDs and exported graph output remain deterministic.
     let mut needing_parse = Vec::new();
     let mut extracted_files = Vec::new();
-    for &index in &changed {
-        crate::progress::report(
-            "Looking up shared extractions",
-            extracted_files.len(),
-            Some(changed.len()),
-            &files[index].rel,
-        );
+    crate::progress::report("Looking up shared extractions", 0, Some(changed.len()), "");
+    for (inspected, &index) in changed.iter().enumerate() {
         if let Some(extracted) = crate::content::load_base(&tx, &files[index])? {
             extracted_files.push((index, extracted));
             reused += 1;
         } else {
             needing_parse.push(index);
         }
+        crate::progress::report(
+            "Looking up shared extractions",
+            inspected + 1,
+            Some(changed.len()),
+            &files[index].rel,
+        );
     }
     for (index, extracted) in extract_changed(&files, &needing_parse, requested_jobs)? {
         // Store only the immutable base result, before contextualize mutates it.
