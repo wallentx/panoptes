@@ -262,3 +262,13 @@ Schema v4 adds identity metadata without rewriting existing graphs. Cache reset
 removes graph data while retaining registered checkout IDs; global cache clear
 also clears identity metadata. Keep a pre-migration SQLite backup when an older
 binary must remain a rollback option.
+
+
+Git-instance locator validation uses a read-only filesystem incarnation token
+(inode generation where available, otherwise birth time) together with device
+and inode. Device/inode alone is never trusted after reopening. Filesystems that
+expose neither token report an unknown Git instance; checkout IDs and ordinary
+indexing remain usable. Legacy inode-only registrations are re-established on
+explicit registration, preserving the checkout ID while assigning a new Git
+instance ID. Ancestry inspection captures the registered instance before the
+walk and rejects persistence if its generation or registration changes.
