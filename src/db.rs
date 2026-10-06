@@ -231,13 +231,15 @@ pub fn reset_repo(db: &Connection, root: &Path) -> Result<bool> {
 
 /// Remove every indexed repository while preserving a valid, reusable store.
 pub fn clear(db: &Connection) -> Result<i64> {
-    let repositories: i64 = db.query_row("select count(*) from repos", [], |row| row.get(0))?;
-    db.execute("delete from repos", [])?;
-    db.execute("delete from checkouts", [])?;
-    db.execute("delete from git_instances", [])?;
-    db.execute("delete from lineages", [])?;
-    db.execute("delete from content_objects", [])?;
-    db.execute("delete from extraction_profiles", [])?;
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+    let repositories: i64 = tx.query_row("select count(*) from repos", [], |row| row.get(0))?;
+    tx.execute("delete from repos", [])?;
+    tx.execute("delete from checkouts", [])?;
+    tx.execute("delete from git_instances", [])?;
+    tx.execute("delete from lineages", [])?;
+    tx.execute("delete from content_objects", [])?;
+    tx.execute("delete from extraction_profiles", [])?;
+    tx.commit()?;
     db.execute_batch("pragma wal_checkpoint(truncate); vacuum;")?;
     Ok(repositories)
 }
@@ -617,6 +619,37 @@ mod tests {
         }
         assert_eq!(integrity(&db).unwrap(), "ok");
         seed_repo(&db);
+    }
+
+    #[test]
+    fn failed_clear_rolls_back_graphs_and_identity_metadata_together() {
+        let (_g, db) = temp_db();
+        let graph = seed_repo(&db);
+        db.execute("insert into git_instances default values", [])
+            .unwrap();
+        let instance = db.last_insert_rowid();
+        db.execute(
+            "insert into checkouts(root,instance_id,graph_repo_id) values ('/src/demo',?1,?2)",
+            rusqlite::params![instance, graph],
+        )
+        .unwrap();
+        db.execute_batch("create trigger reject_instance_delete before delete on git_instances begin select raise(abort,'injected clear failure'); end;").unwrap();
+        assert!(clear(&db).is_err());
+        assert_eq!(
+            db.query_row(
+                "select graph_repo_id from checkouts where root='/src/demo'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            graph
+        );
+        assert!(
+            db.query_row("select count(*) from symbols", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+                > 0
+        );
+        assert_eq!(integrity(&db).unwrap(), "ok");
     }
 
     #[test]

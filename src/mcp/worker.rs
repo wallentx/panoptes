@@ -101,6 +101,7 @@ pub fn worker_main() -> Result<()> {
         )
     })()
     .map_err(|error| format!("{error:#}"));
+    progress::finish();
     let mut output = std::io::stdout().lock();
     serde_json::to_writer(&mut output, &result)?;
     output.write_all(b"\n")?;

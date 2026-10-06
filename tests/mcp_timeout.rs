@@ -805,6 +805,15 @@ fn progress_notifications_stream_stages_and_keep_request_tokens() {
     assert!(updates.iter().any(
         |update| update["params"]["_meta"]["panoptesTiming"]["stage"] == "Waiting for index writer"
     ));
+    assert_eq!(
+        updates
+            .iter()
+            .filter(
+                |update| update["params"]["_meta"]["panoptesTiming"]["stage"] == "Querying index"
+            )
+            .count(),
+        1
+    );
     server.request(3, "ping", json!({}));
     assert!(
         server.notifications.try_recv().is_err(),
@@ -829,4 +838,24 @@ fn progress_logs_work_without_tokens_and_respect_log_level() {
     assert!(server.notifications.try_recv().is_err());
     let invalid = server.request(4, "logging/setLevel", json!({"level":"verbose"}));
     assert_eq!(invalid["error"]["code"], -32602);
+}
+
+#[test]
+fn failed_query_flushes_its_final_worker_phase() {
+    let fixture = Fixture::new();
+    fixture.build();
+    let mut server = Server::with_timeout(&fixture, "5");
+    let response = server.request(
+        1,
+        "tools/call",
+        json!({"name":"grep","arguments":{"pattern":"["},"_meta":{"progressToken":"failed-query"}}),
+    );
+    assert_eq!(response["error"]["code"], -32000, "{response}");
+    let timings: Vec<_> = server
+        .notifications
+        .try_iter()
+        .filter(|update| update["params"]["_meta"]["panoptesTiming"]["stage"] == "Querying index")
+        .collect();
+    assert_eq!(timings.len(), 1);
+    assert_eq!(timings[0]["params"]["progressToken"], "failed-query");
 }
