@@ -944,3 +944,79 @@ fn skeleton_cli_preserves_literal_backslashes_in_relative_and_absolute_paths() {
         assert!(!text.contains("nested_file"), "{text}");
     }
 }
+
+#[test]
+fn scoped_cli_full_implies_source_for_repository_and_lineage() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("repo");
+    let commit = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args([
+            "-c",
+            "user.name=Panoptes Test",
+            "-c",
+            "user.email=panoptes-test@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Scoped CLI fixture ancestry",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    fixture.build();
+    let identity = Command::new(env!("CARGO_BIN_EXE_panoptes"))
+        .arg("--store")
+        .arg(fixture.store())
+        .arg("identity")
+        .arg(&root)
+        .arg("--lineage")
+        .output()
+        .unwrap();
+    assert!(
+        identity.status.success(),
+        "{}",
+        String::from_utf8_lossy(&identity.stderr)
+    );
+    let identity: Value = serde_json::from_slice(&identity.stdout).unwrap();
+    let lineage = format!(
+        "{}:{}",
+        identity["ancestry"]["objectFormat"].as_str().unwrap(),
+        identity["ancestry"]["roots"][0].as_str().unwrap()
+    );
+    for scope in ["repository", "lineage"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_panoptes"));
+        command
+            .arg("--store")
+            .arg(fixture.store())
+            .args(["--no-refresh", "ask", "original"])
+            .arg(&root)
+            .args(["--full", "--view-scope", scope]);
+        if scope == "lineage" {
+            command.args(["--lineage-root", &lineage]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            value["repositories"]["repo"]["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["source"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("pub fn original"))),
+            "{value}"
+        );
+    }
+}

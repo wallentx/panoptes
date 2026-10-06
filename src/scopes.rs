@@ -51,10 +51,18 @@ fn lineage_member(db: &Connection, target: &repo::Target, lineage: &str) -> Resu
         return Ok(None);
     };
     let common = std::path::Path::new(common);
-    if common.join("shallow").exists()
-        || std::fs::metadata(common.join("info/grafts")).is_ok_and(|m| m.len() > 0)
-    {
-        return Ok(None);
+    match std::fs::symlink_metadata(common.join("shallow")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Ok(None),
+    }
+    let grafts = common.join("info/grafts");
+    match std::fs::symlink_metadata(&grafts) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => match std::fs::metadata(&grafts) {
+            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
+            _ => return Ok(None),
+        },
+        Err(_) => return Ok(None),
     }
     let observation: Option<i64> = db.query_row("select o.id from ancestry_observations o join git_instances i on i.id=o.instance_id where i.uid=?1 and o.head_oid=?2 and o.policy_stamp='physical-head-roots-v1' and o.status='complete'", params![instance,head], |r| r.get(0)).optional()?;
     let Some(observation) = observation else {
@@ -225,6 +233,20 @@ mod tests {
         .unwrap();
         assert_eq!(output["panoptesScope"]["snapshotsSearched"], 1);
         assert_eq!(output["panoptesCheckouts"].as_array().unwrap().len(), 2);
+        #[cfg(unix)]
+        for path in ["shallow", "info/grafts"] {
+            let path = targets[1].root.join(".git").join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&path, &path).unwrap();
+            let members = expand(&db, &targets[..1], "lineage", Some(&lineage)).unwrap();
+            assert_eq!(
+                members.targets.len(),
+                1,
+                "unverifiable boundary must exclude merged checkout"
+            );
+            assert_eq!(members.unknown, 2);
+            std::fs::remove_file(path).unwrap();
+        }
         std::fs::write(
             targets[1].root.join(".git/HEAD"),
             format!("{}\n", "5".repeat(40)),

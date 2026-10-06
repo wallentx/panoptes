@@ -448,7 +448,7 @@ fn main() -> Result<()> {
             json,
         } => {
             if view_scope != "checkout" || lineage_root.is_some() {
-                let mut args = serde_json::json!({"query":query,"limit":limit,"source":source,"full":full,"scope":view_scope});
+                let mut args = serde_json::json!({"query":query,"limit":limit,"source":source || full,"full":full,"scope":view_scope});
                 if let Some(scope) = scope {
                     args["in"] = scope.into();
                 }
