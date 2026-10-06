@@ -82,18 +82,55 @@ fn filesystem_key(path: &Path) -> Option<String> {
                 None
             }
         };
-        incarnation_key(
-            metadata.dev(),
-            metadata.ino(),
-            generation,
-            metadata.created().ok(),
-        )
+        let created = metadata.created().ok();
+        #[cfg(target_os = "android")]
+        let created = created.or_else(|| android_birthtime(&directory));
+        incarnation_key(metadata.dev(), metadata.ino(), generation, created)
     }
     #[cfg(not(unix))]
     {
         let _ = path;
         None
     }
+}
+
+// Android std does not expose statx birth time on all supported API levels.
+// Query the already-open directory, avoiding a path replacement race and a
+// dependency on a newer Bionic symbol. Unsupported kernels remain unverified.
+#[cfg(target_os = "android")]
+fn android_birthtime(directory: &std::fs::File) -> Option<std::time::SystemTime> {
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: the descriptor is live, the empty C string is NUL terminated, and
+    // stat points to a correctly sized writable kernel statx structure.
+    let status = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            directory.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_BTIME,
+            stat.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    // SAFETY: the successful syscall initialized the zeroed output structure.
+    let stat = unsafe { stat.assume_init() };
+    statx_birthtime(stat.stx_mask, stat.stx_btime.tv_sec, stat.stx_btime.tv_nsec)
+}
+
+#[cfg(target_os = "android")]
+fn statx_birthtime(mask: u32, seconds: i64, nanos: u32) -> Option<std::time::SystemTime> {
+    if mask & libc::STATX_BTIME == 0 || seconds < 0 || nanos >= 1_000_000_000 {
+        return None;
+    }
+    let duration = Duration::new(seconds as u64, nanos);
+    if duration.is_zero() {
+        return None;
+    }
+    std::time::UNIX_EPOCH.checked_add(duration)
 }
 
 #[cfg(unix)]
@@ -678,6 +715,19 @@ mod tests {
         let after = inspect(&mut db, &fixture.repo(), false).unwrap();
         assert_eq!(before["checkoutId"], after["checkoutId"]);
         assert_ne!(before["gitInstanceId"], after["gitInstanceId"]);
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn android_birthtime_requires_kernel_support_and_a_valid_timestamp() {
+        assert!(statx_birthtime(0, 10, 0).is_none());
+        assert!(statx_birthtime(libc::STATX_BTIME, 0, 0).is_none());
+        assert!(statx_birthtime(libc::STATX_BTIME, -1, 0).is_none());
+        assert!(statx_birthtime(libc::STATX_BTIME, 10, 1_000_000_000).is_none());
+        assert_eq!(
+            statx_birthtime(libc::STATX_BTIME, 10, 42),
+            Some(std::time::UNIX_EPOCH + Duration::new(10, 42))
+        );
     }
 
     #[test]
