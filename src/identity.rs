@@ -52,14 +52,42 @@ create table if not exists ancestry_roots (
 create index if not exists ancestry_roots_by_lineage on ancestry_roots(object_format,root_oid,observation_id);
 "#;
 
-// Only distinguishes a replaced locator on this machine; never exported as an ID
-// and never used to infer continuity at another path.
+// Read-only incarnation evidence: dev:ino alone can be recycled. Never infer
+// continuity when neither an inode generation nor a birth time is available.
 fn filesystem_key(path: &Path) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let metadata = std::fs::metadata(path).ok()?;
-        Some(format!("{}:{}", metadata.dev(), metadata.ino()))
+        let directory = std::fs::File::open(path).ok()?;
+        let metadata = directory.metadata().ok()?;
+        let generation = {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                use std::os::fd::AsRawFd;
+                let mut value: libc::c_long = 0;
+                // SAFETY: GETVERSION writes one c_long into a valid initialized
+                // output, and the borrowed descriptor remains open for the call.
+                if unsafe {
+                    libc::ioctl(directory.as_raw_fd(), libc::FS_IOC_GETVERSION, &mut value)
+                } == 0
+                    && value != 0
+                {
+                    Some(value as u64)
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                None
+            }
+        };
+        incarnation_key(
+            metadata.dev(),
+            metadata.ino(),
+            generation,
+            metadata.created().ok(),
+        )
     }
     #[cfg(not(unix))]
     {
@@ -68,11 +96,34 @@ fn filesystem_key(path: &Path) -> Option<String> {
     }
 }
 
+#[cfg(unix)]
+fn incarnation_key(
+    dev: u64,
+    ino: u64,
+    generation: Option<u64>,
+    created: Option<std::time::SystemTime>,
+) -> Option<String> {
+    if let Some(generation) = generation {
+        return Some(format!("generation-v1:{dev}:{ino}:{generation}"));
+    }
+    let created = created?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    if created.is_zero() {
+        return None;
+    }
+    Some(format!(
+        "birth-v1:{dev}:{ino}:{}:{}",
+        created.as_secs(),
+        created.subsec_nanos()
+    ))
+}
+
 fn instance(db: &Connection, root: &Path) -> Result<Option<i64>> {
     let Some(common) = crate::repo::git_common_dir(root) else {
         return Ok(None);
     };
-    let key = filesystem_key(Path::new(&common));
+    let Some(key) = filesystem_key(Path::new(&common)) else {
+        return Ok(None);
+    };
     let previous: Option<(i64, Option<String>)> = db
         .query_row(
             "select instance_id,filesystem_key from git_instance_locations where common_dir=?1",
@@ -81,7 +132,7 @@ fn instance(db: &Connection, root: &Path) -> Result<Option<i64>> {
         )
         .optional()?;
     if let Some((id, previous_key)) = previous {
-        if previous_key.is_none() || previous_key == key {
+        if previous_key.as_deref() == Some(key.as_str()) {
             db.execute(
                 "update git_instance_locations set filesystem_key=?1 where instance_id=?2",
                 params![key, id],
@@ -130,7 +181,8 @@ pub fn metadata(db: &Connection, root: &Path) -> Result<Value> {
     let source_complete: Option<bool> = row.get(6)?;
     let generation: i64 = row.get(7)?;
     let live = crate::repo::git_common_dir(root);
-    if common != live
+    if key.is_none()
+        || common != live
         || common
             .as_ref()
             .is_some_and(|path| key != filesystem_key(Path::new(path)))
@@ -145,18 +197,39 @@ pub fn metadata(db: &Connection, root: &Path) -> Result<Value> {
 }
 
 pub fn inspect(db: &mut Connection, root: &Path, lineage: bool) -> Result<Value> {
+    inspect_with(db, root, lineage, ancestry)
+}
+
+fn inspect_with(
+    db: &mut Connection,
+    root: &Path,
+    lineage: bool,
+    observe: impl FnOnce(&crate::repo::Target) -> Value,
+) -> Result<Value> {
     let target = crate::repo::checkout_target(root)?;
-    let ancestry = lineage.then(|| ancestry(&target));
+    // Capture the registered instance before the potentially slow ancestry walk,
+    // but do not retain a SQLite writer lock while Git executes.
+    let expected = {
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        register(&tx, &target.root, None)?;
+        let expected = metadata(&tx, &target.root)?["gitInstanceId"].clone();
+        tx.commit()?;
+        expected
+    };
+    let observation = lineage.then(|| observe(&target));
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    register(&tx, &target.root, None)?;
     let mut output = crate::repo::checkout_identity(&target);
     output
         .as_object_mut()
         .unwrap()
         .extend(metadata(&tx, &target.root)?.as_object().unwrap().clone());
-    if let Some(ancestry) = ancestry {
-        persist_ancestry(&tx, &target.root, &ancestry)?;
-        output["ancestry"] = ancestry;
+    if let Some(observation) = observation {
+        ensure!(
+            expected.is_string() && output["gitInstanceId"] == expected,
+            "Git instance generation changed or could not be verified during ancestry inspection; retry with a stable supported filesystem"
+        );
+        persist_ancestry(&tx, &target.root, &observation)?;
+        output["ancestry"] = observation;
     }
     tx.commit()?;
     Ok(output)
@@ -575,6 +648,65 @@ mod tests {
         assert_eq!(before["checkoutId"], after["checkoutId"]);
         assert_ne!(before["gitInstanceId"], after["gitInstanceId"]);
     }
+    #[cfg(unix)]
+    #[test]
+    fn recycled_inode_requires_new_generation_or_birth_time() {
+        assert_ne!(
+            incarnation_key(1, 42, Some(100), None),
+            incarnation_key(1, 42, Some(101), None)
+        );
+        let first = std::time::UNIX_EPOCH + Duration::from_secs(10);
+        assert_ne!(
+            incarnation_key(1, 42, None, Some(first)),
+            incarnation_key(1, 42, None, Some(first + Duration::from_nanos(1)))
+        );
+        assert!(incarnation_key(1, 42, None, None).is_none());
+        assert!(incarnation_key(1, 42, None, Some(std::time::UNIX_EPOCH)).is_none());
+        let fixture = Fixture::new();
+        let mut db = fixture.db();
+        let before = inspect(&mut db, &fixture.repo(), false).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(fixture.repo().join(".git")).unwrap();
+        // A legacy dev:ino key cannot establish continuity, even with the same
+        // inode still present: it also fits a deleted/recycled directory.
+        db.execute(
+            "update git_instance_locations set filesystem_key=?1",
+            [format!("{}:{}", m.dev(), m.ino())],
+        )
+        .unwrap();
+        assert!(metadata(&db, &fixture.repo()).unwrap()["gitInstanceId"].is_null());
+        let after = inspect(&mut db, &fixture.repo(), false).unwrap();
+        assert_eq!(before["checkoutId"], after["checkoutId"]);
+        assert_ne!(before["gitInstanceId"], after["gitInstanceId"]);
+    }
+
+    #[test]
+    fn ancestry_rejects_instance_replacement_after_the_walk() {
+        let fixture = Fixture::new();
+        let mut db = fixture.db();
+        commit(&fixture.repo(), "Original ancestry fixture");
+        let result = inspect_with(&mut db, &fixture.repo(), true, |target| {
+            let old = ancestry(target);
+            assert_eq!(old["status"], "complete");
+            std::fs::rename(target.root.join(".git"), fixture.0.join("old-git")).unwrap();
+            git(&target.root, &["init", "-q"]);
+            old
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("generation changed")
+        );
+        assert_eq!(
+            db.query_row("select count(*) from ancestry_observations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(metadata(&db, &fixture.repo()).unwrap()["gitInstanceId"].is_null());
+    }
+
     #[test]
     fn sha256_roots_keep_their_object_format() {
         let fixture = Fixture::new();

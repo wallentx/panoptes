@@ -805,6 +805,15 @@ fn progress_notifications_stream_stages_and_keep_request_tokens() {
     assert!(updates.iter().any(
         |update| update["params"]["_meta"]["panoptesTiming"]["stage"] == "Waiting for index writer"
     ));
+    assert_eq!(
+        updates
+            .iter()
+            .filter(
+                |update| update["params"]["_meta"]["panoptesTiming"]["stage"] == "Querying index"
+            )
+            .count(),
+        1
+    );
     server.request(3, "ping", json!({}));
     assert!(
         server.notifications.try_recv().is_err(),
@@ -852,4 +861,54 @@ fn no_refresh_uses_captured_source_when_the_live_file_is_unreadable_as_text() {
                 .as_str()
                 .is_some_and(|source| source.contains("pub fn original")))
     );
+}
+
+#[test]
+fn failed_query_flushes_its_final_worker_phase() {
+    let fixture = Fixture::new();
+    fixture.build();
+    let mut server = Server::with_timeout(&fixture, "5");
+    let response = server.request(
+        1,
+        "tools/call",
+        json!({"name":"grep","arguments":{"pattern":"["},"_meta":{"progressToken":"failed-query"}}),
+    );
+    assert_eq!(response["error"]["code"], -32000, "{response}");
+    let timings: Vec<_> = server
+        .notifications
+        .try_iter()
+        .filter(|update| update["params"]["_meta"]["panoptesTiming"]["stage"] == "Querying index")
+        .collect();
+    assert_eq!(timings.len(), 1);
+    assert_eq!(timings[0]["params"]["progressToken"], "failed-query");
+}
+
+#[test]
+fn shared_extraction_progress_counts_misses_and_mixed_hits() {
+    for seeded in [false, true] {
+        let fixture = Fixture::new();
+        if seeded {
+            fixture.build();
+        }
+        let second = fixture.0.join("second");
+        std::fs::create_dir_all(second.join(".git")).unwrap();
+        std::fs::write(second.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::copy(fixture.0.join("repo/lib.rs"), second.join("lib.rs")).unwrap();
+        std::fs::write(second.join("fresh.rs"), "pub fn newly_added() {}\n").unwrap();
+        let mut server = Server::with_timeout(&fixture, "5");
+        let response = server.request(1,"tools/call",json!({"name":"find","arguments":{"query":"newly_added","repo":second},"_meta":{"progressToken":"lookup"}}));
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let messages: Vec<_> = server
+            .notifications
+            .try_iter()
+            .filter_map(|v| v["params"]["message"].as_str().map(str::to_string))
+            .filter(|m| m.starts_with("Looking up shared extractions "))
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("Looking up shared extractions 2/2")),
+            "seeded={seeded}: {messages:?}"
+        );
+    }
 }

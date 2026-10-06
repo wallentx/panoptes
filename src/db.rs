@@ -247,7 +247,7 @@ pub fn reset_repo(db: &Connection, root: &Path) -> Result<bool> {
 
 /// Remove graphs and identities together, preserving a reusable store.
 pub fn clear(db: &Connection) -> Result<i64> {
-    let tx = db.unchecked_transaction()?;
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
     let count = tx.query_row(
         "select count(*) from checkouts where snapshot_id is not null",
         [],
@@ -730,6 +730,37 @@ mod tests {
         }
         assert_eq!(integrity(&db).unwrap(), "ok");
         seed_repo(&db);
+    }
+
+    #[test]
+    fn failed_clear_rolls_back_graphs_and_identity_metadata_together() {
+        let (_g, db) = temp_db();
+        let graph = seed_repo(&db);
+        db.execute("insert into git_instances default values", [])
+            .unwrap();
+        let instance = db.last_insert_rowid();
+        db.execute(
+            "update checkouts set instance_id=?1 where snapshot_id=?2",
+            rusqlite::params![instance, graph],
+        )
+        .unwrap();
+        db.execute_batch("create trigger reject_instance_delete before delete on git_instances begin select raise(abort,'injected clear failure'); end;").unwrap();
+        assert!(clear(&db).is_err());
+        assert_eq!(
+            db.query_row(
+                "select snapshot_id from checkouts where root='/src/demo'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            graph
+        );
+        assert!(
+            db.query_row("select count(*) from symbols", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+                > 0
+        );
+        assert_eq!(integrity(&db).unwrap(), "ok");
     }
 
     #[test]
