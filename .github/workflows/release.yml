@@ -248,3 +248,18 @@ jobs:
             release/*.tar.gz
             release/*.tar.gz.sha256
             release/SHA256SUMS
+
+      - name: Request Homebrew formula update
+        if: needs.prepare.outputs.prerelease != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo '::notice::Homebrew will update through the tap scheduled workflow; set HOMEBREW_TAP_TOKEN for immediate dispatch.'
+            printf '%s\n' 'Homebrew: the tap polls completed stable releases every 15 minutes (GitHub scheduling can be delayed).' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh workflow run update-panoptes.yml \
+            --repo wallentx/homebrew-tap --ref wallentx/tap \
+            --field "version=$RELEASE_TAG"

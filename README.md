@@ -370,3 +370,20 @@ indexing remain usable. Legacy inode-only registrations are re-established on
 explicit registration, preserving the checkout ID while assigning a new Git
 instance ID. Ancestry inspection captures the registered instance before the
 walk and rejects persistence if its generation or registration changes.
+
+
+### Homebrew release updates
+
+After publishing a stable release, `.github/workflows/release.yml` requests the
+`update-panoptes.yml` workflow in `wallentx/homebrew-tap` when the optional
+`HOMEBREW_TAP_TOKEN` secret is available. Use a token with Actions write access to
+that tap for immediate dispatch; the source repository's `GITHUB_TOKEN` cannot
+write to another repository.
+
+Without that secret, the tap still updates automatically through its 15-minute
+schedule (subject to GitHub scheduling delays). Its updater waits for all four
+archives and `SHA256SUMS`, verifies checksums and embedded release metadata, and
+then updates the formula and dispatches the tap's four-platform install tests.
+A release with missing or failed assets is not promoted. See the
+[tap maintenance instructions](https://github.com/wallentx/homebrew-tap#maintain-the-formula)
+for a manual retry.
