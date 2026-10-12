@@ -242,7 +242,8 @@ jobs:
           tag_name: ${{ needs.prepare.outputs.release_tag }}
           target_commitish: ${{ needs.prepare.outputs.checkout_ref }}
           prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
-          generate_release_notes: true
+          # Preserve curated notes when rebuilding/reuploading an existing tag.
+          generate_release_notes: ${{ needs.prepare.outputs.existing_tag != 'true' }}
           fail_on_unmatched_files: true
           files: |
             release/*.tar.gz
