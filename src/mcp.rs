@@ -18,11 +18,14 @@ const MAX_MESSAGE: usize = 1024 * 1024;
 const MAX_OUTPUT: usize = 1024 * 1024;
 const TOKEN_CHARS: u64 = 4;
 const SAVINGS_LABEL: &str = "ꙮ Estimated tokens saved for this session";
+const SAVINGS_BASIS: &str =
+    "4 source bytes or output characters/token vs whole matched files; estimate, not billing";
 
 #[derive(Default)]
 struct SessionStats {
     estimated_tokens_saved: u64,
     calls_with_savings: u64,
+    compact: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -32,9 +35,15 @@ struct ToolData {
     baseline_files: usize,
 }
 
-pub fn serve(store: &Path, start: &Path, no_refresh: bool, timeout: Duration) -> Result<()> {
+pub fn serve(
+    store: &Path,
+    start: &Path,
+    no_refresh: bool,
+    timeout: Duration,
+    compact: bool,
+) -> Result<()> {
     let targets = repo::automatic_targets(start)?;
-    server::serve(store, &targets, no_refresh, timeout)
+    server::serve(store, &targets, no_refresh, timeout, compact)
 }
 
 fn write_response(output: &mut impl Write, response: Value) -> Result<()> {
@@ -69,7 +78,7 @@ fn dispatch(
             let instructions = if targets.is_empty() {
                 "Panoptes started without indexing because the current directory is not a Git repository or a workspace containing at least two immediate Git repositories. Pass an absolute Git checkout path as repo on tool calls, or start the coding agent inside a repository to enable Panoptes source navigation."
             } else {
-                "Prefer Panoptes before built-in grep, search, or whole-file reads for indexed source; one focused call usually replaces several reads. Use find for where/how questions (bounded source is included by default), grep when every occurrence matters, callers for incoming/outgoing dependency and blast-radius tracing, skeleton for a file API, and map for orientation. For a scoped question, start with one find or grep rather than map, and treat three Panoptes calls as the normal task budget. Work from returned paths and spans; do not repeat find to reconstruct individual files, and fall back only when indexed context is insufficient. Retrieval results include an honest four-characters-per-token estimate versus reading matched files whole plus an MCP-session total. When Panoptes was used, end the response with the provided session savings display in the form `ꙮ Estimated tokens saved for this session: 1,231,578`; treat it as an estimate, never as billing. Panoptes indexes the selected checkout on demand and refreshes changed source before answers. For a PR worktree, pass its absolute path as repo on every call; changing a shell cwd does not retarget this connection. Use worktrees to discover checkouts created after connection. Identical requests already in flight share one operation and progress stream; wait for completion rather than issuing duplicates. The timeout measures 30 seconds without meaningful progress, not total elapsed time. Freshness and worktrees are observational."
+                "Use find for ranked context, grep for exhaustive matches, callers for graph tracing, and skeleton for file APIs. Start with one focused find or grep; narrow with in before expanding. Pass repo as an absolute checkout path. Queries refresh on demand; worktrees and freshness are observational. Wait for in-flight calls: timeouts measure inactivity. When reporting savings, use the supplied sessionSavingsDisplay estimate, not billing tokens."
             };
             Ok(json!({
                 "protocolVersion":"2024-11-05",
@@ -98,27 +107,96 @@ const DEFAULT_FIND_LIMIT: usize = 5;
 fn tool_response(output: ToolData, session: &mut SessionStats) -> Result<Value> {
     let data = add_savings(output, session)?;
     Ok(json!({
-        "content":[{"type":"text", "text":serde_json::to_string(&data)?}],
+        "content":[{"type":"text", "text":response_text(&data, session.compact)?}],
         "structuredContent":data,
         "isError":false
     }))
+}
+
+/// Compact mode is an explicit adapter choice. Full machine-readable metadata
+/// stays in structuredContent; ordinary clients retain the existing JSON text.
+fn response_text(data: &Value, compact: bool) -> Result<String> {
+    if !compact {
+        return Ok(serde_json::to_string(data)?);
+    }
+    let Some(repositories) = data.get("repositories").and_then(Value::as_object) else {
+        return Ok(serde_json::to_string(data)?);
+    };
+    let mut text = String::new();
+    for (label, result) in repositories {
+        text.push_str(&format!("Repository {}", serde_json::to_string(label)?));
+        if let Some(checkout) = data
+            .get("panoptesCheckouts")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|c| {
+                    c["label"].as_str() == Some(label) || c["root"].as_str() == Some(label)
+                })
+            })
+        {
+            text.push_str(&format!(" {}", serde_json::to_string(&checkout["root"])?));
+        }
+        text.push('\n');
+        if result.get("mode").is_some()
+            && let Some(hits) = result.get("hits").and_then(Value::as_array)
+        {
+            if let Some(note) = result.get("note").and_then(Value::as_str) {
+                text.push_str(note);
+                text.push('\n');
+            }
+            if hits.is_empty() {
+                text.push_str("No matches.\n");
+            }
+            for hit in hits {
+                text.push_str(&format!(
+                    "{}:{}-{} {} {}\n",
+                    serde_json::to_string(&hit["path"])?,
+                    hit["start_line"],
+                    hit["end_line"],
+                    hit["kind"].as_str().unwrap_or(""),
+                    serde_json::to_string(&hit["name"])?
+                ));
+                if let Some(source) = hit.get("source").and_then(Value::as_str) {
+                    text.push_str(source);
+                    text.push('\n');
+                } else if let Some(signature) = hit.get("signature").and_then(Value::as_str) {
+                    text.push_str(signature);
+                    text.push('\n');
+                }
+            }
+        } else {
+            text.push_str(&serde_json::to_string(result)?);
+            text.push('\n');
+        }
+    }
+    if let Some(scope) = data.get("panoptesScope") {
+        text.push_str(&serde_json::to_string(scope)?);
+        text.push('\n');
+    }
+    if let Some(display) = data
+        .pointer("/panoptesSavings/sessionSavingsDisplay")
+        .and_then(Value::as_str)
+    {
+        text.push_str(display);
+    }
+    Ok(text)
 }
 
 fn tool_schemas() -> Vec<Value> {
     vec![
         schema(
             "find",
-            "Start here for where/how questions. Returns ranked definitions with exact spans, signatures, graph context, and bounded source excerpts for the top 5 matches by default. Narrow with in; request a larger limit or full=true only when needed.",
+            "Find ranked definitions with source and exact spans; 5 hits by default. Narrow with in; full=true expands source.",
             &["query"],
         ),
         schema(
             "grep",
-            "Use when every textual occurrence matters. Exhaustively searches indexed source and groups regex or literal matches under their enclosing definitions.",
+            "Find every regex/literal occurrence, grouped by enclosing definition.",
             &["pattern"],
         ),
         schema(
             "callers",
-            "Trace incoming callers or outgoing dependencies for a symbol. Use this for dependency chains, impact analysis, and blast radius instead of searching names manually.",
+            "Trace incoming callers or outgoing dependencies of a symbol.",
             &["symbol"],
         ),
         schema(
@@ -128,7 +206,7 @@ fn tool_schemas() -> Vec<Value> {
         ),
         schema(
             "map",
-            "Orient in an unfamiliar repository using directory clusters, dependency hubs, and hotspots before making a narrower query.",
+            "Show directory clusters, dependency hubs, and hotspots for orientation.",
             &[],
         ),
         schema(
@@ -138,12 +216,12 @@ fn tool_schemas() -> Vec<Value> {
         ),
         schema(
             "worktrees",
-            "Discover live Git checkouts and their branch/HEAD identity without indexing; includes worktrees created after connection.",
+            "List live Git checkouts and branch/HEAD identity without indexing.",
             &[],
         ),
         schema(
             "freshness",
-            "Observe differences between indexed and live source without triggering a rebuild.",
+            "Compare indexed and live source without rebuilding.",
             &[],
         ),
     ]
@@ -153,12 +231,12 @@ fn schema(name: &str, description: &str, required: &[&str]) -> Value {
     let mut properties = match name {
         "find" => {
             json!({
-                "query":{"type":"string", "description":"Natural-language or structural code question."},
-                "limit":{"type":"integer", "minimum":1, "default":DEFAULT_FIND_LIMIT, "description":"Maximum ranked definitions per checkout; defaults to 5. Increase only when more matches are needed."},
+                "query":{"type":"string", "description":"Code question or symbol name."},
+                "limit":{"type":"integer", "minimum":1, "default":DEFAULT_FIND_LIMIT, "description":"Maximum matches per checkout (default 5)."},
                 "in":{"type":"string", "description":"Optional repository-relative path scope."},
-                "source":{"type":"boolean", "default":true, "description":"Include excerpts of at most 8 lines and 1024 UTF-8 bytes each; defaults to true."},
-                "full":{"type":"boolean", "default":false, "description":"Return each complete matched definition instead of the bounded excerpt."},
-                "repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}
+                "source":{"type":"boolean", "default":true, "description":"Include source, at most 8 lines/1 KiB unless full=true."},
+                "full":{"type":"boolean", "default":false, "description":"Include full definitions."},
+                "repo":{"type":"string", "description":"Absolute checkout path or unique label; omit for startup targets."}
             })
         }
         "grep" => {
@@ -167,7 +245,7 @@ fn schema(name: &str, description: &str, required: &[&str]) -> Value {
                 "fixed":{"type":"boolean", "default":false, "description":"Treat pattern as literal text."},
                 "ignoreCase":{"type":"boolean", "default":false, "description":"Match without case sensitivity."},
                 "in":{"type":"string", "description":"Optional repository-relative path scope."},
-                "repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}
+                "repo":{"type":"string", "description":"Absolute checkout path or unique label; omit for startup targets."}
             })
         }
         "callers" => {
@@ -176,20 +254,20 @@ fn schema(name: &str, description: &str, required: &[&str]) -> Value {
                 "direction":{"enum":["in","out"], "default":"in", "description":"in finds callers; out finds dependencies called by the symbol."},
                 "depth":{"type":"integer", "minimum":1, "maximum":32, "default":1, "description":"Maximum graph traversal depth."},
                 "in":{"type":"string", "description":"Optional repository-relative path scope."},
-                "repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}
+                "repo":{"type":"string", "description":"Absolute checkout path or unique label; omit for startup targets."}
             })
         }
         "skeleton" => json!({
             "file":{"type":"string", "description":"Repository-relative file path or unique filename."},
-            "repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}
+            "repo":{"type":"string", "description":"Absolute checkout path or unique label; omit for startup targets."}
         }),
         _ => {
-            json!({"repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}})
+            json!({"repo":{"type":"string", "description":"Absolute checkout path or unique label; omit for startup targets."}})
         }
     };
     if !matches!(name, "freshness" | "worktrees") {
-        properties["scope"] = json!({"type":"string","enum":["checkout","repository","lineage"],"default":"checkout","description":"Expand to registered live checkouts in one Git instance or one explicitly verified ancestry root."});
-        properties["lineageRoot"] = json!({"type":"string","description":"Required for lineage scope: sha1:<root-oid> or sha256:<root-oid>. Observe ancestry first with panoptes identity PATH --lineage."});
+        properties["scope"] = json!({"type":"string","enum":["checkout","repository","lineage"],"default":"checkout","description":"Expand to registered checkouts in one Git instance or verified lineage."});
+        properties["lineageRoot"] = json!({"type":"string","description":"For lineage: sha1:OID or sha256:OID. Run panoptes identity PATH --lineage first."});
     }
     json!({
         "name":name,
@@ -517,8 +595,11 @@ fn add_savings(mut output: ToolData, session: &mut SessionStats) -> Result<Value
         return Ok(output.value);
     }
     let baseline_tokens = estimated_tokens(output.baseline_bytes);
-    let mut payload_tokens =
-        estimated_tokens(serde_json::to_string(&output.value)?.chars().count() as u64);
+    let mut payload_tokens = estimated_tokens(
+        response_text(&output.value, session.compact)?
+            .chars()
+            .count() as u64,
+    );
     let mut saved = baseline_tokens.saturating_sub(payload_tokens);
 
     for _ in 0..4 {
@@ -533,15 +614,18 @@ fn add_savings(mut output: ToolData, session: &mut SessionStats) -> Result<Value
             "sessionEstimatedTokensSaved":session_total,
             "sessionCallsWithSavings":session_calls,
             "sessionSavingsDisplay":session_savings_display(session_total),
-            "basis":"estimate at four UTF-8 source bytes or output characters per token versus reading matched source files whole; not model billing"
+            "basis":SAVINGS_BASIS
         });
         output
             .value
             .as_object_mut()
             .context("tool output must be an object")?
             .insert("panoptesSavings".to_string(), metadata);
-        let next_payload_tokens =
-            estimated_tokens(serde_json::to_string(&output.value)?.chars().count() as u64);
+        let next_payload_tokens = estimated_tokens(
+            response_text(&output.value, session.compact)?
+                .chars()
+                .count() as u64,
+        );
         let next_saved = baseline_tokens.saturating_sub(next_payload_tokens);
         if next_payload_tokens == payload_tokens && next_saved == saved {
             break;
@@ -563,7 +647,7 @@ fn add_savings(mut output: ToolData, session: &mut SessionStats) -> Result<Value
         "sessionEstimatedTokensSaved":session.estimated_tokens_saved,
         "sessionCallsWithSavings":session.calls_with_savings,
         "sessionSavingsDisplay":session_savings_display(session.estimated_tokens_saved),
-        "basis":"estimate at four UTF-8 source bytes or output characters per token versus reading matched source files whole; not model billing"
+        "basis":SAVINGS_BASIS
     });
     output
         .value
@@ -1103,6 +1187,65 @@ mod tests {
         assert_eq!(
             response["structuredContent"]["panoptesSavings"]["responseTokens"],
             estimated_tokens(text.chars().count() as u64)
+        );
+    }
+
+    #[test]
+    fn compact_text_keeps_evidence_and_full_structured_metadata() {
+        let (_temp, store, target) = fixture("compact-agent");
+        std::fs::write(
+            target.root.join("lib.rs"),
+            format!("pub fn original() {{}}\n{}", "// padding\n".repeat(400)),
+        )
+        .unwrap();
+        let args = json!({"name":"find","arguments":{"query":"original"}});
+        let mut compact = SessionStats {
+            compact: true,
+            ..SessionStats::default()
+        };
+        let result = dispatch(
+            &store,
+            std::slice::from_ref(&target),
+            "tools/call",
+            &args,
+            false,
+            &mut compact,
+        )
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("lib.rs"));
+        assert!(text.contains("pub fn original()"));
+        assert!(text.contains("1-1"));
+        assert!(text.contains("Estimated tokens saved"));
+        assert!(!text.contains("baselineTokens"));
+        assert!(result["structuredContent"]["panoptesCheckouts"][0]["checkoutId"].is_string());
+        assert_eq!(
+            result["structuredContent"]["panoptesSavings"]["responseTokens"],
+            estimated_tokens(text.chars().count() as u64)
+        );
+        assert!(
+            text.len()
+                < serde_json::to_string(&result["structuredContent"])
+                    .unwrap()
+                    .len()
+        );
+        let ordinary = dispatch(
+            &store,
+            &[target],
+            "tools/call",
+            &args,
+            false,
+            &mut SessionStats::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(ordinary["content"][0]["text"].as_str().unwrap())
+                .unwrap(),
+            ordinary["structuredContent"]
+        );
+        assert_eq!(
+            ordinary["structuredContent"]["repositories"],
+            result["structuredContent"]["repositories"]
         );
     }
 
