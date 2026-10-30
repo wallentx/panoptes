@@ -9,7 +9,9 @@ description: Use Panoptes MCP for coding tasks that require locating, understand
 
 Use Panoptes first when the task depends on indexed source. One focused call can
 replace several searches and whole-file reads while still returning exact paths,
-line spans, signatures, and bounded source.
+line spans, signatures, and bounded source. `find` defaults to five matches, with
+excerpts capped at eight lines and 1 KiB each. Narrow with `in` before increasing
+`limit`; use `full=true` only when the complete definition is needed.
 
 ## Choose the tool
 

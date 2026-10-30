@@ -192,12 +192,19 @@ clients so they use the newly installed executable.
 
 | Tool | Purpose |
 | --- | --- |
-| `find` | Ranked code context for a question |
+| `find` | Ranked code context; five matches by default, with bounded excerpts |
 | `grep` | Every regex or literal occurrence |
 | `callers` | Incoming or outgoing dependency paths |
 | `skeleton` | Every signature in one file |
 | `map` | Repository structure, hubs, and hotspots |
 | `status` | Index state and estimated context savings |
+
+MCP `find` defaults to five ranked matches per checkout. Source excerpts remain
+on by default and are limited to eight lines and 1 KiB of UTF-8 per match; a
+truncation marker identifies byte-limited excerpts. Use `in` to narrow a query,
+an explicit `limit` for more matches, or `full=true` for complete definitions.
+`source=false` omits excerpts. Symbol spans always describe the full definition.
+MCP text responses use compact JSON and retain the same structured fields.
 
 The same operations are available directly from the CLI:
 

@@ -304,6 +304,9 @@ fn is_test_path(path: &str) -> bool {
         || file.contains("_test.")
 }
 
+pub(crate) const MAX_EXCERPT_BYTES: usize = 1024;
+const EXCERPT_TRUNCATED: &str = "\n[excerpt truncated; use full=true]";
+
 fn source_excerpt(
     db: &Connection,
     snapshot: i64,
@@ -318,14 +321,21 @@ fn source_excerpt(
     if !full {
         end = end.min(start + 7);
     }
-    Some(
-        text.lines()
-            .enumerate()
-            .filter(|(index, _)| start <= index + 1 && *index < end)
-            .map(|(_, line)| line)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+    let mut excerpt = text
+        .lines()
+        .skip(start - 1)
+        .take(end - start + 1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !full && excerpt.len() > MAX_EXCERPT_BYTES {
+        let mut boundary = MAX_EXCERPT_BYTES - EXCERPT_TRUNCATED.len();
+        while !excerpt.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        excerpt.truncate(boundary);
+        excerpt.push_str(EXCERPT_TRUNCATED);
+    }
+    Some(excerpt)
 }
 
 #[cfg(test)]
