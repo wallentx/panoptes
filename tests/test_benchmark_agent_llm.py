@@ -90,6 +90,20 @@ class BenchmarkIntegrityTests(unittest.TestCase):
             self.assertEqual(bench.tool_read_file(root, {'path': 'file.txt', 'offset': 2, 'limit': 2}, None), '2: beta\n3: gamma')
             self.assertEqual(bench.MAX_READ_LINES, 2000)
 
+    def test_directory_tools_support_aliased_worktree_roots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp)
+            actual = parent / "private" / "actual"
+            root = actual / "worktree"
+            root.mkdir(parents=True)
+            (root / "inside.txt").write_text("SAFE_ROOT_MARKER\n", encoding="utf-8")
+            (parent / "alias").symlink_to(actual, target_is_directory=True)
+            aliased = parent / "alias" / "worktree"
+            grep = bench.tool_grep_files(str(aliased), {"pattern":"SAFE_ROOT_MARKER"}, None)
+            self.assertEqual(grep, "inside.txt:1:SAFE_ROOT_MARKER")
+            self.assertEqual(bench.tool_glob_files(str(aliased), {"pattern":"*.txt"}, None), "inside.txt")
+            self.assertIn("SAFE_ROOT_MARKER", bench.tool_read_file(str(aliased), {"path":"inside.txt"}, None))
+
     def test_directory_tools_skip_escaping_symlinks_and_keep_internal_file_aliases(self):
         if not hasattr(os, 'symlink'):
             self.skipTest('symlinks are not supported')

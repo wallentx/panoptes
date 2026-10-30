@@ -382,6 +382,8 @@ def iter_files(worktree, subpath):
 
 
 def tool_grep_files(worktree, arguments, events):
+    # Match the canonical paths produced by traversal (e.g. macOS /private/var).
+    worktree = os.path.realpath(worktree)
     pattern = arguments.get("pattern")
     if not isinstance(pattern, str) or not pattern:
         return "error: pattern is required"
@@ -421,6 +423,7 @@ def tool_grep_files(worktree, arguments, events):
 
 
 def tool_glob_files(worktree, arguments, events):
+    worktree = os.path.realpath(worktree)
     pattern = arguments.get("pattern")
     if not isinstance(pattern, str) or not pattern:
         return "error: pattern is required"
