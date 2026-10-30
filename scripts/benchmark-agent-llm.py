@@ -95,10 +95,10 @@ SYSTEM_PROMPT = (
 
 
 def load_credentials(args):
-    if args.base_url and args.api_key:
-        return args.base_url.rstrip("/"), args.api_key
-    base = os.environ.get("OPENAI_BASE_URL")
-    key = os.environ.get("OPENAI_API_KEY")
+    # Each option has its own precedence; a partial CLI override must not be
+    # discarded just because the environment supplies a complete pair.
+    base = args.base_url or os.environ.get("OPENAI_BASE_URL")
+    key = args.api_key or os.environ.get("OPENAI_API_KEY")
     if base and key:
         return base.rstrip("/"), key
     token_file = os.path.expanduser("~/.ssh/tokens/glm53")
@@ -114,8 +114,8 @@ def load_credentials(args):
                     values[match.group(1)] = value
     except OSError:
         pass
-    base = args.base_url or values.get("OPENAI_BASE_URL")
-    key = args.api_key or values.get("OPENAI_API_KEY")
+    base = base or values.get("OPENAI_BASE_URL")
+    key = key or values.get("OPENAI_API_KEY")
     if not base or not key:
         sys.exit("no endpoint credentials: pass --base-url/--api-key, set OPENAI_BASE_URL/OPENAI_API_KEY, "
                   "or create ~/.ssh/tokens/glm53")
@@ -246,7 +246,7 @@ class Endpoint:
 
 class PanoptesMcp:
     def __init__(self, binary, store, worktree, compact=False):
-        self.prefix = "panoptes."
+        self.prefix = "panoptes_"
         command = [binary, "--store", store, "mcp", worktree]
         if compact:
             command.append("--compact")
@@ -326,6 +326,8 @@ def safe_path(worktree, relative):
     candidate = os.path.realpath(os.path.join(worktree, relative))
     if candidate != root and not candidate.startswith(root + os.sep):
         raise ValueError("path escapes the worktree: %s" % relative)
+    if ".git" in os.path.relpath(candidate, root).split(os.sep):
+        raise ValueError("path enters Git metadata: %s" % relative)
     return candidate
 
 
@@ -361,12 +363,22 @@ def tool_read_file(worktree, arguments, events):
 def iter_files(worktree, subpath):
     root = safe_path(worktree, subpath)
     if os.path.isfile(root):
-        yield root
+        yield os.path.join(worktree, subpath), root
         return
-    for current, dirnames, filenames in os.walk(root):
+    for current, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = sorted(d for d in dirnames if d != ".git")
         for filename in sorted(filenames):
-            yield os.path.join(current, filename)
+            discovered = os.path.join(current, filename)
+            try:
+                # A safe search root does not establish containment for each
+                # symlinked file discovered below it. Open only checked targets.
+                resolved = safe_path(worktree, os.path.relpath(discovered, worktree))
+                if not os.path.isfile(resolved):
+                    continue
+            except (OSError, ValueError):
+                continue
+            display = os.path.join(worktree, subpath, os.path.relpath(discovered, root))
+            yield display, resolved
 
 
 def tool_grep_files(worktree, arguments, events):
@@ -385,11 +397,11 @@ def tool_grep_files(worktree, arguments, events):
     except (OSError, ValueError) as exc:
         return "error: %s" % exc
     matches = []
-    for filepath in files:
+    for filepath, resolved in files:
         if include and not fnmatch.fnmatch(os.path.basename(filepath), include):
             continue
         try:
-            with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
+            with open(resolved, "r", encoding="utf-8", errors="replace") as handle:
                 if "\0" in handle.read(4096):
                     continue
                 handle.seek(0)
@@ -413,20 +425,17 @@ def tool_glob_files(worktree, arguments, events):
     if not isinstance(pattern, str) or not pattern:
         return "error: pattern is required"
     subpath = arguments.get("path") or "."
-    try:
-        root = safe_path(worktree, subpath)
-    except (OSError, ValueError) as exc:
-        return "error: %s" % exc
     matches = []
-    for current, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d != ".git")
-        for filename in sorted(filenames):
-            relative = os.path.relpath(os.path.join(current, filename), worktree)
+    try:
+        for display, _resolved in iter_files(worktree, subpath):
+            relative = os.path.relpath(display, worktree)
             if fnmatch.fnmatch(relative, pattern):
                 matches.append(relative)
                 if len(matches) >= MAX_GLOB_MATCHES:
                     matches.append("(stopped at %d matches)" % MAX_GLOB_MATCHES)
                     return "\n".join(matches)
+    except (OSError, ValueError) as exc:
+        return "error: %s" % exc
     return "\n".join(matches) if matches else "(no matches)"
 
 
@@ -555,7 +564,8 @@ def run_one(endpoint, task, prompt, arm, trial, effort, worktree, mcp, events_pa
                     "tool_calls": [{"name": c.get("function", {}).get("name"),
                                     "arguments": c.get("function", {}).get("arguments")}
                                    for c in tool_calls],
-                    "usage": usage, "endpoint_elapsed_ms": endpoint_elapsed_ms})
+                    "usage": usage, "endpoint_elapsed_ms": endpoint_elapsed_ms,
+                    "finish_reason": choice.get("finish_reason")})
             replay = {"role": "assistant", "content": content}
             if tool_calls:
                 replay["tool_calls"] = [
@@ -564,8 +574,16 @@ def run_one(endpoint, task, prompt, arm, trial, effort, worktree, mcp, events_pa
                                   "arguments": call.get("function", {}).get("arguments") or "{}"}}
                     for call in tool_calls]
             messages.append(replay)
-            if not tool_calls:
-                answer = (content or "").strip()
+            finish_reason = choice.get("finish_reason")
+            if tool_calls:
+                if finish_reason not in ("tool_calls", "stop"):
+                    raise RuntimeError("incomplete tool-call response: finish_reason=%r" % finish_reason)
+            else:
+                if finish_reason != "stop":
+                    raise RuntimeError("incomplete final response: finish_reason=%r" % finish_reason)
+                if not isinstance(content, str) or not content.strip():
+                    raise RuntimeError("empty final response")
+                answer = content.strip()
                 break
             for call in tool_calls:
                 tool_started = time.monotonic()
@@ -865,10 +883,10 @@ def main():
                             s[2] = max(s[2], e["output_chars"])
         print("\nquick find-bloat comparison (%s, 1 trial, effort %s):" % (args.task, "/".join(efforts)))
         for arm in ("baseline", "panoptes"):
-            if not any((arm, n) in tools for n in ("panoptes.find", "panoptes.grep", "panoptes.map", "read_file", "grep_files", "glob_files")):
+            if not any((arm, n) in tools for n in ("panoptes_find", "panoptes_grep", "panoptes_map", "read_file", "grep_files", "glob_files")):
                 continue
             row = []
-            for name in ("panoptes.find", "panoptes.grep", "panoptes.map", "read_file", "grep_files", "glob_files"):
+            for name in ("panoptes_find", "panoptes_grep", "panoptes_map", "read_file", "grep_files", "glob_files"):
                 if (arm, name) in tools:
                     c, t, m = tools[(arm, name)]
                     row.append("%s:%d/%.1fk/%d" % (name, c, t / c / 1000, m))

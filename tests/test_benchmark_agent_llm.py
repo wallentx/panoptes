@@ -90,6 +90,182 @@ class BenchmarkIntegrityTests(unittest.TestCase):
             self.assertEqual(bench.tool_read_file(root, {'path': 'file.txt', 'offset': 2, 'limit': 2}, None), '2: beta\n3: gamma')
             self.assertEqual(bench.MAX_READ_LINES, 2000)
 
+    def test_directory_tools_skip_escaping_symlinks_and_keep_internal_file_aliases(self):
+        if not hasattr(os, 'symlink'):
+            self.skipTest('symlinks are not supported')
+        with tempfile.TemporaryDirectory() as base:
+            corpus = Path(base, 'corpus'); corpus.mkdir()
+            outside = Path(base, 'host'); outside.mkdir()
+            secret = 'PRIVATE_HOST_CONTENT_DO_NOT_EXPOSE'
+            (outside / 'secret.txt').write_text(secret + '\n')
+            (corpus / 'real.txt').write_text('ALLOWED_CORPUS_CONTENT\n')
+            (corpus / 'inside.txt').symlink_to(corpus / 'real.txt')
+            (corpus / 'escape.txt').symlink_to(outside / 'secret.txt')
+            (corpus / 'escape-dir').symlink_to(outside, target_is_directory=True)
+            grep = bench.tool_grep_files(str(corpus), {'pattern': 'CONTENT|EXPOSE'}, None)
+            self.assertIn('ALLOWED_CORPUS_CONTENT', grep)
+            self.assertIn('inside.txt:1:', grep)
+            self.assertNotIn(secret, grep)
+            self.assertNotIn('escape', grep)
+            glob = bench.tool_glob_files(str(corpus), {'pattern': '*.txt'}, None)
+            self.assertIn('inside.txt', glob.splitlines())
+            self.assertNotIn('escape.txt', glob.splitlines())
+            self.assertNotIn('escape-dir/secret.txt', glob.splitlines())
+            for path in ('escape.txt', 'escape-dir', str(outside / 'secret.txt')):
+                with self.subTest(path=path):
+                    result = bench.tool_grep_files(str(corpus), {'pattern': '.', 'path': path}, None)
+                    self.assertNotIn(secret, result)
+                    self.assertTrue(result.startswith('error:') or result == '(no matches)', result)
+                    result = bench.tool_glob_files(str(corpus), {'pattern': '*', 'path': path}, None)
+                    self.assertNotIn(secret, result)
+                    self.assertTrue(result.startswith('error:') or result == '(no matches)', result)
+
+    def test_directory_aliases_keep_display_paths_and_git_metadata_is_private(self):
+        if not hasattr(os, 'symlink'):
+            self.skipTest('symlinks are not supported')
+        with tempfile.TemporaryDirectory() as base:
+            corpus = Path(base, 'corpus'); corpus.mkdir()
+            actual = corpus / 'directory'; actual.mkdir()
+            (actual / 'child.txt').write_text('VISIBLE_DIRECTORY_CONTENT\n')
+            (corpus / 'directory-alias').symlink_to(actual, target_is_directory=True)
+            git = corpus / '.git'; git.mkdir()
+            credential = 'FAKE_GIT_CONFIG_CREDENTIAL'
+            (git / 'config').write_text(credential + '\n')
+            (corpus / 'metadata-alias.txt').symlink_to(git / 'config')
+            (corpus / 'metadata-dir').symlink_to(git, target_is_directory=True)
+            result = bench.tool_grep_files(str(corpus), {'path': 'directory-alias', 'pattern': 'VISIBLE'}, None)
+            self.assertIn('directory-alias/child.txt:1:VISIBLE_DIRECTORY_CONTENT', result)
+            self.assertEqual(bench.tool_glob_files(str(corpus), {'path': 'directory-alias', 'pattern': '*.txt'}, None), 'directory-alias/child.txt')
+            for path in ('.', '.git', '.git/config', 'metadata-alias.txt', 'metadata-dir'):
+                with self.subTest(path=path):
+                    result = bench.tool_grep_files(str(corpus), {'path': path, 'pattern': '.'}, None)
+                    self.assertNotIn(credential, result)
+                    self.assertNotIn(credential, bench.tool_read_file(str(corpus), {'path': path}, None))
+            names = bench.tool_glob_files(str(corpus), {'pattern': '*'}, None).splitlines()
+            self.assertNotIn('.git/config', names)
+            self.assertNotIn('metadata-alias.txt', names)
+            self.assertNotIn('metadata-dir/config', names)
+
+    def test_credentials_resolve_each_field_in_cli_environment_file_order(self):
+        token = 'OPENAI_BASE_URL=https://file.invalid/v1/\nOPENAI_API_KEY=file-key\n'
+        cases = [
+            # Explicit partial overrides must win even with a complete env pair.
+            ('https://cli.invalid/v1/', None, {'OPENAI_BASE_URL': 'https://env.invalid/v1/', 'OPENAI_API_KEY': 'env-key'}, ('https://cli.invalid/v1', 'env-key'), False),
+            (None, 'cli-key', {'OPENAI_BASE_URL': 'https://env.invalid/v1/', 'OPENAI_API_KEY': 'env-key'}, ('https://env.invalid/v1', 'cli-key'), False),
+            # Missing env fields come from the file without discarding env values.
+            (None, None, {'OPENAI_BASE_URL': 'https://env.invalid/v1/'}, ('https://env.invalid/v1', 'file-key'), True),
+            (None, None, {'OPENAI_API_KEY': 'env-key'}, ('https://file.invalid/v1', 'env-key'), True),
+            ('https://cli.invalid/v1/', None, {}, ('https://cli.invalid/v1', 'file-key'), True),
+            (None, 'cli-key', {}, ('https://file.invalid/v1', 'cli-key'), True),
+            (None, None, {}, ('https://file.invalid/v1', 'file-key'), True),
+            ('https://cli.invalid/v1/', 'cli-key', {'OPENAI_BASE_URL': 'https://env.invalid/v1/', 'OPENAI_API_KEY': 'env-key'}, ('https://cli.invalid/v1', 'cli-key'), False),
+            (None, None, {'OPENAI_BASE_URL': 'https://env.invalid/v1/', 'OPENAI_API_KEY': 'env-key'}, ('https://env.invalid/v1', 'env-key'), False),
+            ('https://cli.invalid/v1/', None, {'OPENAI_API_KEY': 'env-key'}, ('https://cli.invalid/v1', 'env-key'), False),
+            (None, 'cli-key', {'OPENAI_BASE_URL': 'https://env.invalid/v1/'}, ('https://env.invalid/v1', 'cli-key'), False),
+        ]
+        for cli_base, cli_key, environment, expected, reads_file in cases:
+            args = bench.argparse.Namespace(base_url=cli_base, api_key=cli_key)
+            opened = mock.mock_open(read_data=token)
+            with self.subTest(cli_base=cli_base, cli_key=cli_key, environment=environment), mock.patch.dict(os.environ, environment, clear=True), mock.patch('builtins.open', opened):
+                self.assertEqual(bench.load_credentials(args), expected)
+                if reads_file:
+                    opened.assert_called_once()
+                else:
+                    opened.assert_not_called()
+
+    def test_mcp_function_names_are_api_compatible_and_dispatch_to_bare_tool_names(self):
+        class Endpoint:
+            model = 'offline'
+            turn = 0
+            def chat(self, messages, tools, reasoning_effort=None):
+                for tool in tools:
+                    self_test.assertRegex(tool['function']['name'], r'^[A-Za-z0-9_-]{1,64}$')
+                self.turn += 1
+                if self.turn == 1:
+                    message = {'tool_calls': [{'id': 'mcp-1', 'function': {'name': 'panoptes_find', 'arguments': '{"query":"needle"}'}}]}
+                    reason = 'tool_calls'
+                else:
+                    message = {'content': 'completed answer'}
+                    reason = 'stop'
+                return {'choices': [{'message': message, 'finish_reason': reason}], 'usage': {}}
+        self_test = self
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(bench.subprocess, 'Popen'), mock.patch.object(bench.PanoptesMcp, '_initialize'):
+            corpus = Path(root, 'corpus'); corpus.mkdir()
+            client = bench.PanoptesMcp('/bin/panoptes', '/scratch/store.db', str(corpus))
+            self.assertEqual(client.prefix, 'panoptes_')
+            def send(method, params=None):
+                if method == 'tools/list':
+                    return {'tools': [{'name': 'find', 'description': 'find', 'inputSchema': {'type': 'object'}}]}
+                self.assertEqual(method, 'tools/call')
+                self.assertEqual(params, {'name': 'find', 'arguments': {'query': 'needle'}})
+                return {'content': [{'type': 'text', 'text': 'evidence'}], 'isError': False}
+            client._send = mock.Mock(side_effect=send)
+            client.close = mock.Mock()
+            with mock.patch.object(bench, 'args_max_turns', 3, create=True):
+                metrics, answer = bench.run_one(Endpoint(), 'task', 'question', 'panoptes', 1, 'low', str(corpus), client, str(Path(root, 'events.jsonl')), str(Path(root, 'answer.md')))
+            self.assertEqual(metrics['exit_code'], 0)
+            self.assertEqual(metrics['panoptes_calls'], 1)
+            self.assertEqual(answer, 'completed answer')
+            client.close.assert_called_once()
+
+    def test_incomplete_and_empty_final_responses_fail_but_keep_usage_and_evidence(self):
+        cases = [('length', 'truncated answer'), ('content_filter', 'filtered answer'),
+                 ('stop', ''), ('stop', '  \n\t'), ('stop', None),
+                 (None, 'unconfirmed answer'), ('tool_calls', 'unconfirmed answer'), ('unexpected', 'unconfirmed answer')]
+        for reason, content in cases:
+            class Endpoint:
+                model = 'offline'
+                def chat(self, messages, tools, reasoning_effort=None):
+                    return {'choices': [{'message': {'content': content}, 'finish_reason': reason}],
+                            'usage': {'prompt_tokens': 10, 'completion_tokens': 2,
+                                      'prompt_tokens_details': {'cached_tokens': 3},
+                                      'completion_tokens_details': {'reasoning_tokens': 1}}}
+            with self.subTest(reason=reason, content=content), tempfile.TemporaryDirectory() as root:
+                corpus = Path(root, 'corpus'); corpus.mkdir()
+                events = Path(root, 'events.jsonl'); answer = Path(root, 'answer.md')
+                with mock.patch.object(bench, 'args_max_turns', 1, create=True):
+                    metrics, result = bench.run_one(Endpoint(), 'task', 'question', 'baseline', 1, 'low', str(corpus), None, str(events), str(answer))
+                self.assertNotEqual(metrics['exit_code'], 0)
+                self.assertEqual((metrics['input_tokens'], metrics['cached_input_tokens'], metrics['output_tokens'], metrics['reasoning_output_tokens']), (10, 3, 2, 1))
+                records = [json.loads(line) for line in events.read_text().splitlines()]
+                self.assertTrue(any(r['type'] == 'run.error' for r in records))
+                assistant = next(r for r in records if r['type'] == 'assistant')
+                self.assertEqual(assistant['finish_reason'], reason)
+                self.assertEqual(answer.read_text(), result)
+
+    def test_truncated_tool_call_is_rejected_before_execution(self):
+        class Endpoint:
+            model = 'offline'
+            def chat(self, messages, tools, reasoning_effort=None):
+                return {'choices': [{'message': {'tool_calls': [{'id': 't', 'function': {'name': 'read_file', 'arguments': '{"path":"file.txt"}'}}]}, 'finish_reason': 'length'}],
+                        'usage': {'prompt_tokens': 10, 'completion_tokens': 2}}
+        with tempfile.TemporaryDirectory() as root:
+            corpus = Path(root, 'corpus'); corpus.mkdir()
+            events = Path(root, 'events.jsonl')
+            with mock.patch.object(bench, 'args_max_turns', 1, create=True), mock.patch.object(bench, 'tool_read_file') as read:
+                metrics, result = bench.run_one(Endpoint(), 'task', 'question', 'baseline', 1, 'low', str(corpus), None, str(events), str(Path(root, 'answer.md')))
+            read.assert_not_called()
+            self.assertNotEqual(metrics['exit_code'], 0)
+            self.assertEqual(metrics['tool_calls'], 0)
+            self.assertEqual((metrics['input_tokens'], metrics['output_tokens']), (10, 2))
+            records = [json.loads(line) for line in events.read_text().splitlines()]
+            self.assertTrue(any(r['type'] == 'run.error' for r in records))
+            self.assertFalse(any(r['type'] == 'tool_result' for r in records))
+
+    def test_complete_stop_response_is_successful(self):
+        class Endpoint:
+            model = 'offline'
+            def chat(self, messages, tools, reasoning_effort=None):
+                return {'choices': [{'message': {'content': ' completed answer '}, 'finish_reason': 'stop'}],
+                        'usage': {'prompt_tokens': 7, 'completion_tokens': 3}}
+        with tempfile.TemporaryDirectory() as root:
+            corpus = Path(root, 'corpus'); corpus.mkdir()
+            with mock.patch.object(bench, 'args_max_turns', 1, create=True):
+                metrics, result = bench.run_one(Endpoint(), 'task', 'question', 'baseline', 1, 'low', str(corpus), None, str(Path(root, 'events.jsonl')), str(Path(root, 'answer.md')))
+            self.assertEqual(metrics['exit_code'], 0)
+            self.assertEqual(result, 'completed answer')
+            self.assertEqual((metrics['input_tokens'], metrics['output_tokens']), (7, 3))
+
     def test_request_sizes_describe_exact_wire_json_without_credentials(self):
         messages = [{'role': 'user', 'content': 'é'}]
         tools = [{'type': 'function', 'function': {'name': 'example'}}]
@@ -111,7 +287,7 @@ class BenchmarkIntegrityTests(unittest.TestCase):
                     message = {'tool_calls': [{'id': 'tool-1', 'function': {'name': 'read_file', 'arguments': '{"path":"file.txt","limit":2}'}}]}
                 else:
                     message = {'content': 'answer'}
-                return {'choices': [{'message': message}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 2, 'prompt_tokens_details': {'cached_tokens': 3}}}
+                return {'choices': [{'message': message, 'finish_reason': 'tool_calls' if self.turn == 1 else 'stop'}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 2, 'prompt_tokens_details': {'cached_tokens': 3}}}
         with tempfile.TemporaryDirectory() as root:
             corpus = Path(root, 'corpus'); corpus.mkdir()
             Path(corpus, 'file.txt').write_text('a\nb\n')
@@ -163,6 +339,16 @@ class BenchmarkIntegrityTests(unittest.TestCase):
             self.assertEqual(output.getvalue(), '')
 
 
+    def test_quick_footer_excludes_incomplete_run_pairs(self):
+        header = "task\tarm\ttrial\teffort\texit_code\testimated_cost_usd\tinput_tokens\tuncached_input_tokens\ttool_calls\trubric_hits\trubric_total\n"
+        rows = "auth\tbaseline\t1\tlow\t0\t0.2\t100\t40\t5\t6\t6\nauth\tpanoptes\t1\tlow\t1\t0.1\t80\t20\t3\t5\t6\n"
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root, 'results.tsv'); path.write_text(header + rows)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                bench.print_quick_results(path)
+            self.assertEqual(output.getvalue(), '')
+
     def test_compact_mcp_command_is_opt_in(self):
         for compact in (False, True):
             with self.subTest(compact=compact), mock.patch.object(bench.subprocess, 'Popen') as popen, mock.patch.object(bench.PanoptesMcp, '_initialize'):
@@ -183,12 +369,12 @@ class BenchmarkIntegrityTests(unittest.TestCase):
             def chat(self, messages, tools, reasoning_effort=None):
                 self.turn += 1
                 if self.turn == 1:
-                    message = {'tool_calls': [{'id': 'tool-1', 'function': {'name': 'panoptes.../../../unsafe', 'arguments': '{}'}}]}
+                    message = {'tool_calls': [{'id': 'tool-1', 'function': {'name': 'panoptes_../../unsafe', 'arguments': '{}'}}]}
                 else:
                     message = {'content': 'answer'}
-                return {'choices': [{'message': message}], 'usage': {}}
+                return {'choices': [{'message': message, 'finish_reason': 'tool_calls' if self.turn == 1 else 'stop'}], 'usage': {}}
         class Mcp:
-            prefix = 'panoptes.'
+            prefix = 'panoptes_'
             def list_tools(self): return []
             def call(self, name, arguments): return full, False
             def close(self): pass
