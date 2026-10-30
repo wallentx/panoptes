@@ -206,6 +206,19 @@ an explicit `limit` for more matches, or `full=true` for complete definitions.
 `source=false` omits excerpts. Symbol spans always describe the full definition.
 MCP text responses use compact JSON and retain the same structured fields.
 
+For agents that consume tool text, start MCP with `--compact`:
+
+```sh
+panoptes mcp /absolute/checkout --compact
+```
+
+This renders find hits as locations and excerpts, and omits repeated telemetry
+from the text. Full hit fields, checkout identities, scope provenance, and savings
+remain available in `structuredContent`. The default text remains JSON for
+existing clients. Both modes retain the same ranked hits and captured source.
+Tool descriptions and initialization guidance are concise in both modes.
+
+
 The same operations are available directly from the CLI:
 
 ```sh

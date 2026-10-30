@@ -3,6 +3,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -67,6 +68,7 @@ pub fn ask(
     } else {
         None
     };
+    let mut source_cache = SourceCache::default();
     if let Some((subject, outgoing)) = structural_subject(query) {
         let (seeds, reached) =
             crate::index::callers_scoped(db, repo_id, subject, outgoing, 1, options.scope)?;
@@ -94,6 +96,7 @@ pub fn ask(
                                 reached.start_line,
                                 reached.end_line,
                                 options.full,
+                                &mut source_cache,
                             )
                         })
                         .flatten(),
@@ -131,14 +134,22 @@ pub fn ask(
         rusqlite::params![repo_id, scope],
         |r| r.get(0),
     )?;
-    let mut statement = db.prepare(
+    // With only one distinct term, each symbol has one posting, so the
+    // correlated indexed count already runs exactly once and avoids a second
+    // query. Multi-term searches defer counts until after candidate filtering.
+    let count_in_posting = query_terms.iter().all(|term| term == &query_terms[0]);
+    let edge_projection = if count_in_posting {
+        "(select count(*) from edges e where e.repo_id=s.repo_id and e.dst_symbol_id=s.id),"
+    } else {
+        ""
+    };
+    let mut statement = db.prepare(&format!(
         "select s.id,s.name,s.kind,f.path,s.start_line,s.end_line,coalesce(s.signature,''),
-                (select count(*) from edges e where e.repo_id=s.repo_id and e.dst_symbol_id=s.id),
-                t.name_count,t.path_count,t.signature_count,t.body_count
+                {edge_projection}t.name_count,t.path_count,t.signature_count,t.body_count
          from search_terms t join symbols s on s.id=t.symbol_id join files f on f.id=s.file_id
          where t.repo_id=?1 and t.term=?2 and s.kind != 'module'
-         and (?3 is null or f.path=?3 or substr(f.path,1,length(?3)+1)=?3||'/')",
-    )?;
+         and (?3 is null or f.path=?3 or substr(f.path,1,length(?3)+1)=?3||'/')"
+    ))?;
     // Deduplicate lookup work while retaining repeated query terms in scoring.
     let mut term_slots: HashMap<&str, usize> = HashMap::new();
     let mut unique_terms = Vec::new();
@@ -167,13 +178,13 @@ pub fn ask(
                     start_line: row.get(4)?,
                     end_line: row.get(5)?,
                     signature: row.get(6)?,
-                    in_edges: row.get(7)?,
+                    in_edges: if count_in_posting { row.get(7)? } else { 0 },
                     term_counts: Vec::with_capacity(unique_terms.len().min(4)),
                 }),
             };
             let mut counts = [0.0; 4];
             for (field, count) in counts.iter_mut().enumerate() {
-                *count = row.get::<_, i64>(8 + field)? as f64;
+                *count = row.get::<_, i64>(7 + usize::from(count_in_posting) + field)? as f64;
             }
             // Only matched terms occupy memory; long queries must not allocate
             // a full query-by-corpus matrix. Slots arrive in increasing order.
@@ -222,8 +233,20 @@ pub fn ask(
         if is_test_path(&document.path) && !query_mentions_tests {
             score *= 0.65;
         }
-        score *= 1.0 + (document.in_edges as f64 + 1.0).ln() * 0.06;
         scored.push((score, document));
+    }
+    // Incoming edges affect ranking only after the lexical eligibility filter.
+    // For multi-term searches, count once per surviving symbol rather than
+    // once per query-term posting.
+    if !count_in_posting {
+        let ids: Vec<_> = scored.iter().map(|(_, document)| document.id).collect();
+        let edge_counts = incoming_edge_counts(db, repo_id, &ids)?;
+        for (_, document) in &mut scored {
+            document.in_edges = edge_counts.get(&document.id).copied().unwrap_or(0);
+        }
+    }
+    for (score, document) in &mut scored {
+        *score *= 1.0 + (document.in_edges as f64 + 1.0).ln() * 0.06;
     }
 
     scored.sort_by(|(left_score, left), (right_score, right)| {
@@ -243,6 +266,7 @@ pub fn ask(
                 document.start_line,
                 document.end_line,
                 options.full,
+                &mut source_cache,
             )
         } else {
             None
@@ -270,6 +294,33 @@ pub fn ask(
         }),
         hits,
     })
+}
+
+fn incoming_edge_counts(db: &Connection, repo_id: i64, ids: &[i64]) -> Result<HashMap<i64, i64>> {
+    // Stay comfortably below SQLite's historical 999-variable limit while
+    // amortizing statement/row setup over many candidates.
+    const BATCH_SIZE: usize = 256;
+    let mut counts = HashMap::new();
+    for batch in ids.chunks(BATCH_SIZE) {
+        let placeholders = (0..batch.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "select dst_symbol_id,count(*) from edges
+             where repo_id=?1 and dst_symbol_id in ({placeholders})
+             group by dst_symbol_id"
+        );
+        let mut statement = db.prepare_cached(&sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(
+            std::iter::once(repo_id).chain(batch.iter().copied()),
+        ))?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            counts.insert(id, row.get(1)?);
+        }
+    }
+    Ok(counts)
 }
 
 fn structural_subject(query: &str) -> Option<(&str, bool)> {
@@ -304,6 +355,36 @@ fn is_test_path(path: &str) -> bool {
         || file.contains("_test.")
 }
 
+// Cache captured source only for this read view. The fixed byte budget avoids
+// retaining several large BLOBs when ranked results span different files.
+#[derive(Default)]
+struct SourceCache {
+    files: HashMap<String, Option<String>>,
+    bytes: usize,
+}
+
+impl SourceCache {
+    const MAX_BYTES: usize = 1024 * 1024;
+
+    fn read<'a>(&'a mut self, db: &Connection, snapshot: i64, path: &str) -> Option<Cow<'a, str>> {
+        match self.files.entry(path.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                entry.into_mut().as_deref().map(Cow::Borrowed)
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let source = crate::content::source(db, snapshot, path).ok().flatten();
+                let bytes = source.as_ref().map_or(0, String::len);
+                if bytes <= Self::MAX_BYTES.saturating_sub(self.bytes) {
+                    self.bytes += bytes;
+                    entry.insert(source).as_deref().map(Cow::Borrowed)
+                } else {
+                    source.map(Cow::Owned)
+                }
+            }
+        }
+    }
+}
+
 pub(crate) const MAX_EXCERPT_BYTES: usize = 1024;
 const EXCERPT_TRUNCATED: &str = "\n[excerpt truncated; use full=true]";
 
@@ -314,8 +395,9 @@ fn source_excerpt(
     start: i64,
     end: i64,
     full: bool,
+    cache: &mut SourceCache,
 ) -> Option<String> {
-    let text = crate::content::source(db, snapshot, path).ok()??;
+    let text = cache.read(db, snapshot, path)?;
     let start = start.max(1) as usize;
     let mut end = end.max(start as i64) as usize;
     if !full {
@@ -370,6 +452,39 @@ mod tests {
     }
 
     #[test]
+    fn incoming_edge_batches_keep_counts_scoped_and_include_zero_edge_candidates() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("create table edges(repo_id integer,src_symbol_id integer,dst_symbol_id integer); create index edges_by_dst on edges(repo_id,dst_symbol_id);").unwrap();
+        let ids: Vec<i64> = (1..=600).collect();
+        for &id in &ids {
+            for source in 0..id % 4 {
+                db.execute(
+                    "insert into edges values (1,?1,?2)",
+                    rusqlite::params![source, id],
+                )
+                .unwrap();
+            }
+            // A different snapshot must not inflate this candidate's count.
+            db.execute("insert into edges values (2,0,?1)", [id])
+                .unwrap();
+        }
+        assert!(incoming_edge_counts(&db, 1, &[]).unwrap().is_empty());
+        let counts = incoming_edge_counts(&db, 1, &ids).unwrap();
+        for id in ids {
+            assert_eq!(
+                counts.get(&id).copied().unwrap_or(0),
+                id % 4,
+                "candidate {id}"
+            );
+        }
+        let plan: String = db.query_row("explain query plan select dst_symbol_id,count(*) from edges where repo_id=1 and dst_symbol_id in (1,2,3) group by dst_symbol_id", [], |row| row.get(3)).unwrap();
+        assert!(
+            plan.contains("SEARCH edges USING COVERING INDEX edges_by_dst"),
+            "{plan}"
+        );
+    }
+
+    #[test]
     fn ranking_is_stable_de_ranks_tests_and_searches_module_bodies() {
         use crate::{db, index};
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -396,6 +511,54 @@ mod tests {
         let mut conn = db::open(&store).unwrap();
         index::build(&mut conn, &root).unwrap();
         let repo_id = index::repo_id_of(&conn, &root).unwrap().unwrap();
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reads.clone();
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(
+                context.action,
+                rusqlite::hooks::AuthAction::Read {
+                    table_name: "content_objects",
+                    column_name: "source_bytes"
+                }
+            ) {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            rusqlite::hooks::Authorization::Allow
+        }))
+        .unwrap();
+        let mut cache = SourceCache::default();
+        assert!(
+            source_excerpt(&conn, repo_id, "src/gateway.ts", 2, 2, false, &mut cache)
+                .unwrap()
+                .contains("processPayment")
+        );
+        let first_reads = reads.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(first_reads > 0);
+        assert!(
+            source_excerpt(&conn, repo_id, "src/gateway.ts", 3, 3, true, &mut cache)
+                .unwrap()
+                .contains("main")
+        );
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed),
+            first_reads
+        );
+        source_excerpt(
+            &conn,
+            repo_id,
+            "src/gateway.ts",
+            2,
+            2,
+            false,
+            &mut SourceCache::default(),
+        )
+        .unwrap();
+        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > first_reads);
+        conn.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        )
+        .unwrap();
+
         let first = ask(
             &conn,
             repo_id,
@@ -410,6 +573,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first.hits[0].path, "src/gateway.ts");
+        for hit in &first.hits {
+            let expected: i64 = conn
+                .query_row(
+                    "select count(*) from edges where repo_id=?1 and dst_symbol_id=?2",
+                    rusqlite::params![repo_id, hit.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(hit.in_edges, expected);
+        }
+        let repeated = ask(
+            &conn,
+            repo_id,
+            &root,
+            "process payment process payment",
+            AskOptions {
+                limit: 8,
+                scope: None,
+                source: false,
+                full: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.hits.len(), repeated.hits.len());
+        for (single, repeated) in first.hits.iter().zip(&repeated.hits) {
+            assert_eq!(single.id, repeated.id);
+            assert_eq!(single.in_edges, repeated.in_edges);
+            assert!((single.score * 2.0 - repeated.score).abs() < 1e-9);
+        }
+
         let ids: Vec<_> = first.hits.iter().map(|hit| hit.id).collect();
         index::build(&mut conn, &root).unwrap();
         let second = ask(

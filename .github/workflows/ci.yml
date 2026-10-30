@@ -100,6 +100,13 @@ jobs:
       - name: Check benchmark isolation and reset
         run: python3 -B tests/test_benchmark_mcp.py
 
+      - name: Check direct benchmark integrity
+        run: |
+          # Older release tags may predate the direct runner.
+          if [ -f tests/test_benchmark_agent_llm.py ]; then
+            python3 -B tests/test_benchmark_agent_llm.py
+          fi
+
   termux-container:
     name: check (Termux Bionic)
     runs-on: ubuntu-latest

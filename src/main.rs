@@ -143,6 +143,9 @@ enum Cmd {
     },
     /// Serve Panoptes tools to MCP clients over stdin/stdout JSON-RPC.
     Mcp {
+        /// Concise agent text; complete JSON remains in structuredContent.
+        #[arg(long)]
+        compact: bool,
         #[arg(default_value = ".")]
         path: PathBuf,
         /// Stop after this many seconds without meaningful progress (1-300 seconds).
@@ -893,11 +896,16 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Mcp { path, timeout_secs } => mcp::serve(
+        Cmd::Mcp {
+            path,
+            timeout_secs,
+            compact,
+        } => mcp::serve(
             &store,
             &path,
             refresh_disabled(no_refresh),
             std::time::Duration::from_secs(timeout_secs),
+            compact,
         )?,
         Cmd::McpWorker => mcp::worker_main()?,
 

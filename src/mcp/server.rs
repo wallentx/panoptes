@@ -91,6 +91,7 @@ pub(super) fn serve(
     targets: &[repo::Target],
     no_refresh: bool,
     timeout: Duration,
+    compact: bool,
 ) -> Result<()> {
     // Drop the receiver before cancelling/joining jobs on an I/O error, so a
     // supervisor blocked sending completion cannot deadlock cleanup.
@@ -123,7 +124,10 @@ pub(super) fn serve(
         let _ = reader_send.send(Event::Closed);
     });
     let mut output = std::io::stdout().lock();
-    let mut session = SessionStats::default();
+    let mut session = SessionStats {
+        compact,
+        ..SessionStats::default()
+    };
     let mut keys: HashMap<String, u64> = HashMap::new();
     let mut queue = VecDeque::new();
     let mut next = 0u64;
