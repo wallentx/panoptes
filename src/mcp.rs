@@ -93,10 +93,12 @@ fn dispatch(
     }
 }
 
+const DEFAULT_FIND_LIMIT: usize = 5;
+
 fn tool_response(output: ToolData, session: &mut SessionStats) -> Result<Value> {
     let data = add_savings(output, session)?;
     Ok(json!({
-        "content":[{"type":"text", "text":serde_json::to_string_pretty(&data)?}],
+        "content":[{"type":"text", "text":serde_json::to_string(&data)?}],
         "structuredContent":data,
         "isError":false
     }))
@@ -106,7 +108,7 @@ fn tool_schemas() -> Vec<Value> {
     vec![
         schema(
             "find",
-            "Start here for where/how questions. Returns ranked definitions with exact spans, signatures, graph context, and a bounded source excerpt by default; prefer this over broad search and whole-file reads.",
+            "Start here for where/how questions. Returns ranked definitions with exact spans, signatures, graph context, and bounded source excerpts for the top 5 matches by default. Narrow with in; request a larger limit or full=true only when needed.",
             &["query"],
         ),
         schema(
@@ -152,9 +154,9 @@ fn schema(name: &str, description: &str, required: &[&str]) -> Value {
         "find" => {
             json!({
                 "query":{"type":"string", "description":"Natural-language or structural code question."},
-                "limit":{"type":"integer", "minimum":1, "description":"Maximum ranked definitions to return; defaults to 8."},
+                "limit":{"type":"integer", "minimum":1, "default":DEFAULT_FIND_LIMIT, "description":"Maximum ranked definitions per checkout; defaults to 5. Increase only when more matches are needed."},
                 "in":{"type":"string", "description":"Optional repository-relative path scope."},
-                "source":{"type":"boolean", "default":true, "description":"Include bounded source excerpts; defaults to true."},
+                "source":{"type":"boolean", "default":true, "description":"Include excerpts of at most 8 lines and 1024 UTF-8 bytes each; defaults to true."},
                 "full":{"type":"boolean", "default":false, "description":"Return each complete matched definition instead of the bounded excerpt."},
                 "repo":{"type":"string", "description":"Absolute Git checkout/worktree path or unique label. Omit for startup repositories."}
             })
@@ -387,7 +389,7 @@ fn call_tool_detailed(
                     &target.root,
                     string_arg(args, "query")?,
                     ask::AskOptions {
-                        limit: usize_arg(args, "limit", 8),
+                        limit: usize_arg(args, "limit", DEFAULT_FIND_LIMIT),
                         scope: args.get("in").and_then(Value::as_str),
                         source: bool_arg_default(args, "source", true),
                         full: bool_arg(args, "full"),
@@ -516,7 +518,7 @@ fn add_savings(mut output: ToolData, session: &mut SessionStats) -> Result<Value
     }
     let baseline_tokens = estimated_tokens(output.baseline_bytes);
     let mut payload_tokens =
-        estimated_tokens(serde_json::to_string_pretty(&output.value)?.chars().count() as u64);
+        estimated_tokens(serde_json::to_string(&output.value)?.chars().count() as u64);
     let mut saved = baseline_tokens.saturating_sub(payload_tokens);
 
     for _ in 0..4 {
@@ -539,7 +541,7 @@ fn add_savings(mut output: ToolData, session: &mut SessionStats) -> Result<Value
             .context("tool output must be an object")?
             .insert("panoptesSavings".to_string(), metadata);
         let next_payload_tokens =
-            estimated_tokens(serde_json::to_string_pretty(&output.value)?.chars().count() as u64);
+            estimated_tokens(serde_json::to_string(&output.value)?.chars().count() as u64);
         let next_saved = baseline_tokens.saturating_sub(next_payload_tokens);
         if next_payload_tokens == payload_tokens && next_saved == saved {
             break;
@@ -998,6 +1000,109 @@ mod tests {
         assert_eq!(
             result["repositories"]["repo"]["hits"][0]["source"],
             "pub fn original() {}"
+        );
+    }
+
+    #[test]
+    fn find_default_is_five_ranked_hits_but_explicit_limits_are_preserved() {
+        let (_temp, store, target) = fixture("find-default-limit");
+        let source: String = (0..12)
+            .map(|n| format!("pub fn original_{n}() {{}}\n"))
+            .collect();
+        std::fs::write(target.root.join("lib.rs"), source).unwrap();
+        let targets = [target];
+        let default = call_tool(
+            &store,
+            &targets,
+            "find",
+            &json!({"query":"original"}),
+            false,
+        )
+        .unwrap();
+        let expanded = call_tool(
+            &store,
+            &targets,
+            "find",
+            &json!({"query":"original", "limit":8}),
+            false,
+        )
+        .unwrap();
+        let hits = default["repositories"]["repo"]["hits"].as_array().unwrap();
+        let more = expanded["repositories"]["repo"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 5);
+        assert_eq!(more.len(), 8);
+        assert_eq!(hits, &more[..5]);
+        let tools = tool_schemas();
+        let find = tools.iter().find(|tool| tool["name"] == "find").unwrap();
+        assert_eq!(find["inputSchema"]["properties"]["limit"]["default"], 5);
+    }
+
+    #[test]
+    fn find_caps_long_utf8_excerpts_and_full_still_returns_the_definition() {
+        let (_temp, store, target) = fixture("find-long-line");
+        let definition = format!("pub fn original() {{\n// {}\n}}", "é".repeat(2048));
+        std::fs::write(target.root.join("lib.rs"), &definition).unwrap();
+        let targets = [target];
+        for full in [false, true] {
+            let value = call_tool(
+                &store,
+                &targets,
+                "find",
+                &json!({"query":"original", "full":full}),
+                false,
+            )
+            .unwrap();
+            let hit = value["repositories"]["repo"]["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["name"] == "original")
+                .unwrap();
+            let source = hit["source"].as_str().unwrap();
+            if full {
+                assert_eq!(source, definition);
+            } else {
+                assert!(source.len() <= crate::ask::MAX_EXCERPT_BYTES);
+                assert!(source.ends_with("[excerpt truncated; use full=true]"));
+                assert!(source.starts_with("pub fn original()"));
+            }
+            assert_eq!(hit["start_line"], 1);
+            assert_eq!(hit["end_line"], 3);
+        }
+    }
+
+    #[test]
+    fn mcp_text_is_compact_lossless_and_savings_count_the_emitted_format() {
+        let (_temp, store, target) = fixture("compact-response");
+        std::fs::write(
+            target.root.join("lib.rs"),
+            format!("pub fn original() {{}}\n{}", "// padding\n".repeat(400)),
+        )
+        .unwrap();
+        let response = dispatch(
+            &store,
+            &[target],
+            "tools/call",
+            &json!({"name":"find", "arguments":{"query":"original"}}),
+            false,
+            &mut SessionStats::default(),
+        )
+        .unwrap();
+        let text = response["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(text).unwrap(),
+            response["structuredContent"]
+        );
+        assert!(!text.contains('\n'));
+        assert!(
+            text.len()
+                < serde_json::to_string_pretty(&response["structuredContent"])
+                    .unwrap()
+                    .len()
+        );
+        assert_eq!(
+            response["structuredContent"]["panoptesSavings"]["responseTokens"],
+            estimated_tokens(text.chars().count() as u64)
         );
     }
 
