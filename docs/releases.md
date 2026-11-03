@@ -105,12 +105,14 @@ metadata, not the source tag. The checks and builds receive the same version
 input. A tag that moves during a build causes publication to fail. Existing release assets may be replaced on a successful
 rerun of the same tag.
 
-Publishing a release manually on GitHub also starts the asset pipeline. Because
-that tag already exists, this path applies its version to the build checkouts
-without moving the tag. Prefer the manual workflow to also commit the version
-to the default branch before creating a new tag. To rebuild an older release
-with the current workflow, dispatch the workflow from `main` with its exact tag;
-rerunning an old workflow run uses that run's original workflow definition.
+Publishing a release manually on GitHub creates its tag before the asset pipeline
+starts. That pipeline requires the tag's committed Cargo version and lockfile to
+already match; it cannot update those files before GitHub creates the tag. If they
+do not match, the pipeline fails with guidance to prepare the next release through
+the Release workflow. Existing tags remain unchanged. To rebuild an older release
+whose committed version differs, dispatch the workflow from `main` with its exact
+tag; the workflow applies the version in its temporary build checkouts. Rerunning
+an old workflow run uses that run's original workflow definition.
 SemVer prerelease tags such as `v0.2.0-rc.1` create prereleases.
 
 ## Update Homebrew
