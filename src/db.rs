@@ -130,7 +130,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     if crate::progress::enabled() {
         let mut steps = 0u64;
