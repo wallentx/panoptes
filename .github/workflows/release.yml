@@ -112,6 +112,27 @@ jobs:
           file: Cargo.toml
           path: $.package.version
 
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Validate published release source versions
+        if: github.event_name == 'release'
+        env:
+          CARGO_VERSION: ${{ steps.cargo.outputs.value }}
+          RELEASE_VERSION: ${{ steps.resolve.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          if [[ "$CARGO_VERSION" != "$RELEASE_VERSION" ]]; then
+            printf '::error::Published tag contains Cargo version %s, expected %s. Run the Release workflow on main before creating the next tag.\n' "$CARGO_VERSION" "$RELEASE_VERSION"
+            exit 1
+          fi
+          if ! cargo metadata --locked --format-version 1 > /dev/null; then
+            printf '::error::Published tag has an incompatible Cargo.lock or Cargo metadata could not be loaded. Prepare the release on main before creating its tag.\n'
+            exit 1
+          fi
+
       - name: Update Cargo.toml version
         if: steps.cargo.outputs.value != steps.resolve.outputs.release_version
         uses: cssnr/toml-action@v2
@@ -119,11 +140,6 @@ jobs:
           file: Cargo.toml
           path: $.package.version
           value: ${{ steps.resolve.outputs.release_version }}
-
-      - name: Set up Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
 
       - name: Synchronize lockfile and prepare versioned commit
         id: prepare
@@ -150,6 +166,10 @@ jobs:
               git commit -m "chore(release): prepare v$RELEASE_VERSION"
               git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
             fi
+          fi
+          if [[ "$EXISTING_TAG" == false ]]; then
+            # The published tag must identify the files that were tested.
+            git diff --exit-code HEAD -- Cargo.toml Cargo.lock
           fi
           printf 'checkout_ref=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
